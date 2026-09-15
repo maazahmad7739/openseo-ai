@@ -51,7 +51,7 @@ export function PageHeader({
             </Link>
             <div className="min-w-0 leading-tight">
               <p className="truncate text-sm font-bold tracking-tight">
-                OpenSEO<span className="text-primary">++</span> Operator
+                ActionSEO
               </p>
               <p className="truncate text-[11px] text-base-content/50">
                 {title}
