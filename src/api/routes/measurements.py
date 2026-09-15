@@ -125,6 +125,24 @@ def implement_safe(recommendation_id, body: ImplementRequest, conn=Depends(get_c
             "implement %s: baseline degraded (%s: %s) — stored zeroed fallback",
             recommendation_id, type(exc).__name__, exc,
         )
+    # Audit trail (spec §3): the implement event lands in change_log with the
+    # baseline metrics frozen as before_snapshot. Best-effort — an audit miss
+    # never blocks the operator's status transition.
+    change_log_url = rec.get("target_url") or rec.get("proposed_url") or ""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO change_log (recommendation_id, url, before_snapshot, "
+                "implementation_date, implemented_by) VALUES (%s, %s, %s::jsonb, "
+                "COALESCE(%s::date, now()::date), %s)",
+                (recommendation_id, change_log_url,
+                 json.dumps({"baseline": baseline_info,
+                             "status_transition": f"{rec['status']} -> in_progress"}),
+                 implemented_at, body.assigned_to or "operator"),
+            )
+    except Exception as exc:
+        logger.warning("implement %s: change_log write skipped (%s)",
+                       recommendation_id, exc)
     conn.commit()
     return ImplementOut(
         recommendation_id=recommendation_id,
@@ -255,13 +273,15 @@ def get_results(site_id, conn=Depends(get_conn)):
                    COALESCE(r.proposed_url, r.target_url) AS url,
                    kc.primary_keyword AS cluster,
                    r.result AS verdict,
-                   ms.snapshot_type, ms.clicks, ms.avg_position
+                   ms.snapshot_type, ms.clicks, ms.avg_position,
+                   ms.orders, ms.revenue, ms.impressions
             FROM latest l
             JOIN recommendations r ON r.recommendation_id = l.recommendation_id
             LEFT JOIN keyword_clusters kc ON kc.cluster_id = r.cluster_id
             LEFT JOIN LATERAL (
                 SELECT DISTINCT ON (ms2.snapshot_type)
-                       ms2.snapshot_type, ms2.clicks, ms2.avg_position
+                       ms2.snapshot_type, ms2.clicks, ms2.avg_position,
+                       ms2.orders, ms2.revenue, ms2.impressions
                 FROM measurement_snapshots ms2
                 WHERE ms2.recommendation_id = r.recommendation_id
                   AND ms2.comparison_type = 'target'
@@ -311,10 +331,16 @@ def get_results(site_id, conn=Depends(get_conn)):
             "before": {
                 "position": float(snaps["baseline"]["avg_position"]) if snaps.get("baseline") and snaps["baseline"]["avg_position"] is not None else None,
                 "clicks": int(snaps["baseline"]["clicks"] or 0) if snaps.get("baseline") else None,
+                "impressions": int(snaps["baseline"]["impressions"] or 0) if snaps.get("baseline") else None,
+                "orders": int(snaps["baseline"]["orders"] or 0) if snaps.get("baseline") else None,
+                "revenue": float(snaps["baseline"]["revenue"] or 0) if snaps.get("baseline") and snaps["baseline"]["revenue"] is not None else None,
             } if snaps.get("baseline") else None,
             "after": {
                 "position": float(snaps["post_implementation"]["avg_position"]) if snaps.get("post_implementation") and snaps["post_implementation"]["avg_position"] is not None else None,
                 "clicks": int(snaps["post_implementation"]["clicks"] or 0) if snaps.get("post_implementation") else None,
+                "impressions": int(snaps["post_implementation"]["impressions"] or 0) if snaps.get("post_implementation") else None,
+                "orders": int(snaps["post_implementation"]["orders"] or 0) if snaps.get("post_implementation") else None,
+                "revenue": float(snaps["post_implementation"]["revenue"] or 0) if snaps.get("post_implementation") and snaps["post_implementation"]["revenue"] is not None else None,
             } if snaps.get("post_implementation") else None,
             "observation_window_days": window_days,
             "observation_day": min(day_elapsed, window_days) if (day_elapsed is not None and window_days) else None,

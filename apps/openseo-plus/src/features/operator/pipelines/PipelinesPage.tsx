@@ -1,4 +1,5 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { toast } from "sonner";
 import {
   Activity,
   CheckCircle2,
@@ -8,6 +9,7 @@ import {
 import { EMPTY_RECS, EMPTY_RUNS, useOperatorData } from "../data/useOperatorData";
 import { PageHeader, PageTitle } from "../components/PageHeader";
 import { KpiCard } from "../components/KpiCard";
+import { DetailDrawer } from "../components/DetailDrawer";
 import { SkeletonCard, SkeletonStrip } from "../components/Skeleton";
 import { PipelineCard, PipelineColumn, RawCandidatesCard } from "./PipelineCard";
 import type { CandidateRun } from "../data/types";
@@ -48,6 +50,7 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
   );
 
   const inObservation = byStage.inProgress.length;
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   if (data.isError) {
     return (
@@ -136,7 +139,11 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
                 <ColumnEmpty text="No proposed recommendations" />
               ) : (
                 byStage.proposed.map((rec) => (
-                  <PipelineCard key={rec.recommendation_id} rec={rec} />
+                  <PipelineCard
+                    key={rec.recommendation_id}
+                    rec={rec}
+                    onOpenDetail={setDetailId}
+                  />
                 ))
               )}
             </PipelineColumn>
@@ -150,7 +157,15 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
                 <ColumnEmpty text="Nothing approved yet" />
               ) : (
                 byStage.approved.map((rec) => (
-                  <PipelineCard key={rec.recommendation_id} rec={rec} />
+                  <PipelineCard
+                    key={rec.recommendation_id}
+                    rec={rec}
+                    onOpenDetail={setDetailId}
+                    onImplement={(id) => {
+                      data.implement(id);
+                      toast.success("Marked as implemented — baseline captured, observation window started");
+                    }}
+                  />
                 ))
               )}
             </PipelineColumn>
@@ -164,7 +179,15 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
                 <ColumnEmpty text="Nothing being implemented" />
               ) : (
                 byStage.inProgress.map((rec) => (
-                  <PipelineCard key={rec.recommendation_id} rec={rec} />
+                  <PipelineCard
+                    key={rec.recommendation_id}
+                    rec={rec}
+                    onOpenDetail={setDetailId}
+                    onMarkLive={(id) => {
+                      data.markLive(id);
+                      toast.success("Marked live — outcome will be measured at window close");
+                    }}
+                  />
                 ))
               )}
             </PipelineColumn>
@@ -178,13 +201,22 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
                 <ColumnEmpty text="No measured outcomes yet" />
               ) : (
                 byStage.measured.map((rec) => (
-                  <PipelineCard key={rec.recommendation_id} rec={rec} />
+                  <PipelineCard
+                    key={rec.recommendation_id}
+                    rec={rec}
+                    onOpenDetail={setDetailId}
+                  />
                 ))
               )}
             </PipelineColumn>
           </div>
         </div>
       </div>
+
+      <DetailDrawer
+        recommendationId={detailId}
+        onClose={() => setDetailId(null)}
+      />
     </div>
   );
 }

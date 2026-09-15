@@ -29,6 +29,7 @@ class RecommendationOut(BaseModel):
     search_volume: Optional[int] = None
     primary_keyword: Optional[str] = None
     commercial_value: Optional[str] = None
+    evidence_json: Optional[Any] = None
 
 
 class QueueOut(BaseModel):
@@ -67,6 +68,8 @@ class QueueDetailOut(BaseModel):
     cluster: Optional[dict] = None
     priority_score: Optional[float] = None
     measurement_plan: Optional[dict] = None
+    catalogue: Optional[dict] = None
+    serp_context: Optional[list] = None
 
 
 class RejectRequest(BaseModel):

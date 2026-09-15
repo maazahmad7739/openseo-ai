@@ -96,6 +96,8 @@ export interface RecommendationStats {
   competitorCount: number;
   impressions: number;
   clicks: number;
+  /** In-stock catalogue depth (from evidence) when the agent recorded it. */
+  inStockProducts?: number;
 }
 
 export type QueueStatusFilter = "all" | RecommendationStatus;
@@ -123,6 +125,10 @@ export interface MeasurementSnapshot {
   baseline_value: number | null;
   current_value: number | null;
   relative_change: number | null;
+  /** Business metrics (GA4) when the snapshot carried them. */
+  impressions?: number | null;
+  orders?: number | null;
+  revenue?: number | null;
 }
 
 export interface MeasuredResult {

@@ -19,13 +19,43 @@ export function daysUntil(iso: string | null): number | null {
   );
 }
 
-/** Countdown chip for an item in its observation window. Green when healthy,
- * amber when it closes soon, red once overdue. */
-export function DueCountdown({ dueAt }: { dueAt: string | null }) {
+/** Observation-window badge: "Day X/N" while measuring (spec §3 wording),
+ * green with runway, amber near the close, red once overdue. */
+export function DueCountdown({
+  dueAt,
+  implementedAt,
+}: {
+  dueAt: string | null;
+  implementedAt?: string | null;
+}) {
   const days = daysUntil(dueAt);
   if (days == null) return null;
   const overdue = days < 0;
   const soon = days <= 7 && !overdue;
+
+  const window =
+    implementedAt && dueAt
+      ? Math.max(
+          Math.round(
+            (new Date(dueAt).getTime() - new Date(implementedAt).getTime()) /
+              86_400_000,
+          ),
+          1,
+        )
+      : null;
+  const dayElapsed =
+    implementedAt && window
+      ? Math.min(
+          Math.max(
+            Math.floor(
+              (Date.now() - new Date(implementedAt).getTime()) / 86_400_000,
+            ),
+            0,
+          ),
+          window,
+        )
+      : null;
+
   return (
     <span
       className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium tabular-nums ring-1 ring-inset ${
@@ -48,9 +78,11 @@ export function DueCountdown({ dueAt }: { dueAt: string | null }) {
       )}
       {overdue
         ? `Overdue ${Math.abs(days)}d`
-        : days === 0
-          ? "Due today"
-          : `Due in ${days}d`}
+        : dayElapsed != null && window
+          ? `Day ${dayElapsed}/${window}`
+          : days === 0
+            ? "Due today"
+            : `Due in ${days}d`}
     </span>
   );
 }
@@ -61,10 +93,23 @@ function urlLabel(url: string | null): string {
   return url.split("/").filter(Boolean).pop() || url;
 }
 
-export function PipelineCard({ rec }: { rec: Recommendation }) {
+export function PipelineCard({
+  rec,
+  onImplement,
+  onMarkLive,
+  onOpenDetail,
+}: {
+  rec: Recommendation;
+  onImplement?: (id: string) => void;
+  onMarkLive?: (id: string) => void;
+  onOpenDetail?: (id: string) => void;
+}) {
   const url = rec.target_url ?? rec.proposed_url;
   return (
-    <div className="group rounded-xl border border-base-300 bg-base-100 p-3.5 shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md">
+    <div
+      className="group cursor-pointer rounded-xl border border-base-300 bg-base-100 p-3.5 shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md"
+      onClick={() => onOpenDetail?.(rec.recommendation_id)}
+    >
       <div className="flex items-center justify-between gap-2">
         <GeneratorBadge generator={rec.generator} />
         <ImpactBadge impact={rec.impact} />
@@ -84,7 +129,36 @@ export function PipelineCard({ rec }: { rec: Recommendation }) {
         <OwnerBadgeSolid owner={rec.owner} />
         {rec.status !== "proposed" ? <StatusBadge status={rec.status} /> : null}
         {rec.status === "in_progress" || rec.status === "live" ? (
-          <DueCountdown dueAt={rec.measurement_due_at} />
+          <DueCountdown
+            dueAt={rec.measurement_due_at}
+            implementedAt={rec.implemented_at}
+          />
+        ) : null}
+        {rec.status === "approved" && onImplement ? (
+          <button
+            type="button"
+            className="btn btn-primary btn-xs ml-auto"
+            onClick={(e) => {
+              e.stopPropagation();
+              onImplement(rec.recommendation_id);
+            }}
+            title="Mark as implemented: capture baseline, start observation window"
+          >
+            Implement
+          </button>
+        ) : null}
+        {rec.status === "in_progress" && onMarkLive ? (
+          <button
+            type="button"
+            className="btn btn-xs btn-outline ml-auto"
+            onClick={(e) => {
+              e.stopPropagation();
+              onMarkLive(rec.recommendation_id);
+            }}
+            title="Change is live in production"
+          >
+            Mark live
+          </button>
         ) : null}
       </div>
     </div>

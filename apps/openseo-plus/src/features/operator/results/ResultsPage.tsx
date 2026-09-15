@@ -259,6 +259,18 @@ export function ResultsPage({ projectId }: { projectId: string }) {
                           : "—"}
                         )
                       </span>
+                      {r.before[0]?.revenue != null && r.after[0]?.revenue != null ? (
+                        <span
+                          className={`text-xs font-medium tabular-nums ${
+                            r.after[0].revenue - r.before[0].revenue >= 0
+                              ? "text-success"
+                              : "text-error"
+                          }`}
+                        >
+                          rev {r.after[0].revenue - r.before[0].revenue >= 0 ? "+" : "−"}
+                          ${Math.abs(r.after[0].revenue - r.before[0].revenue).toFixed(0)}
+                        </span>
+                      ) : null}
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">

@@ -2,6 +2,7 @@ import {
   ArrowDownRight,
   ArrowRight,
   ArrowUpRight,
+  BadgeDollarSign,
   FlaskConical,
   Minus,
   X,
@@ -115,6 +116,9 @@ export function ResultDetailModal({
           ) : null}
         </div>
 
+        {/* Business impact (GA4): orders + revenue movement */}
+        <BusinessImpact result={result} />
+
         <div className="text-xs text-base-content/45">
           Measured {new Date(result.measured_at).toLocaleDateString()} · implemented{" "}
           {new Date(result.implemented_at).toLocaleDateString()} ·{" "}
@@ -123,6 +127,77 @@ export function ResultDetailModal({
       </div>
     </Modal>
   );
+}
+
+/** Orders + revenue movement from the GA4-fed snapshots. Hides entirely
+ * when neither snapshot carries business metrics (honest absence). */
+function BusinessImpact({ result }: { result: MeasuredResult }) {
+  const beforeOrders = result.before[0]?.orders ?? null;
+  const afterOrders = result.after[0]?.orders ?? null;
+  const beforeRevenue = result.before[0]?.revenue ?? null;
+  const afterRevenue = result.after[0]?.revenue ?? null;
+  const hasOrders = beforeOrders != null || afterOrders != null;
+  const hasRevenue = beforeRevenue != null || afterRevenue != null;
+  if (!hasOrders && !hasRevenue) return null;
+
+  const revDelta =
+    beforeRevenue != null && afterRevenue != null
+      ? afterRevenue - beforeRevenue
+      : null;
+  return (
+    <div className="space-y-2.5">
+      <div className="flex items-center gap-2 text-xs font-medium text-base-content/60">
+        <BadgeDollarSign className="size-3.5" />
+        Business impact (organic)
+      </div>
+      <div className="grid gap-px overflow-hidden rounded-lg border border-base-300 bg-base-300/70 sm:grid-cols-2">
+        <div className="bg-base-100 px-4 py-3">
+          <p className="text-[11px] uppercase tracking-wider text-base-content/50">
+            Orders
+          </p>
+          <p className="mt-0.5 text-lg font-semibold tabular-nums">
+            {fmtNum(beforeOrders)} → {fmtNum(afterOrders)}
+          </p>
+          {hasOrders && beforeOrders != null && afterOrders != null ? (
+            <p
+              className={`mt-0.5 text-[11px] font-medium tabular-nums ${
+                afterOrders - beforeOrders >= 0 ? "text-success" : "text-error"
+              }`}
+            >
+              {afterOrders - beforeOrders >= 0 ? "+" : "−"}
+              {Math.abs(afterOrders - beforeOrders)} orders
+            </p>
+          ) : null}
+        </div>
+        <div className="bg-base-100 px-4 py-3">
+          <p className="text-[11px] uppercase tracking-wider text-base-content/50">
+            Organic revenue
+          </p>
+          <p className="mt-0.5 text-lg font-semibold tabular-nums">
+            {fmtMoney(beforeRevenue)} → {fmtMoney(afterRevenue)}
+          </p>
+          {revDelta != null ? (
+            <p
+              className={`mt-0.5 text-[11px] font-medium tabular-nums ${
+                revDelta >= 0 ? "text-success" : "text-error"
+              }`}
+            >
+              {revDelta >= 0 ? "+" : "−"}${Math.abs(revDelta).toFixed(2)}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function fmtNum(n: number | null): string {
+  return n == null ? "—" : String(n);
+}
+
+function fmtMoney(n: number | null): string {
+  if (n == null) return "—";
+  return `$${n.toFixed(0)}`;
 }
 
 function MetricCell({

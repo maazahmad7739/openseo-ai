@@ -132,7 +132,8 @@ def get_queue(
             "r.target_url, r.proposed_url, r.cluster_id, r.diagnosis, r.impact, "
             "r.confidence, r.effort, r.owner, r.status, r.assigned_to, r.result, "
             "COALESCE((kc.search_volume)::int, 0) AS search_volume, "
-            "kc.primary_keyword, kc.commercial_value "
+            "kc.primary_keyword, kc.commercial_value, "
+            "r.evidence_json "
             "FROM recommendations r "
             "LEFT JOIN keyword_clusters kc ON kc.cluster_id = r.cluster_id "
             "WHERE r.site_id = %s AND r.status = 'proposed'"
@@ -230,9 +231,22 @@ def get_queue(
             search_volume=r["search_volume"] if r["search_volume"] else None,
             primary_keyword=r["primary_keyword"],
             commercial_value=r["commercial_value"],
+            evidence_json=_parse_jsonb_queue(r.get("evidence_json")),
         )
         for r in rows
     ]
+
+
+def _parse_jsonb_queue(value):
+    """Queue rows may carry raw jsonb; degrade to None on anything odd."""
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
     return QueueOut(site_id=site_id, total_proposed=total, showing=len(items),
                     recommendations=items)
 
@@ -291,6 +305,48 @@ def get_queue_detail(recommendation_id, conn=Depends(get_conn)):
     # were agent-promoted first).
     enriched = rec["status"] != "raw"
 
+    # Catalogue inventory signals (drawer "Pages & Products Affected" block):
+    # per-cluster stock depth straight from the catalogue_coverage job. Present
+    # only for cluster-scoped recommendations; NULL degrades to a hidden block.
+    catalogue = None
+    if rec.get("cluster_id"):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT cc.matching_product_count, cc.in_stock_product_count, "
+                "cc.average_price, cc.existing_collection_url "
+                "FROM catalogue_coverage cc WHERE cc.cluster_id = %s",
+                (rec["cluster_id"],),
+            )
+            crow = cur.fetchone()
+        if crow:
+            catalogue = {
+                "matching_product_count": crow[0],
+                "in_stock_product_count": crow[1],
+                "average_price": float(crow[2]) if crow[2] is not None else None,
+                "existing_collection_url": crow[3],
+            }
+
+    # SERP comparison (drawer "Who outranks you" block): the cluster's latest
+    # snapshot results, competitor rows first. is_self lets the UI highlight
+    # our own listing; positions give the visual rank ladder.
+    serp_context = None
+    if rec.get("cluster_id"):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (oss.result_url)
+                       oss.query, oss.result_url, oss.result_domain,
+                       oss.position, oss.is_self, oss.snapshot_date
+                FROM openseo_serp_snapshots oss
+                WHERE oss.cluster_id = %s
+                ORDER BY oss.result_url, oss.snapshot_date DESC
+                """,
+                (rec["cluster_id"],),
+            )
+            columns = [d[0] for d in cur.description]
+            serp_rows = [dict(zip(columns, r)) for r in cur.fetchall()]
+        serp_context = sorted(serp_rows, key=lambda r: (not r["is_self"], r["position"] or 99))
+
     def _parse_jsonb(value):
         if value is None:
             return None
@@ -339,6 +395,8 @@ def get_queue_detail(recommendation_id, conn=Depends(get_conn)):
         measured_at=rec.get("measured_at"),
         cluster=cluster,
         measurement_plan=measurement_plan,
+        catalogue=catalogue,
+        serp_context=serp_context,
     )
 
 

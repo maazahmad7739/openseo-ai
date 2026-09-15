@@ -41,6 +41,7 @@ export function RecommendationCard({
   onToggleExpand,
   onApprove,
   onReject,
+  onOpenDetail,
 }: {
   rec: Recommendation;
   stats: RecommendationStats | undefined;
@@ -51,6 +52,7 @@ export function RecommendationCard({
   onToggleExpand: () => void;
   onApprove: (reason?: string) => void;
   onReject: (reason?: string) => void;
+  onOpenDetail?: () => void;
 }) {
   const [rejecting, setRejecting] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
@@ -62,11 +64,12 @@ export function RecommendationCard({
 
   return (
     <div
-      className={`card border bg-base-100 transition-shadow ${
+      className={`card cursor-pointer border bg-base-100 transition-shadow hover:shadow-md ${
         selected
           ? "border-primary/50 shadow-[0_0_0_1px] shadow-primary/25"
           : "border-base-300"
       }`}
+      onClick={() => onOpenDetail?.()}
     >
       <div className="card-body gap-3 p-4 md:p-5">
         {/* Header row: selection + badges */}
@@ -77,6 +80,7 @@ export function RecommendationCard({
             aria-label={`Select ${rec.recommendation_id}`}
             checked={selected}
             disabled={!selectable}
+            onClick={(e) => e.stopPropagation()}
             onChange={onToggleSelect}
           />
           <div className="min-w-0 flex-1">
@@ -111,17 +115,25 @@ export function RecommendationCard({
         {/* Stat chips — key numbers pulled out of the prose */}
         {stats ? (
           <div className="flex flex-wrap gap-2">
-            <StatChip label="Volume" value={fmt(stats.volume)} />
+            {stats.volume > 0 ? <StatChip label="Volume" value={fmt(stats.volume)} /> : null}
+            {stats.impressions > 0 ? (
+              <StatChip label="Impressions" value={fmt(stats.impressions)} />
+            ) : null}
+            {stats.clicks > 0 ? (
+              <StatChip label="Clicks" value={fmt(stats.clicks)} />
+            ) : null}
             <StatChip
               label="Position"
               value={stats.position ?? "—"}
               tone={stats.position != null && stats.position <= 3 ? "good" : "neutral"}
             />
-            <StatChip
-              label="Competitors"
-              value={stats.competitorCount}
-              tone={stats.competitorCount >= 8 ? "bad" : "neutral"}
-            />
+            {stats.inStockProducts != null ? (
+              <StatChip
+                label="In stock"
+                value={stats.inStockProducts}
+                tone={stats.inStockProducts > 0 ? "good" : "bad"}
+              />
+            ) : null}
             <StatChip
               label="Effort"
               value={rec.effort === "days" ? "~several days" : "~a day"}
@@ -150,7 +162,10 @@ export function RecommendationCard({
         <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
           <button
             type="button"
-            onClick={onToggleExpand}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleExpand();
+            }}
             className="btn btn-ghost btn-xs"
             aria-expanded={expanded}
           >
@@ -164,7 +179,7 @@ export function RecommendationCard({
 
           <div className="flex items-center gap-2">
             {rejecting ? (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
                 <input
                   type="text"
                   className="input input-xs w-52"
@@ -200,7 +215,10 @@ export function RecommendationCard({
                   <>
                     <button
                       type="button"
-                      onClick={() => setRejecting(true)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRejecting(true);
+                      }}
                       className="btn btn-ghost btn-xs text-error"
                     >
                       <X className="size-3.5" />
@@ -208,7 +226,10 @@ export function RecommendationCard({
                     </button>
                     <button
                       type="button"
-                      onClick={() => onApprove()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onApprove();
+                      }}
                       className="btn btn-primary btn-xs"
                     >
                       <Check className="size-3.5" />

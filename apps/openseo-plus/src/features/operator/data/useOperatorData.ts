@@ -5,6 +5,7 @@ import type {
   CandidateRun,
   ConfidenceLevel,
   EffortLevel,
+  EvidenceItem,
   GeneratorType,
   ImpactLevel,
   MeasuredResult,
@@ -17,6 +18,8 @@ import type {
 
 const API_BASE: string =
   (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://127.0.0.1:8000";
+
+export { API_BASE };
 
 interface ApiQueueItem {
   recommendation_id: string;
@@ -37,6 +40,7 @@ interface ApiQueueItem {
   search_volume: number | null;
   primary_keyword: string | null;
   commercial_value: string | null;
+  evidence_json: unknown;
 }
 
 interface ApiQueueOut {
@@ -89,8 +93,20 @@ interface ApiMeasuredDetail {
   url: string | null;
   cluster: string | null;
   verdict: string | null;
-  before: { position: number | null; clicks: number | null } | null;
-  after: { position: number | null; clicks: number | null } | null;
+  before: {
+    position: number | null;
+    clicks: number | null;
+    impressions?: number | null;
+    orders?: number | null;
+    revenue?: number | null;
+  } | null;
+  after: {
+    position: number | null;
+    clicks: number | null;
+    impressions?: number | null;
+    orders?: number | null;
+    revenue?: number | null;
+  } | null;
 }
 
 interface ApiResultsOut {
@@ -118,7 +134,7 @@ export const EMPTY_STATS: Record<string, RecommendationStats> = {};
 export const EMPTY_MEASURED: MeasuredResult[] = [];
 export const EMPTY_RUNS: CandidateRun[] = [];
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
+export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { accept: "application/json" };
   if (init?.body) headers["content-type"] = "application/json";
   const token = import.meta.env.VITE_API_TOKEN as string | undefined;
@@ -137,6 +153,19 @@ function nowIso(): string {
 function mapQueueItem(
   item: ApiQueueItem,
 ): { rec: Recommendation; stats?: RecommendationStats } {
+  // Defensive evidence parse (Option A): chips hide on malformed payloads.
+  const evidence = parseEvidence(item.evidence_json);
+  const gsc = extractGscSignals(evidence);
+  const catalogue = evidence.find((e) => e.source === "catalogue");
+  const inStockMatch = catalogue
+    ? `${catalogue.value ?? ""} ${catalogue.finding}`.match(
+        /([\d.,]+)\s*in[- ]stock/i,
+      )
+    : null;
+  const inStockProducts = inStockMatch
+    ? Number(inStockMatch[1].replace(/,/g, ""))
+    : undefined;
+
   const rec: Recommendation = {
     recommendation_id: item.recommendation_id,
     site_id: item.site_id,
@@ -145,7 +174,7 @@ function mapQueueItem(
     target_url: item.target_url,
     proposed_url: item.proposed_url,
     diagnosis: item.diagnosis,
-    evidence_json: [],
+    evidence_json: evidence,
     work_required_json: [],
     impact: item.impact as ImpactLevel,
     confidence: item.confidence as ConfidenceLevel,
@@ -164,17 +193,57 @@ function mapQueueItem(
     rejection_reason: null,
     measured_at: null,
   };
-  const stats: RecommendationStats | undefined =
-    item.search_volume != null
-      ? {
-          volume: item.search_volume,
-          position: null,
-          competitorCount: 0,
-          impressions: 0,
-          clicks: 0,
-        }
-      : undefined;
+  const hasVolume = item.search_volume != null && item.search_volume > 0;
+  const hasGsc = gsc != null && (gsc.impressions > 0 || gsc.clicks > 0);
+  if (!hasVolume && !hasGsc && inStockProducts == null) {
+    return { rec, stats: undefined };
+  }
+  const stats: RecommendationStats = {
+    volume: item.search_volume ?? 0,
+    position: gsc?.position ?? null,
+    competitorCount: 0,
+    impressions: gsc?.impressions ?? 0,
+    clicks: gsc?.clicks ?? 0,
+    ...(inStockProducts != null ? { inStockProducts } : {}),
+  };
   return { rec, stats };
+}
+
+/** Defensive parse of an evidence_json-ish value into typed items.
+ * Returns [] on anything malformed — chips simply hide, never crash. */
+function parseEvidence(value: unknown): EvidenceItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is EvidenceItem =>
+      item != null &&
+      typeof item === "object" &&
+      typeof (item as EvidenceItem).finding === "string",
+  );
+}
+
+/** Pull compact GSC metrics out of structured evidence `value` strings for
+ * card chips (Option A defensive parse). Evidence values look like
+ * "56,790 impressions | 1,713 clicks | pos 5.07" — tolerant of format drift;
+ * returns null whenever nothing usable is found, and chips hide. */
+export function extractGscSignals(
+  evidence: EvidenceItem[],
+): { impressions: number; clicks: number; position: number | null } | null {
+  for (const item of evidence) {
+    if (item.source !== "GSC") continue;
+    const raw = `${item.value ?? ""} ${item.finding}`;
+    const impMatch = raw.match(/([\d.,]+\s*k?)\s*impressions?/i);
+    const clkMatch = raw.match(/([\d.,]+\s*k?)\s*clicks?/i);
+    const posMatch = raw.match(/position\s*([\d.]+)/i);
+    const parse = (s: string) =>
+      Number(s.replace(/[,\s]/g, "").replace(/k$/i, "000"));
+    const impressions = impMatch ? parse(impMatch[1]) : null;
+    const clicks = clkMatch ? parse(clkMatch[1]) : null;
+    const position = posMatch ? Number(posMatch[1]) : null;
+    if (impressions != null || clicks != null) {
+      return { impressions: impressions ?? 0, clicks: clicks ?? 0, position };
+    }
+  }
+  return null;
 }
 
 function mapPipelineItem(item: ApiPipelineItem): Recommendation {
@@ -235,6 +304,9 @@ function mapMeasuredDetail(detail: ApiMeasuredDetail): MeasuredResult {
             baseline_value: beforeClicks,
             current_value: beforeClicks,
             relative_change: null,
+            impressions: detail.before.impressions ?? null,
+            orders: detail.before.orders ?? null,
+            revenue: detail.before.revenue ?? null,
           },
         ]
       : [],
@@ -248,6 +320,9 @@ function mapMeasuredDetail(detail: ApiMeasuredDetail): MeasuredResult {
             baseline_value: afterClicks,
             current_value: afterClicks,
             relative_change: null,
+            impressions: detail.after.impressions ?? null,
+            orders: detail.after.orders ?? null,
+            revenue: detail.after.revenue ?? null,
           },
         ]
       : [],
@@ -393,6 +468,33 @@ export function useOperatorData(siteId: string) {
     onSettled: invalidate,
   });
 
+  const implementMutation = useMutation({
+    mutationFn: (id: string) =>
+      api<{ recommendation_id: string; status: string; implemented_at?: string }>(
+        `/recommendations/${id}/implement-safe`,
+        { method: "POST", body: JSON.stringify({}) },
+      ),
+    onMutate: (id) => {
+      patchRecommendation(id, {
+        status: "in_progress",
+        implemented_at: nowIso(),
+      });
+    },
+    onSettled: invalidate,
+  });
+
+  const markLiveMutation = useMutation({
+    mutationFn: (id: string) =>
+      api<{ recommendation_id: string; status: string }>(
+        `/recommendations/${id}/live`,
+        { method: "POST" },
+      ),
+    onMutate: (id) => {
+      patchRecommendation(id, { status: "live" });
+    },
+    onSettled: invalidate,
+  });
+
   const data = useMemo<OperatorData | undefined>(() => {
     if (!queue.data || !pipeline.data || !results.data) return undefined;
     return {
@@ -414,6 +516,8 @@ export function useOperatorData(siteId: string) {
     patchRecommendation,
     approve: (id: string) => approveMutation.mutate(id),
     reject: (id: string, reason?: string) => rejectMutation.mutate({ id, reason }),
+    implement: (id: string) => implementMutation.mutate(id),
+    markLive: (id: string) => markLiveMutation.mutate(id),
   };
 }
 

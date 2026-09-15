@@ -15,6 +15,7 @@ import type {
 import { PageHeader, PageTitle } from "../components/PageHeader";
 import { SkeletonCard } from "../components/Skeleton";
 import { EmptyState } from "../components/EmptyState";
+import { DetailDrawer } from "../components/DetailDrawer";
 import { RecommendationCard } from "./RecommendationCard";
 import {
   QueueBulkBar,
@@ -44,6 +45,7 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
   const [sortKey, setSortKey] = useState<QueueSortKey>("impact");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   const data = useOperatorData(projectId);
 
@@ -290,6 +292,7 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
               selected={selected.has(rec.recommendation_id)}
               expanded={expandedId === rec.recommendation_id}
               domain={null}
+              onOpenDetail={() => setDetailId(rec.recommendation_id)}
               onToggleSelect={() => toggleSelect(rec.recommendation_id)}
               onToggleExpand={() =>
                 setExpandedId((current) =>
@@ -311,6 +314,11 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
           onApprove={bulkApprove}
         />
       ) : null}
+
+      <DetailDrawer
+        recommendationId={detailId}
+        onClose={() => setDetailId(null)}
+      />
     </div>
   );
 }
