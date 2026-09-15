@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fastapi import FastAPI, Depends, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.common import get_conn, require_auth, ensure_env_loaded
@@ -47,19 +47,25 @@ def startup():
 
 
 @app.get("/health", response_model=HealthOut)
-def health(conn=Depends(get_conn)):
+def health():
+    # No DB dependency: on serverless there may be no reachable Postgres, and
+    # a raised FastAPI dependency surfaces as HTTP 500. Report degraded instead.
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-            cur.fetchone()
-        db_status = "connected"
+        import db as database
+        conn = database.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            db_status = "connected"
+        finally:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
     except Exception as exc:
         db_status = f"error: {exc}"
-    finally:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
     integration_mode = os.environ.get("INTEGRATION_MODE", "mock")
     agent_creds = "configured" if (
         os.environ.get("OLLAMA_API_BASE") and os.environ.get("OLLAMA_API_KEY")
