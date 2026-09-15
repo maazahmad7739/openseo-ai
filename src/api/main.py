@@ -112,11 +112,15 @@ app.include_router(queue.pipeline_router)
 app.include_router(decisions.router)
 app.include_router(measurements.router)
 
-# Serve the built operator UI (brief §4.1: one deployable process). The API
-# and the SPA share one origin/port, so the UI's relative fetch('/queue', ...)
-# calls reach this same server — no CORS, no hardcoded base URL.
-_UI_BUILD = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "..", "..", "ui", "dist"))
-if os.path.isdir(_UI_BUILD):
-    from fastapi.staticfiles import StaticFiles
-    app.mount("/", StaticFiles(directory=_UI_BUILD, html=True), name="ui")
+# The operator SPA lives at https://openseo-plus.vercel.app (separate Vercel
+# project; the legacy ui/dist login gate is no longer bundled serverless-side).
+# Root serves a small JSON pointer so the API origin is never a dead 404.
+@app.get("/", include_in_schema=False)
+def index():
+    return {
+        "name": "ActionSEO Operator API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health",
+        "ui": "https://openseo-plus.vercel.app",
+    }
