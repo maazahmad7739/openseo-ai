@@ -24,6 +24,7 @@ import {
 } from "./QueueControls";
 import type {
   ActionTypeFilter,
+  EffortFilter,
   GeneratorFilter,
   ImpactFilter,
   OwnerFilter,
@@ -42,6 +43,7 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
   const [owner, setOwner] = useState<OwnerFilter>("all");
   const [actionType, setActionType] = useState<ActionTypeFilter>("all");
   const [impact, setImpact] = useState<ImpactFilter>("all");
+  const [effort, setEffort] = useState<EffortFilter>("all");
   const [sortKey, setSortKey] = useState<QueueSortKey>("impact");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -60,6 +62,7 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
       if (owner !== "all" && rec.owner.toLowerCase() !== owner) return false;
       if (actionType !== "all" && rec.action_type !== actionType) return false;
       if (impact !== "all" && rec.impact !== impact) return false;
+      if (effort !== "all" && rec.effort !== effort) return false;
       if (term) {
         const haystack = [
           rec.diagnosis,
@@ -107,7 +110,7 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
         break;
     }
     return sorted;
-  }, [rows, stats, query, status, generator, owner, actionType, impact, sortKey]);
+  }, [rows, stats, query, status, generator, owner, actionType, impact, effort, sortKey]);
 
   // The queue surfaces the top candidate set only (5 per weekly run, per the
   // product spec). Filters still browse the full backlog when narrowed.
@@ -119,13 +122,14 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
     [rows, selected],
   );
 
-  const hasFilters =
+const hasFilters =
     query.trim() !== "" ||
     status !== "all" ||
     generator !== "all" ||
     owner !== "all" ||
     actionType !== "all" ||
-    impact !== "all";
+    impact !== "all" ||
+    effort !== "all";
 
   const clearFilters = () => {
     setQuery("");
@@ -134,6 +138,7 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
     setOwner("all");
     setActionType("all");
     setImpact("all");
+    setEffort("all");
   };
 
   if (data.isError) {
@@ -245,6 +250,8 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
         onActionTypeChange={setActionType}
         impact={impact}
         onImpactChange={setImpact}
+        effort={effort}
+        onEffortChange={setEffort}
         sortKey={sortKey}
         onSortKeyChange={setSortKey}
       />
