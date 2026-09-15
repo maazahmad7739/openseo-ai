@@ -16,19 +16,17 @@ import type {
   ResultClass,
 } from "./types";
 
-// All API calls are prefixed with /api. On Vercel the FastAPI backend answers
-// under /api/* (api/index.py serves the full /api/... path), and the same
-// routers are mounted under /api for local uvicorn. The default is
-// same-origin ("") so the hosted SPA and its backend share one domain; an
-// explicit VITE_API_BASE (absolute URL) works for local/remote API splits.
-const configured = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(
-  /\/+$/,
-  "",
-);
-const API_BASE: string =
-  configured && !configured.endsWith("/api")
-    ? `${configured}/api`
-    : configured || "/api";
+// All API calls must target /api/*. Vercel serves the FastAPI backend at
+// /api/* (api/index.py), and the root rewrite leaves /api/* alone. The
+// `|| "/api"` fallback guarantees the base is never empty, so
+// fetch(`${API_BASE}${path}`) always produces /api/queue… — never a bare
+// `queue?…` — even when VITE_API_BASE_URL is missing or set to "".
+const raw = (
+  (import.meta.env.VITE_API_BASE_URL as string | undefined) ||
+  (import.meta.env.VITE_API_BASE as string | undefined) ||
+  "/api"
+).replace(/\/+$/, "");
+const API_BASE: string = raw.endsWith("/api") ? raw : `${raw}/api`;
 
 export { API_BASE };
 
