@@ -93,12 +93,17 @@ _AUTH_PROTECTED_PREFIXES = (
     "/results",
 )
 
+_API_PREFIX = "/api"
+
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path == "/health":
         return await call_next(request)
-    if not request.url.path.startswith(_AUTH_PROTECTED_PREFIXES):
+    path = request.url.path
+    if path.startswith(_API_PREFIX):
+        path = path[len(_API_PREFIX):] or "/"
+    if not path.startswith(_AUTH_PROTECTED_PREFIXES):
         return await call_next(request)
     from api.common import API_TOKEN_ENV
     token = os.environ.get(API_TOKEN_ENV)
@@ -111,6 +116,16 @@ app.include_router(queue.router)
 app.include_router(queue.pipeline_router)
 app.include_router(decisions.router)
 app.include_router(measurements.router)
+
+# Vercel serves the FastAPI app at /api/* (api/index.py).  The SPA's fetch
+# calls target /api/queue…, /api/pipeline…, etc., so the same routers are
+# re-mounted under /api so those paths resolve.  include_in_schema=False
+# keeps duplicate operations out of /docs.  The bare routes are preserved
+# for local uvicorn usage and the Python test suite.
+app.include_router(queue.router, prefix=_API_PREFIX, include_in_schema=False)
+app.include_router(queue.pipeline_router, prefix=_API_PREFIX, include_in_schema=False)
+app.include_router(decisions.router, prefix=_API_PREFIX, include_in_schema=False)
+app.include_router(measurements.router, prefix=_API_PREFIX, include_in_schema=False)
 
 # Serve the built operator UI (brief §4.1: one deployable process). The API
 # and the SPA share one origin/port, so the UI's relative fetch('/queue', ...)

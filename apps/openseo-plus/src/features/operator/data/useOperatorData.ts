@@ -16,8 +16,19 @@ import type {
   ResultClass,
 } from "./types";
 
+// All API calls are prefixed with /api. On Vercel the FastAPI backend answers
+// under /api/* (api/index.py serves the full /api/... path), and the same
+// routers are mounted under /api for local uvicorn. The default is
+// same-origin ("") so the hosted SPA and its backend share one domain; an
+// explicit VITE_API_BASE (absolute URL) works for local/remote API splits.
+const configured = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(
+  /\/+$/,
+  "",
+);
 const API_BASE: string =
-  (import.meta.env.VITE_API_BASE as string | undefined) ?? "http://127.0.0.1:8000";
+  configured && !configured.endsWith("/api")
+    ? `${configured}/api`
+    : configured || "/api";
 
 export { API_BASE };
 
