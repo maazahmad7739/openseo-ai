@@ -34,11 +34,12 @@ export function SkeletonCard({
 
 export function SkeletonStrip() {
   return (
-    <div className="grid gap-px overflow-hidden rounded-lg border border-base-300 bg-base-300/70">
+    <div className="grid gap-4 md:grid-cols-4">
       {Array.from({ length: 4 }).map((_, i) => (
-        <div key={i} className="bg-base-100 px-4 py-3">
+        <div key={i} className="app-kpi">
           <div className="skeleton h-2.5 w-16" />
-          <div className="skeleton mt-2 h-5 w-12" />
+          <div className="skeleton mt-2 h-6 w-14" />
+          <div className="skeleton mt-2 h-2.5 w-20" />
         </div>
       ))}
     </div>

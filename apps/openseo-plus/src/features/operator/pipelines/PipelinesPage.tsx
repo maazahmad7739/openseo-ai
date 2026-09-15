@@ -6,8 +6,9 @@ import {
   Loader2,
 } from "lucide-react";
 import { EMPTY_RECS, EMPTY_RUNS, useOperatorData } from "../data/useOperatorData";
-import { PageHeader } from "../components/PageHeader";
-import { SkeletonCard } from "../components/Skeleton";
+import { PageHeader, PageTitle } from "../components/PageHeader";
+import { KpiCard } from "../components/KpiCard";
+import { SkeletonCard, SkeletonStrip } from "../components/Skeleton";
 import { PipelineCard, PipelineColumn, RawCandidatesCard } from "./PipelineCard";
 import type { CandidateRun } from "../data/types";
 
@@ -46,18 +47,11 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
     [rows],
   );
 
-  const inObservation = useMemo(
-    () =>
-      byStage.inProgress.filter(
-        (r) =>
-          r.status === "in_progress" || r.status === "live",
-      ).length,
-    [byStage.inProgress],
-  );
+  const inObservation = byStage.inProgress.length;
 
   if (data.isError) {
     return (
-      <div className="px-4 py-4 md:px-6 md:py-6">
+      <div className="app-main">
         <div className="alert alert-error">Could not load the pipeline.</div>
       </div>
     );
@@ -65,9 +59,9 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
 
   if (data.isPending || !data.data) {
     return (
-      <div className="mx-auto flex max-w-6xl flex-col gap-5 px-4 py-4 md:px-6 md:py-6">
-        <div className="skeleton h-7 w-56" />
-        <div className="skeleton h-24 w-full" />
+      <div className="app-main flex flex-col gap-5">
+        <div className="skeleton h-8 w-56" />
+        <SkeletonStrip />
         <div className="flex gap-4 overflow-hidden">
           <SkeletonCard className="w-64 shrink-0" lines={2} />
           <SkeletonCard className="w-64 shrink-0" lines={2} />
@@ -78,24 +72,57 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
   }
 
   return (
-    <div className="px-4 py-4 md:px-6 md:py-6 pb-24 md:pb-8">
-      <div className="mx-auto flex max-w-6xl flex-col gap-5">
-        <PageHeader
-          projectId={projectId}
-          title="Pipeline"
-          subtitle="Follow recommendations from raw candidate to measured outcome"
+    <div className="app-main flex flex-col gap-6">
+      <PageHeader projectId={projectId} title="Pipeline" />
+
+      <PageTitle
+        title="Pipeline"
+        subtitle="Follow recommendations from raw candidate to measured outcome"
+      />
+
+      {/* Pipeline health KPIs */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <KpiCard
+          label="In observation"
+          value={inObservation}
+          sub="awaiting measurement"
+          icon={<Activity className="size-4.5" />}
+          tone={inObservation > 0 ? "good" : "neutral"}
         />
+        <KpiCard
+          label="Proposed"
+          value={byStage.proposed.length}
+          sub="awaiting operator decision"
+        />
+        <KpiCard
+          label="Approved"
+          value={byStage.approved.length}
+          sub="committed to implementation"
+        />
+        <KpiCard
+          label="Measured"
+          value={byStage.measured.length}
+          sub="outcomes classified"
+        />
+      </div>
 
-        {/* Pipeline health strip */}
-        <PipelineRunsStrip runs={runs} inObservation={inObservation} />
+      {/* Recent run strip */}
+      {runs.length > 0 ? (
+        <div className="grid gap-4 sm:grid-cols-3">
+          {runs.slice(0, 3).map((run) => (
+            <RunStatusCard key={run.run_id} run={run} />
+          ))}
+        </div>
+      ) : null}
 
-        {/* Kanban board */}
-        <div className="overflow-x-auto rounded-xl border border-base-200 bg-base-200/30 p-3">
-          <div className="flex gap-3 pb-1">
+      {/* Kanban board */}
+      <div className="app-panel overflow-hidden">
+        <div className="overflow-x-auto p-4">
+          <div className="flex gap-4 pb-1">
             <PipelineColumn
               title="Raw"
               accentColor="bg-base-content/30"
-              count={61}
+              count={0}
             >
               <RawCandidatesCard proposedCount={proposedCount} />
             </PipelineColumn>
@@ -164,69 +191,41 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
 
 function ColumnEmpty({ text }: { text: string }) {
   return (
-    <div className="flex flex-1 items-center justify-center rounded-lg border border-dashed border-base-300 py-8">
-      <p className="text-xs text-base-content/45">{text}</p>
+    <div className="flex min-h-32 flex-1 items-center justify-center rounded-xl border border-dashed border-base-300/80 bg-base-200/40 px-3 py-8">
+      <p className="text-center text-xs text-base-content/45">{text}</p>
     </div>
   );
 }
 
-/** Recent automated pipeline runs + how many items are in an observation
- * window, so a human can see at a glance whether the system is healthy. */
-function PipelineRunsStrip({
-  runs,
-  inObservation,
-}: {
-  runs: CandidateRun[];
-  inObservation: number;
-}) {
+function RunStatusCard({ run }: { run: CandidateRun }) {
+  const meta = RUN_META[run.run_type];
+  const status = run.status;
   return (
-    <div className="grid gap-px overflow-hidden rounded-lg border border-base-300 bg-base-300/70 lg:grid-cols-5">
-      <div className="col-span-2 bg-base-100 px-4 py-3">
-        <p className="text-[11px] uppercase tracking-wider text-base-content/50">
-          In observation window
-        </p>
-        <p className="mt-0.5 flex items-center gap-2 text-xl font-semibold tabular-nums">
-          {inObservation}
-          <span className="text-xs font-normal text-base-content/50">
-            awaiting measurement
-          </span>
-        </p>
+    <div className="app-kpi">
+      <div className="flex items-center justify-between gap-2">
+        <p className="app-kpi-label">{meta.label}</p>
+        {status === "completed" ? (
+          <CheckCircle2 className="size-4 text-success" />
+        ) : status === "running" ? (
+          <Loader2 className="size-4 animate-spin text-info" />
+        ) : status === "failed" ? (
+          <CircleSlash className="size-4 text-error" />
+        ) : (
+          <Activity className="size-4 text-base-content/40" />
+        )}
       </div>
-
-      {runs.slice(0, 3).map((run) => {
-        const meta = RUN_META[run.run_type];
-        const status = run.status;
-        return (
-          <div key={run.run_id} className="bg-base-100 px-4 py-3">
-            <p className="text-[11px] uppercase tracking-wider text-base-content/50">
-              {meta.label}
-            </p>
-            <p className="mt-0.5 flex items-center gap-1.5 text-sm font-medium">
-              {status === "completed" ? (
-                <CheckCircle2 className="size-4 text-success" />
-              ) : status === "running" ? (
-                <Loader2 className="size-4 animate-spin text-info" />
-              ) : status === "failed" ? (
-                <CircleSlash className="size-4 text-error" />
-              ) : (
-                <Activity className="size-4 text-base-content/40" />
-              )}
-              {status === "completed"
-                ? "Completed"
-                : status === "running"
-                  ? "Running"
-                  : status === "failed"
-                    ? "Failed"
-                    : "Pending"}
-            </p>
-            {run.note ? (
-              <p className="mt-0.5 truncate text-[11px] text-base-content/45">
-                {run.note}
-              </p>
-            ) : null}
-          </div>
-        );
-      })}
+      <p className="app-kpi-value text-base">
+        {status === "completed"
+          ? "Completed"
+          : status === "running"
+            ? "Running"
+            : status === "failed"
+              ? "Failed"
+              : "Pending"}
+      </p>
+      {run.note ? (
+        <p className="app-kpi-sub">{run.note}</p>
+      ) : null}
     </div>
   );
 }

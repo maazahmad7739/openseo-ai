@@ -1,4 +1,4 @@
-import { Link } from "@tanstack/react-router";
+import { Link, useMatchRoute } from "@tanstack/react-router";
 import { BarChart3, ClipboardList, GitBranch, Globe, Moon, Sun } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
 
@@ -21,58 +21,108 @@ const OPERATOR_TABS = [
 ];
 
 /**
- * Page header shared by the three operator tabs.
+ * Sticky app navbar shared by the three operator views.
  *
- * - Title + subtitle on the left.
- * - Brand/domain badge on the right (fixture brand for now; real site details
- *   once the backend connects).
- * - A tab strip linking the three operator tabs with an explicit active state.
+ * - Brand + page context on the left.
+ * - Segmented tab control centered (active tab lifts on a white pill).
+ * - Theme toggle + site badge on the right.
+ * Page title/subtitle render below the navbar on the page itself.
  */
 export function PageHeader({
   projectId,
   title,
-  subtitle,
 }: {
   projectId: string;
   title: string;
-  subtitle: string;
 }) {
+  const matchRoute = useMatchRoute();
+
   return (
-    <div className="space-y-4">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
-          <p className="text-sm text-base-content/60">{subtitle}</p>
-        </div>
+    <>
+      <nav className="app-navbar">
+        <div className="mx-auto flex h-16 w-full max-w-6xl items-center justify-between gap-3 px-4 md:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <Link
+              to="/"
+              className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-content shadow-sm"
+              aria-label="OpenSEO home"
+            >
+              <Globe className="size-4.5" />
+            </Link>
+            <div className="min-w-0 leading-tight">
+              <p className="truncate text-sm font-bold tracking-tight">
+                OpenSEO<span className="text-primary">++</span> Operator
+              </p>
+              <p className="truncate text-[11px] text-base-content/50">
+                {title}
+              </p>
+            </div>
+          </div>
 
-        <div className="flex items-center gap-2">
-          <ThemeToggle />
-          <SiteBadge name={null} domain={null} siteId={projectId} />
-        </div>
-      </div>
-
-      <div
-        role="tablist"
-        aria-label="Operator views"
-        className="tabs tabs-border w-fit border-b border-base-300"
-      >
-        {OPERATOR_TABS.map(({ to, label, icon: Icon }) => (
-          <Link
-            key={to}
-            to={to}
-            params={{ projectId }}
-            search={{}}
-            role="tab"
-            className="tab gap-1.5"
-            activeOptions={{ includeSearch: false }}
-            activeProps={{ className: "tab tab-active gap-1.5" }}
+          <nav
+            role="tablist"
+            aria-label="Operator views"
+            className="app-tabs hidden md:flex"
           >
-            <Icon className="size-3.5" />
-            {label}
-          </Link>
-        ))}
-      </div>
-    </div>
+            {OPERATOR_TABS.map(({ to, label, icon: Icon }) => {
+              const match = matchRoute({
+                to,
+                params: { projectId },
+                fuzzy: false,
+              });
+              const active = match !== false;
+              return (
+                <Link
+                  key={to}
+                  to={to}
+                  params={{ projectId }}
+                  search={{}}
+                  role="tab"
+                  aria-selected={active}
+                  className={`app-tab ${active ? "app-tab-active" : ""}`}
+                >
+                  <Icon className="size-4" />
+                  {label}
+                </Link>
+              );
+            })}
+          </nav>
+
+          <div className="flex shrink-0 items-center gap-2">
+            <ThemeToggle />
+            <SiteBadge siteId={projectId} />
+          </div>
+        </div>
+
+        {/* Mobile tabs */}
+        <div className="border-t border-base-200 px-4 py-2 md:hidden">
+          <nav role="tablist" aria-label="Operator views" className="app-tabs w-full">
+            {OPERATOR_TABS.map(({ to, label, icon: Icon }) => {
+              const match = matchRoute({
+                to,
+                params: { projectId },
+                fuzzy: false,
+              });
+              const active = match !== false;
+              return (
+                <Link
+                  key={to}
+                  to={to}
+                  params={{ projectId }}
+                  search={{}}
+                  role="tab"
+                  aria-selected={active}
+                  className={`app-tab flex-1 justify-center ${active ? "app-tab-active" : ""}`}
+                >
+                  <Icon className="size-4" />
+                  {label}
+                </Link>
+              );
+            })}
+          </nav>
+        </div>
+      </nav>
+    </>
   );
 }
 
@@ -84,45 +134,51 @@ function ThemeToggle() {
     <button
       type="button"
       onClick={toggleTheme}
-      className="btn btn-ghost btn-square border border-base-300"
+      className="btn btn-ghost btn-square btn-sm border border-base-300 bg-base-100"
       aria-label={label}
       title={label}
     >
-      {dark ? <Sun className="size-4.5" /> : <Moon className="size-4.5" />}
+      {dark ? <Sun className="size-4" /> : <Moon className="size-4" />}
     </button>
   );
 }
 
-function SiteBadge({
-  name,
-  domain,
-  siteId,
+function SiteBadge({ siteId }: { siteId: string }) {
+  return (
+    <div
+      className="flex items-center gap-2 rounded-xl border border-base-300 bg-base-100 py-1.5 pl-1.5 pr-3 shadow-sm"
+      title={siteId}
+    >
+      <div className="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary">
+        <Globe className="size-4" />
+      </div>
+      <div className="hidden leading-tight sm:block">
+        <p className="text-xs font-semibold">Aurora Audio</p>
+        <p className="font-mono text-[10px] text-base-content/50">
+          {siteId.slice(0, 8)}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/** Page title block rendered under the sticky navbar. */
+export function PageTitle({
+  title,
+  subtitle,
+  actions,
 }: {
-  name: string | null;
-  domain: string | null;
-  siteId: string;
+  title: string;
+  subtitle: string;
+  actions?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center gap-3 rounded-xl border border-base-300 bg-base-100 px-3.5 py-2.5 shadow-sm" title={siteId}>
-      <div className="flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-        <Globe className="size-4.5" />
+    <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <div className="space-y-1">
+        <h1 className="text-2xl font-bold tracking-tight">{title}</h1>
+        <p className="text-sm text-base-content/60">{subtitle}</p>
       </div>
-      <div className="min-w-0 leading-tight">
-        <p className="truncate text-sm font-semibold">
-          {name ?? domain ?? "Site"}
-        </p>
-        {domain ? (
-          <p className="truncate text-xs text-base-content/50">
-            {domain}
-            <span className="mx-1.5 text-base-content/25">·</span>
-            <span className="font-mono text-[10px]">{siteId.slice(0, 8)}</span>
-          </p>
-        ) : (
-          <p className="truncate text-xs text-base-content/50">
-            <span className="font-mono text-[10px]">{siteId.slice(0, 8)}</span>
-          </p>
-        )}
-      </div>
+      {actions ? <div className="flex items-center gap-2">{actions}</div> : null}
     </div>
   );
 }

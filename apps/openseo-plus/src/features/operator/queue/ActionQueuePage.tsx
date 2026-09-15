@@ -12,7 +12,7 @@ import type {
   Recommendation,
   QueueSortKey,
 } from "../data/types";
-import { PageHeader } from "../components/PageHeader";
+import { PageHeader, PageTitle } from "../components/PageHeader";
 import { SkeletonCard } from "../components/Skeleton";
 import { EmptyState } from "../components/EmptyState";
 import { RecommendationCard } from "./RecommendationCard";
@@ -136,7 +136,7 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
 
   if (data.isError) {
     return (
-      <div className="px-4 py-4 md:px-6 md:py-6">
+      <div className="app-main">
         <div className="alert alert-error">Could not load the action queue.</div>
       </div>
     );
@@ -144,9 +144,9 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
 
   if (data.isPending || !data.data) {
     return (
-      <div className="mx-auto flex max-w-6xl flex-col gap-5 px-4 py-4 md:px-6 md:py-6">
-        <div className="skeleton h-7 w-56" />
-        <div className="skeleton h-12 w-full" />
+      <div className="app-main flex flex-col gap-5">
+        <div className="skeleton h-8 w-56" />
+        <div className="skeleton h-14 w-full" />
         <div className="grid gap-4 lg:grid-cols-2">
           <SkeletonCard />
           <SkeletonCard />
@@ -222,96 +222,95 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
   };
 
   return (
-    <div className="px-4 py-4 md:px-6 md:py-6 pb-24 md:pb-8">
-      <div className="mx-auto flex max-w-6xl flex-col gap-5">
-        <PageHeader
-          projectId={projectId}
-          title="Action Queue"
-          subtitle="Review, approve, and deprioritize weekly candidate recommendations"
+    <div className="app-main flex flex-col gap-6">
+      <PageHeader projectId={projectId} title="Action Queue" />
+
+      <PageTitle
+        title="Action Queue"
+        subtitle="Review, approve, and deprioritize weekly candidate recommendations"
+      />
+
+      <QueueToolbar
+        query={query}
+        onQueryChange={setQuery}
+        status={status}
+        onStatusChange={setStatus}
+        generator={generator}
+        onGeneratorChange={setGenerator}
+        owner={owner}
+        onOwnerChange={setOwner}
+        actionType={actionType}
+        onActionTypeChange={setActionType}
+        impact={impact}
+        onImpactChange={setImpact}
+        sortKey={sortKey}
+        onSortKeyChange={setSortKey}
+      />
+
+      <QueueSummary
+        count={visible.length}
+        total={queueTotal}
+        hasFilters={hasFilters}
+        allSelected={allSelected}
+        hasProposed={visible.some((r) => r.status === "proposed")}
+        onToggleAll={toggleAll}
+        onReset={clearFilters}
+      />
+
+      {filtered.length === 0 ? (
+        <EmptyState
+          icon={Inbox}
+          title={query.trim() ? "No recommendations match your search" : "No recommendations here"}
+          kind={query.trim() ? "search" : "filters"}
+          body={
+            hasFilters
+              ? "Nothing in the queue matches the current search and filters."
+              : "The weekly candidate run only generates recommendations when there is something worth doing. Run it again after the next data sync."
+          }
+          action={
+            hasFilters ? (
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={clearFilters}
+              >
+                <X className="size-3.5" />
+                Clear filters
+              </button>
+            ) : undefined
+          }
         />
+      ) : (
+        <div className="grid gap-4">
+          {visible.map((rec) => (
+            <RecommendationCard
+              key={rec.recommendation_id}
+              rec={rec}
+              stats={stats[rec.recommendation_id]}
+              selected={selected.has(rec.recommendation_id)}
+              expanded={expandedId === rec.recommendation_id}
+              domain={null}
+              onToggleSelect={() => toggleSelect(rec.recommendation_id)}
+              onToggleExpand={() =>
+                setExpandedId((current) =>
+                  current === rec.recommendation_id ? null : rec.recommendation_id,
+                )
+              }
+              onApprove={() => approve(rec)}
+              onReject={(reason) => reject(rec, reason)}
+            />
+          ))}
+        </div>
+      )}
 
-        <QueueToolbar
-          query={query}
-          onQueryChange={setQuery}
-          status={status}
-          onStatusChange={setStatus}
-          generator={generator}
-          onGeneratorChange={setGenerator}
-          owner={owner}
-          onOwnerChange={setOwner}
-          actionType={actionType}
-          onActionTypeChange={setActionType}
-          impact={impact}
-          onImpactChange={setImpact}
-          sortKey={sortKey}
-          onSortKeyChange={setSortKey}
+      {selectedRowCount > 0 ? (
+        <QueueBulkBar
+          count={selectedRowCount}
+          onClear={() => setSelected(new Set())}
+          onReject={bulkReject}
+          onApprove={bulkApprove}
         />
-
-        <QueueSummary
-          count={visible.length}
-          total={queueTotal}
-          hasFilters={hasFilters}
-          allSelected={allSelected}
-          hasProposed={visible.some((r) => r.status === "proposed")}
-          onToggleAll={toggleAll}
-          onReset={clearFilters}
-        />
-
-        {filtered.length === 0 ? (
-          <EmptyState
-            icon={Inbox}
-            title={query.trim() ? "No recommendations match your search" : "No recommendations here"}
-            kind={query.trim() ? "search" : "filters"}
-            body={
-              hasFilters
-                ? "Nothing in the queue matches the current search and filters."
-                : "The weekly candidate run only generates recommendations when there is something worth doing. Run it again after the next data sync."
-            }
-            action={
-              hasFilters ? (
-                <button
-                  type="button"
-                  className="btn btn-primary btn-sm"
-                  onClick={clearFilters}
-                >
-                  <X className="size-3.5" />
-                  Clear filters
-                </button>
-              ) : undefined
-            }
-          />
-        ) : (
-          <div className="grid gap-4">
-            {visible.map((rec) => (
-              <RecommendationCard
-                key={rec.recommendation_id}
-                rec={rec}
-                stats={stats[rec.recommendation_id]}
-                selected={selected.has(rec.recommendation_id)}
-                expanded={expandedId === rec.recommendation_id}
-                domain={null}
-                onToggleSelect={() => toggleSelect(rec.recommendation_id)}
-                onToggleExpand={() =>
-                  setExpandedId((current) =>
-                    current === rec.recommendation_id ? null : rec.recommendation_id,
-                  )
-                }
-                onApprove={() => approve(rec)}
-                onReject={(reason) => reject(rec, reason)}
-              />
-            ))}
-          </div>
-        )}
-
-        {selectedRowCount > 0 ? (
-          <QueueBulkBar
-            count={selectedRowCount}
-            onClear={() => setSelected(new Set())}
-            onReject={bulkReject}
-            onApprove={bulkApprove}
-          />
-        ) : null}
-      </div>
+      ) : null}
     </div>
   );
 }
