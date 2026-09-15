@@ -1,0 +1,166 @@
+{
+  "version": "0.1.20241214",
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "time": "1.234 sec.",
+  "cost": 0.0102,
+  "tasks_count": 1,
+  "tasks_error": 0,
+  "tasks": [
+    {
+      "id": "a1b2c3d4-0000-0000-0000-000000000001",
+      "status_code": 20000,
+      "status_message": "Ok.",
+      "time": "1.100 sec.",
+      "cost": 0.0102,
+      "result_count": 3,
+      "path": [
+        "v3",
+        "keywords_data",
+        "google",
+        "search_volume",
+        "live"
+      ],
+      "data": {
+        "api": "keywords_data",
+        "function": "search_volume",
+        "se": "google",
+        "language_code": "en",
+        "location_code": 2840,
+        "keywords": [
+          "wireless noise cancelling headphones",
+          "best budget noise cancelling headphones",
+          "bose quietcomfort comparison"
+        ]
+      },
+      "result": [
+        {
+          "keyword": "wireless noise cancelling headphones",
+          "location_code": 2840,
+          "language_code": "en",
+          "search_partners": false,
+          "competition": 0.91,
+          "cpc": 1.42,
+          "search_volume": 14200,
+          "categories": [
+            518,
+            531
+          ],
+          "monthly_searches": [
+            {
+              "year": 2026,
+              "month": 9,
+              "search_volume": 14200
+            },
+            {
+              "year": 2026,
+              "month": 8,
+              "search_volume": 13850
+            },
+            {
+              "year": 2026,
+              "month": 7,
+              "search_volume": 12900
+            }
+          ]
+        },
+        {
+          "keyword": "best budget noise cancelling headphones",
+          "location_code": 2840,
+          "language_code": "en",
+          "search_partners": false,
+          "competition": 0.71,
+          "cpc": 0.88,
+          "search_volume": 6200,
+          "categories": [
+            10004,
+            10007
+          ],
+          "monthly_searches": [
+            {
+              "year": 2026,
+              "month": 9,
+              "search_volume": 6200
+            },
+            {
+              "year": 2026,
+              "month": 8,
+              "search_volume": 5900
+            }
+          ]
+        },
+        {
+          "keyword": "bose quietcomfort comparison",
+          "location_code": 2840,
+          "language_code": "en",
+          "search_partners": false,
+          "competition": null,
+          "cpc": null,
+          "search_volume": null,
+          "categories": null,
+          "monthly_searches": null
+        },
+        {
+          "keyword": "noise cancelling headphones sale",
+          "location_code": 2840,
+          "language_code": "en",
+          "search_partners": false,
+          "competition": 0.78,
+          "cpc": 1.1,
+          "search_volume": 5200,
+          "categories": [
+            518,
+            531
+          ],
+          "monthly_searches": [
+            {
+              "year": 2026,
+              "month": 9,
+              "search_volume": 5200
+            }
+          ]
+        },
+        {
+          "keyword": "best wireless headphones for travel",
+          "location_code": 2840,
+          "language_code": "en",
+          "search_partners": false,
+          "competition": 0.62,
+          "cpc": 0.85,
+          "search_volume": 3100,
+          "categories": [
+            518,
+            531
+          ],
+          "monthly_searches": [
+            {
+              "year": 2026,
+              "month": 9,
+              "search_volume": 3100
+            }
+          ]
+        },
+        {
+          "keyword": "waterproof swimming headphones",
+          "location_code": 2840,
+          "language_code": "en",
+          "search_partners": false,
+          "competition": 0.87,
+          "cpc": 1.35,
+          "search_volume": 8100,
+          "categories": [
+            518,
+            531
+          ],
+          "monthly_searches": [
+            {
+              "year": 2026,
+              "month": 9,
+              "search_volume": 8100
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en" data-theme="openseo">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OpenSEO++ Operator</title>
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("openseo-plus-theme");
+          var theme =
+            stored === "openseo" || stored === "openseo-dark"
+              ? stored
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "openseo-dark"
+                : "openseo";
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "openseo");
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

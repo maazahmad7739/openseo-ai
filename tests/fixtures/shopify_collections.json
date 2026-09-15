@@ -1,0 +1,60 @@
+{
+  "custom_collections": [
+    {
+      "id": 4421001001,
+      "title": "Wireless Noise Cancelling Headphones",
+      "handle": "wireless-noise-cancelling-headphones",
+      "published_at": "2025-11-04T09:12:00Z",
+      "published_scope": "web"
+    },
+    {
+      "id": 4421001002,
+      "title": "Budget Noise Cancelling",
+      "handle": "budget-noise-cancelling",
+      "published_at": "2026-01-18T14:40:00Z",
+      "published_scope": "web"
+    },
+    {
+      "id": 4421001003,
+      "title": "Studio & Wired",
+      "handle": "studio-wired",
+      "published_at": null,
+      "published_scope": "web"
+    },
+    {
+      "id": 4421001004,
+      "title": "Wireless Headphones (Legacy)",
+      "handle": "wireless-headphones",
+      "published_at": null,
+      "published_scope": "web"
+    }
+  ],
+  "smart_collections": [
+    {
+      "id": 4421002001,
+      "title": "All Headphones",
+      "handle": "all-headphones",
+      "published_at": "2025-09-30T08:00:00Z",
+      "rules": [
+        {
+          "column": "type",
+          "relation": "equals",
+          "condition": "Headphones"
+        }
+      ]
+    },
+    {
+      "id": 4421002002,
+      "title": "Accessories",
+      "handle": "accessories",
+      "published_at": "2025-10-12T08:00:00Z",
+      "rules": [
+        {
+          "column": "type",
+          "relation": "equals",
+          "condition": "Accessories"
+        }
+      ]
+    }
+  ]
+}

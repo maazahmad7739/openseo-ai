@@ -1,0 +1,111 @@
+{
+  "version": "0.1.20241214",
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "time": "0.9421 sec.",
+  "cost": 0.0097,
+  "tasks_count": 1,
+  "tasks_error": 0,
+  "tasks": [
+    {
+      "id": "b2c3d4e5-0000-0000-0000-000000000002",
+      "status_code": 20000,
+      "status_message": "Ok.",
+      "time": "0.9001 sec.",
+      "cost": 0.0097,
+      "result_count": 1,
+      "path": [
+        "v3",
+        "serp",
+        "google",
+        "organic",
+        "live",
+        "regular"
+      ],
+      "data": {
+        "api": "serp",
+        "function": "organic",
+        "se": "google",
+        "location_code": 2840,
+        "language_code": "en",
+        "keyword": "wireless noise cancelling headphones",
+        "depth": 10
+      },
+      "result": [
+        {
+          "keyword": "wireless noise cancelling headphones",
+          "type": "organic",
+          "se_domain": "google.com",
+          "location_code": 2840,
+          "language_code": "en",
+          "check_url": "https://www.google.com/search?num=100&hl=en&gl=US&q=wireless%20noise%20cancelling%20headphones",
+          "datetime": "2026-09-14 02:31:19 +00:00",
+          "spell": null,
+          "item_types": [
+            "featured_snippet",
+            "organic",
+            "paid"
+          ],
+          "se_results_count": 41200000,
+          "items_count": 7,
+          "items": [
+            {
+              "type": "featured_snippet",
+              "rank_group": 1,
+              "rank_absolute": 1,
+              "domain": "sound-proof.com",
+              "title": "Wireless Noise Cancelling Headphones - Buyer's Guide",
+              "description": "7 things to check before buying wireless noise cancelling headphones: battery life, ANC type, codec support, comfort, multipoint pairing, latency, and price.",
+              "url": "https://sound-proof.com/guides/wireless-noise-cancelling-headphones"
+            },
+            {
+              "type": "paid",
+              "rank_group": 1,
+              "rank_absolute": 2,
+              "domain": "audio-superstore.com",
+              "title": "Wireless Noise Cancelling Headphones | audio-superstore",
+              "description": "Free next-day shipping on all wireless noise cancelling headphones. 30-day returns.",
+              "url": "https://audio-superstore.com/collections/noise-cancelling"
+            },
+            {
+              "type": "organic",
+              "rank_group": 1,
+              "rank_absolute": 3,
+              "domain": "example.com",
+              "title": "Wireless Noise Cancelling Headphones",
+              "description": "Our wireless noise cancelling headphones deliver deep, immersive sound with adaptive ANC up to 45 dB.",
+              "url": "https://example.com/collections/wireless-noise-cancelling-headphones"
+            },
+            {
+              "type": "organic",
+              "rank_group": 1,
+              "rank_absolute": 4,
+              "domain": "big-audio.com",
+              "title": "Best Wireless Noise Cancelling Headphones 2026",
+              "description": "We tested 22 pairs of wireless noise cancelling headphones. Here are the 8 best.",
+              "url": "https://big-audio.com/best-wireless-noise-cancelling-headphones"
+            },
+            {
+              "type": "organic",
+              "rank_group": 2,
+              "rank_absolute": 5,
+              "domain": "audiohouse.com",
+              "title": "Wireless Noise Cancelling Headphones - Compare",
+              "description": "Compare the top wireless noise cancelling headphones side by side on ANC strength, battery, and comfort.",
+              "url": "https://audiohouse.com/compare/wireless-noise-cancelling"
+            },
+            {
+              "type": "organic",
+              "rank_group": 2,
+              "rank_absolute": 6,
+              "domain": "soundsway.com",
+              "title": "ANC Headphones: Are Wireless Noise Cancelling Headphones Worth It?",
+              "description": "A deep dive into active noise cancelling technology and whether wireless noise cancelling headphones are worth the premium.",
+              "url": "https://soundsway.com/journal/are-anc-headphones-worth-it"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

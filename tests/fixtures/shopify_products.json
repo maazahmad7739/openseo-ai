@@ -1,0 +1,138 @@
+{
+  "products": [
+    {
+      "id": 7812300451,
+      "title": "Aurora Pro Wireless Noise Cancelling Headphones",
+      "handle": "aurora-pro-wireless-noise-cancelling-headphones",
+      "product_type": "Headphones",
+      "status": "active",
+      "tags": "audio, wireless, noise-cancelling, premium",
+      "variants": [
+        {
+          "id": 45119002101,
+          "sku": "AUR-PRO-BLK",
+          "price": "249.00",
+          "inventory_quantity": 142
+        },
+        {
+          "id": 45119002102,
+          "sku": "AUR-PRO-WHT",
+          "price": "249.00",
+          "inventory_quantity": 38
+        }
+      ]
+    },
+    {
+      "id": 7812300452,
+      "title": "Aurora Lite On-Ear Headphones",
+      "handle": "aurora-lite-on-ear-headphones",
+      "product_type": "Headphones",
+      "status": "active",
+      "tags": "audio, wireless, budget",
+      "variants": [
+        {
+          "id": 45119002201,
+          "sku": "AUR-LITE-BLK",
+          "price": "79.00",
+          "inventory_quantity": 210
+        }
+      ]
+    },
+    {
+      "id": 7812300453,
+      "title": "Aurora Travel Case",
+      "handle": "aurora-travel-case",
+      "product_type": "Accessories",
+      "status": "active",
+      "tags": "accessories, travel",
+      "variants": [
+        {
+          "id": 45119002301,
+          "sku": "AUR-CASE-STD",
+          "price": "29.00",
+          "inventory_quantity": 0
+        }
+      ]
+    },
+    {
+      "id": 7812300454,
+      "title": "Aurora Ear Tips Kit (Memory Foam)",
+      "handle": "aurora-ear-tips-kit",
+      "product_type": "Accessories",
+      "status": "active",
+      "tags": "accessories, comfort",
+      "variants": [
+        {
+          "id": 45119002401,
+          "sku": "AUR-TIPS-MF",
+          "price": "19.00",
+          "inventory_quantity": 480
+        }
+      ]
+    },
+    {
+      "id": 7812300455,
+      "title": "Aurora Studio Wired Headphones (Discontinued Colour)",
+      "handle": "aurora-studio-wired-headphones",
+      "product_type": "Headphones",
+      "status": "draft",
+      "tags": "audio, wired",
+      "variants": [
+        {
+          "id": 45119002501,
+          "sku": "AUR-STU-RED",
+          "price": "129.00",
+          "inventory_quantity": 12
+        }
+      ]
+    },
+    {
+      "id": 7812300456,
+      "title": "Aurora Kids Noise Cancelling Headphones",
+      "handle": "aurora-kids-noise-cancelling-headphones",
+      "product_type": "Headphones",
+      "status": "active",
+      "tags": "audio, kids, noise-cancelling",
+      "variants": [
+        {
+          "id": 45119002601,
+          "sku": "AUR-KIDS-BLU",
+          "price": "99.00",
+          "inventory_quantity": 75
+        }
+      ]
+    },
+    {
+      "id": 7812300457,
+      "title": "Aurora Waterproof Swim Headphones",
+      "handle": "aurora-waterproof-swim-headphones",
+      "product_type": "Waterproof Headphones",
+      "status": "active",
+      "tags": "audio, waterproof, swimming",
+      "variants": [
+        {
+          "id": 45119002701,
+          "sku": "AUR-SWIM-BLU",
+          "price": "119.00",
+          "inventory_quantity": 64
+        }
+      ]
+    },
+    {
+      "id": 7812300458,
+      "title": "Aurora Waterproof Sport Headphones",
+      "handle": "aurora-waterproof-sport-headphones",
+      "product_type": "Waterproof Headphones",
+      "status": "active",
+      "tags": "audio, waterproof, sport",
+      "variants": [
+        {
+          "id": 45119002801,
+          "sku": "AUR-SPORT-ORG",
+          "price": "109.00",
+          "inventory_quantity": 41
+        }
+      ]
+    }
+  ]
+}

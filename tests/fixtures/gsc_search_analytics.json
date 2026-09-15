@@ -1,0 +1,253 @@
+{
+  "rows": [
+    {
+      "keys": [
+        "2026-09-10",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 482.0,
+      "impressions": 18200.0,
+      "ctr": 0.0265,
+      "position": 4.7
+    },
+    {
+      "keys": [
+        "2026-09-10",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 301.0,
+      "impressions": 9400.0,
+      "ctr": 0.032,
+      "position": 3.2
+    },
+    {
+      "keys": [
+        "2026-09-10",
+        "best budget noise cancelling headphones",
+        "https://example.com/collections/budget-noise-cancelling",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 154.0,
+      "impressions": 6100.0,
+      "ctr": 0.0252,
+      "position": 5.8
+    },
+    {
+      "keys": [
+        "2026-09-09",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 465.0,
+      "impressions": 17890.0,
+      "ctr": 0.026,
+      "position": 4.9
+    },
+    {
+      "keys": [
+        "2026-09-09",
+        "bose quietcomfort comparison",
+        "https://example.com/blogs/guides/bose-quietcomfort-ultra-vs-xm5",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 88.0,
+      "impressions": 3400.0,
+      "ctr": 0.0259,
+      "position": 9.1
+    },
+    {
+      "keys": [
+        "2026-09-09",
+        "bose quietcomfort comparison",
+        "https://example.com/blogs/guides/bose-quietcomfort-ultra-vs-xm5",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 61.0,
+      "impressions": 2285.0,
+      "ctr": 0.0267,
+      "position": 8.6
+    },
+    {
+      "keys": [
+        "2026-08-13",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 210.0,
+      "impressions": 7000.0,
+      "ctr": 0.03,
+      "position": 7.4
+    },
+    {
+      "keys": [
+        "2026-08-20",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 195.0,
+      "impressions": 6800.0,
+      "ctr": 0.0287,
+      "position": 4.1
+    },
+    {
+      "keys": [
+        "2026-08-27",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 230.0,
+      "impressions": 6400.0,
+      "ctr": 0.0359,
+      "position": 4.6
+    },
+    {
+      "keys": [
+        "2026-09-04",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 150.0,
+      "impressions": 5800.0,
+      "ctr": 0.0259,
+      "position": 9.2
+    },
+    {
+      "keys": [
+        "2026-08-13",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 170.0,
+      "impressions": 5500.0,
+      "ctr": 0.0309,
+      "position": 7.3
+    },
+    {
+      "keys": [
+        "2026-08-20",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 205.0,
+      "impressions": 6100.0,
+      "ctr": 0.0336,
+      "position": 4.2
+    },
+    {
+      "keys": [
+        "2026-08-27",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 260.0,
+      "impressions": 5200.0,
+      "ctr": 0.05,
+      "position": 6.1
+    },
+    {
+      "keys": [
+        "2026-08-13",
+        "noise cancelling headphones sale",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 88.0,
+      "impressions": 3100.0,
+      "ctr": 0.0284,
+      "position": 8.2
+    },
+    {
+      "keys": [
+        "2026-08-14",
+        "noise cancelling headphones sale",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 91.0,
+      "impressions": 3050.0,
+      "ctr": 0.0298,
+      "position": 8.0
+    },
+    {
+      "keys": [
+        "2026-08-15",
+        "noise cancelling headphones sale",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 85.0,
+      "impressions": 2980.0,
+      "ctr": 0.0285,
+      "position": 8.4
+    },
+    {
+      "keys": [
+        "2026-09-08",
+        "noise cancelling headphones sale",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 5.0,
+      "impressions": 980.0,
+      "ctr": 0.0051,
+      "position": 11.3
+    },
+    {
+      "keys": [
+        "2026-09-09",
+        "noise cancelling headphones sale",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 7.0,
+      "impressions": 1020.0,
+      "ctr": 0.0069,
+      "position": 11.1
+    },
+    {
+      "keys": [
+        "2026-09-10",
+        "noise cancelling headphones sale",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 6.0,
+      "impressions": 1000.0,
+      "ctr": 0.006,
+      "position": 11.5
+    }
+  ],
+  "responseAggregationType": "byPage",
+  "rowCount": 19
+}

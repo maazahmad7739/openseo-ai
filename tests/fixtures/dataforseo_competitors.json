@@ -1,0 +1,506 @@
+{
+  "version": "0.1.20240514",
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "time": "0.5412 sec.",
+  "cost": 0.0103,
+  "tasks_count": 1,
+  "tasks_error": 0,
+  "tasks": [
+    {
+      "id": "c3d4e5f6-0000-0000-0000-000000000003",
+      "status_code": 20000,
+      "status_message": "Ok.",
+      "time": "0.4846 sec.",
+      "cost": 0.0103,
+      "result_count": 1,
+      "path": [
+        "v3",
+        "dataforseo_labs",
+        "google",
+        "competitors_domain",
+        "live"
+      ],
+      "data": {
+        "api": "dataforseo_labs",
+        "function": "competitors_domain",
+        "se_type": "google",
+        "target": "example.com",
+        "language_name": "English",
+        "location_code": 2840,
+        "limit": 2
+      },
+      "result": [
+        {
+          "se_type": "google",
+          "target": "example.com",
+          "location_code": 2840,
+          "language_code": "en",
+          "total_count": 412,
+          "items_count": 3,
+          "items": [
+            {
+              "se_type": "google",
+              "domain": "big-audio.com",
+              "avg_position": 12.4,
+              "sum_position": 5110,
+              "intersections": 412,
+              "full_domain_metrics": {
+                "organic": {
+                  "pos_1": 31,
+                  "pos_2_3": 78,
+                  "pos_4_10": 210,
+                  "pos_11_20": 95,
+                  "pos_21_30": 12,
+                  "pos_31_40": 0,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 168942.3,
+                  "count": 412,
+                  "estimated_paid_traffic_cost": 98210.1,
+                  "is_new": 41,
+                  "is_up": 66,
+                  "is_down": 38,
+                  "is_lost": 12,
+                  "clickstream_etv": 4102.0,
+                  "clickstream_gender_distribution": {
+                    "female": 44,
+                    "male": 56
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 14,
+                    "25-34": 38,
+                    "35-44": 29,
+                    "45-54": 13,
+                    "55-64": 6
+                  }
+                },
+                "paid": {
+                  "pos_1": 2,
+                  "pos_2_3": 5,
+                  "pos_4_10": 11,
+                  "pos_11_20": 0,
+                  "pos_21_30": 0,
+                  "pos_31_40": 0,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 1201.4,
+                  "count": 18,
+                  "estimated_paid_traffic_cost": 4500.0,
+                  "is_new": 3,
+                  "is_up": 2,
+                  "is_down": 1,
+                  "is_lost": 0,
+                  "clickstream_etv": 88.0,
+                  "clickstream_gender_distribution": {
+                    "female": 50,
+                    "male": 50
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 0,
+                    "25-34": 60,
+                    "35-44": 40,
+                    "45-54": 0,
+                    "55-64": 0
+                  }
+                },
+                "local_pack": null,
+                "featured_snippet": null
+              },
+              "metrics": {
+                "organic": {
+                  "pos_1": 2,
+                  "pos_2_3": 6,
+                  "pos_4_10": 41,
+                  "pos_11_20": 88,
+                  "pos_21_30": 102,
+                  "pos_31_40": 98,
+                  "pos_41_50": 75,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 24110.6,
+                  "count": 412,
+                  "estimated_paid_traffic_cost": 18200.0,
+                  "is_new": 9,
+                  "is_up": 24,
+                  "is_down": 44,
+                  "is_lost": 0,
+                  "clickstream_etv": 810.0,
+                  "clickstream_gender_distribution": {
+                    "female": 46,
+                    "male": 54
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 12,
+                    "25-34": 40,
+                    "35-44": 31,
+                    "45-54": 11,
+                    "55-64": 6
+                  }
+                },
+                "paid": {
+                  "pos_1": 0,
+                  "pos_2_3": 1,
+                  "pos_4_10": 4,
+                  "pos_11_20": 0,
+                  "pos_21_30": 0,
+                  "pos_31_40": 0,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 302.1,
+                  "count": 5,
+                  "estimated_paid_traffic_cost": 900.0,
+                  "is_new": 0,
+                  "is_up": 1,
+                  "is_down": 0,
+                  "is_lost": 0,
+                  "clickstream_etv": 0,
+                  "clickstream_gender_distribution": {
+                    "female": 0,
+                    "male": 0
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 0,
+                    "25-34": 0,
+                    "35-44": 0,
+                    "45-54": 0,
+                    "55-64": 0
+                  }
+                },
+                "local_pack": null,
+                "featured_snippet": null
+              },
+              "competitor_metrics": {
+                "organic": {
+                  "pos_1": 9,
+                  "pos_2_3": 14,
+                  "pos_4_10": 57,
+                  "pos_11_20": 91,
+                  "pos_21_30": 88,
+                  "pos_31_40": 72,
+                  "pos_41_50": 81,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 33218.9,
+                  "count": 412,
+                  "estimated_paid_traffic_cost": 30155.0,
+                  "is_new": 22,
+                  "is_up": 40,
+                  "is_down": 35,
+                  "is_lost": 8,
+                  "clickstream_etv": 1510.0,
+                  "clickstream_gender_distribution": {
+                    "female": 48,
+                    "male": 52
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 10,
+                    "25-34": 42,
+                    "35-44": 33,
+                    "45-54": 9,
+                    "55-64": 6
+                  }
+                },
+                "paid": {
+                  "pos_1": 0,
+                  "pos_2_3": 0,
+                  "pos_4_10": 0,
+                  "pos_11_20": 0,
+                  "pos_21_30": 0,
+                  "pos_31_40": 0,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 0,
+                  "count": 0,
+                  "estimated_paid_traffic_cost": 0,
+                  "is_new": 0,
+                  "is_up": 0,
+                  "is_down": 0,
+                  "is_lost": 0,
+                  "clickstream_etv": 0,
+                  "clickstream_gender_distribution": {
+                    "female": 0,
+                    "male": 0
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 0,
+                    "25-34": 0,
+                    "35-44": 0,
+                    "45-54": 0,
+                    "55-64": 0
+                  }
+                },
+                "local_pack": null,
+                "featured_snippet": null
+              }
+            },
+            {
+              "se_type": "google",
+              "domain": "audiohouse.com",
+              "avg_position": 18.7,
+              "sum_position": 3352,
+              "intersections": 179,
+              "full_domain_metrics": {
+                "organic": {
+                  "pos_1": 12,
+                  "pos_2_3": 34,
+                  "pos_4_10": 61,
+                  "pos_11_20": 52,
+                  "pos_21_30": 20,
+                  "pos_31_40": 0,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 84211.0,
+                  "count": 179,
+                  "estimated_paid_traffic_cost": 51200.0,
+                  "is_new": 18,
+                  "is_up": 33,
+                  "is_down": 21,
+                  "is_lost": 6,
+                  "clickstream_etv": 990.0,
+                  "clickstream_gender_distribution": {
+                    "female": 41,
+                    "male": 59
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 8,
+                    "25-34": 44,
+                    "35-44": 36,
+                    "45-54": 8,
+                    "55-64": 4
+                  }
+                },
+                "paid": null,
+                "local_pack": null,
+                "featured_snippet": null
+              },
+              "metrics": {
+                "organic": {
+                  "pos_1": 1,
+                  "pos_2_3": 4,
+                  "pos_4_10": 12,
+                  "pos_11_20": 39,
+                  "pos_21_30": 44,
+                  "pos_31_40": 79,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 9210.2,
+                  "count": 179,
+                  "estimated_paid_traffic_cost": 5600.0,
+                  "is_new": 5,
+                  "is_up": 11,
+                  "is_down": 30,
+                  "is_lost": 0,
+                  "clickstream_etv": 120.0,
+                  "clickstream_gender_distribution": {
+                    "female": 39,
+                    "male": 61
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 9,
+                    "25-34": 47,
+                    "35-44": 34,
+                    "45-54": 7,
+                    "55-64": 3
+                  }
+                },
+                "paid": null,
+                "local_pack": null,
+                "featured_snippet": null
+              },
+              "competitor_metrics": {
+                "organic": {
+                  "pos_1": 3,
+                  "pos_2_3": 7,
+                  "pos_4_10": 19,
+                  "pos_11_20": 41,
+                  "pos_21_30": 50,
+                  "pos_31_40": 59,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 11391.0,
+                  "count": 179,
+                  "estimated_paid_traffic_cost": 7400.0,
+                  "is_new": 8,
+                  "is_up": 15,
+                  "is_down": 25,
+                  "is_lost": 2,
+                  "clickstream_etv": 180.0,
+                  "clickstream_gender_distribution": {
+                    "female": 40,
+                    "male": 60
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 7,
+                    "25-34": 45,
+                    "35-44": 38,
+                    "45-54": 7,
+                    "55-64": 3
+                  }
+                },
+                "paid": null,
+                "local_pack": null,
+                "featured_snippet": null
+              }
+            },
+            {
+              "se_type": "google",
+              "domain": "example.com",
+              "avg_position": 21.3,
+              "sum_position": 4012,
+              "intersections": 0,
+              "full_domain_metrics": {
+                "organic": {
+                  "pos_1": 4,
+                  "pos_2_3": 18,
+                  "pos_4_10": 62,
+                  "pos_11_20": 71,
+                  "pos_21_30": 33,
+                  "pos_31_40": 0,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 72100.0,
+                  "count": 188,
+                  "estimated_paid_traffic_cost": 29800.0,
+                  "is_new": 12,
+                  "is_up": 29,
+                  "is_down": 17,
+                  "is_lost": 4,
+                  "clickstream_etv": 775.0,
+                  "clickstream_gender_distribution": {
+                    "female": 45,
+                    "male": 55
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 11,
+                    "25-34": 43,
+                    "35-44": 34,
+                    "45-54": 8,
+                    "55-64": 4
+                  }
+                },
+                "paid": null,
+                "local_pack": null,
+                "featured_snippet": null
+              },
+              "metrics": {
+                "organic": {
+                  "pos_1": 4,
+                  "pos_2_3": 18,
+                  "pos_4_10": 62,
+                  "pos_11_20": 71,
+                  "pos_21_30": 33,
+                  "pos_31_40": 0,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 72100.0,
+                  "count": 188,
+                  "estimated_paid_traffic_cost": 29800.0,
+                  "is_new": 12,
+                  "is_up": 29,
+                  "is_down": 17,
+                  "is_lost": 4,
+                  "clickstream_etv": 775.0,
+                  "clickstream_gender_distribution": {
+                    "female": 45,
+                    "male": 55
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 11,
+                    "25-34": 43,
+                    "35-44": 34,
+                    "45-54": 8,
+                    "55-64": 4
+                  }
+                },
+                "paid": null,
+                "local_pack": null,
+                "featured_snippet": null
+              },
+              "competitor_metrics": {
+                "organic": {
+                  "pos_1": 4,
+                  "pos_2_3": 18,
+                  "pos_4_10": 62,
+                  "pos_11_20": 71,
+                  "pos_21_30": 33,
+                  "pos_31_40": 0,
+                  "pos_41_50": 0,
+                  "pos_51_60": 0,
+                  "pos_61_70": 0,
+                  "pos_71_80": 0,
+                  "pos_81_90": 0,
+                  "pos_91_100": 0,
+                  "etv": 72100.0,
+                  "count": 188,
+                  "estimated_paid_traffic_cost": 29800.0,
+                  "is_new": 12,
+                  "is_up": 29,
+                  "is_down": 17,
+                  "is_lost": 4,
+                  "clickstream_etv": 775.0,
+                  "clickstream_gender_distribution": {
+                    "female": 45,
+                    "male": 55
+                  },
+                  "clickstream_age_distribution": {
+                    "18-24": 11,
+                    "25-34": 43,
+                    "35-44": 34,
+                    "45-54": 8,
+                    "55-64": 4
+                  }
+                },
+                "paid": null,
+                "local_pack": null,
+                "featured_snippet": null
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

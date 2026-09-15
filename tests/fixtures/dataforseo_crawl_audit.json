@@ -1,0 +1,120 @@
+{
+  "status_code": 20000,
+  "status_message": "Ok.",
+  "cost": 0.5,
+  "tasks_count": 1,
+  "tasks_error": 0,
+  "tasks": [
+    {
+      "id": "20260910-3100-0000-0000-crawl-audit-01",
+      "status_code": 20000,
+      "status_message": "Ok.",
+      "cost": 0.5,
+      "result": [
+        {
+          "type": "on_page",
+          "domain": "example.com",
+          "crawl_progress": "finished",
+          "pages": [
+            {
+              "url": "https://example.com/collections/wireless-noise-cancelling-headphones",
+              "status_code": 200,
+              "indexable": true,
+              "canonical": "https://example.com/collections/wireless-noise-cancelling-headphones",
+              "page_type": "collection",
+              "template": "collection.liquid",
+              "crawl_depth": 2,
+              "internal_links_in": 18,
+              "internal_links_out": 24,
+              "raw_html_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+              "rendered_html_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+              "render_status": "render_failed",
+              "structured_data": true,
+              "is_orphan": false
+            },
+            {
+              "url": "https://example.com/collections/budget-noise-cancelling",
+              "status_code": 200,
+              "indexable": true,
+              "canonical": "https://example.com/collections/budget-noise-cancelling",
+              "page_type": "collection",
+              "template": "collection.liquid",
+              "crawl_depth": 2,
+              "internal_links_in": 7,
+              "internal_links_out": 12,
+              "raw_html_hash": "b2c3d4e5f60718293a4b5c6d7e8f90a1",
+              "rendered_html_hash": "c3d4e5f60718293a4b5c6d7e8f90a1b2",
+              "render_status": "js_rendered",
+              "structured_data": false,
+              "is_orphan": false
+            },
+            {
+              "url": "https://example.com/collections/wireless-headphones",
+              "status_code": 200,
+              "indexable": false,
+              "canonical": "https://example.com/collections/wireless-noise-cancelling-headphones",
+              "page_type": "collection",
+              "template": "collection.liquid",
+              "crawl_depth": 2,
+              "internal_links_in": 5,
+              "internal_links_out": 8,
+              "raw_html_hash": "d4e5f60718293a4b5c6d7e8f90a1b2c3",
+              "rendered_html_hash": "e5f60718293a4b5c6d7e8f90a1b2c3d4",
+              "render_status": "js_rendered",
+              "structured_data": false,
+              "is_orphan": false
+            },
+            {
+              "url": "https://example.com/blogs/guides/bose-quietcomfort-ultra-vs-xm5",
+              "status_code": 200,
+              "indexable": true,
+              "canonical": "https://example.com/blogs/guides/bose-quietcomfort-ultra-vs-xm5",
+              "page_type": "blog",
+              "template": "article.liquid",
+              "crawl_depth": 3,
+              "internal_links_in": 4,
+              "internal_links_out": 9,
+              "raw_html_hash": "f60718293a4b5c6d7e8f90a1b2c3d4e5",
+              "rendered_html_hash": "0718293a4b5c6d7e8f90a1b2c3d4e5f6",
+              "render_status": "js_rendered",
+              "structured_data": true,
+              "is_orphan": false
+            },
+            {
+              "url": "https://example.com/collections/deep-archived-audio",
+              "status_code": 200,
+              "indexable": true,
+              "canonical": "https://example.com/collections/deep-archived-audio",
+              "page_type": "collection",
+              "template": "collection.liquid",
+              "crawl_depth": 7,
+              "internal_links_in": 1,
+              "internal_links_out": 3,
+              "raw_html_hash": "718293a4b5c6d7e8f90a1b2c3d4e5f607",
+              "rendered_html_hash": "8293a4b5c6d7e8f90a1b2c3d4e5f60718",
+              "render_status": "js_rendered",
+              "structured_data": false,
+              "is_orphan": false
+            },
+            {
+              "url": "https://example.com/products/aurora-pro-wireless-noise-cancelling-headphones",
+              "status_code": 200,
+              "indexable": true,
+              "canonical": "https://example.com/products/aurora-pro-wireless-noise-cancelling-headphones",
+              "page_type": "product",
+              "template": "product.liquid",
+              "crawl_depth": 3,
+              "internal_links_in": 12,
+              "internal_links_out": 15,
+              "raw_html_hash": "93a4b5c6d7e8f90a1b2c3d4e5f6071829",
+              "rendered_html_hash": "a4b5c6d7e8f90a1b2c3d4e5f60718293a",
+              "render_status": "js_rendered",
+              "structured_data": true,
+              "is_orphan": false
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

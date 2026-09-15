@@ -1,0 +1,37 @@
+# Secrets & local config
+.env
+*.pem
+*service-account*.json
+*service_account*.json
+gcp-keys/
+secrets/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node / Python
+node_modules/
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Build output
+dist/
+.vite/
+.tanstack/
+.wrangler/
+.vercel/
+
+# Local data
+*.dump
+*.log
+.temp/
+.openchamber/
+infra/open-seo/
+
+# OS
+Thumbs.db
+.DS_Store

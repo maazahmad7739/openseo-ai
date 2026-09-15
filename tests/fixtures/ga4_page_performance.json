@@ -1,0 +1,46 @@
+{
+  "dimensionHeaders": [
+    {"name": "date"},
+    {"name": "pagePath"},
+    {"name": "sessionDefaultChannelGroup"}
+  ],
+  "metricHeaders": [
+    {"name": "sessions", "type": "TYPE_INTEGER"},
+    {"name": "engagedSessions", "type": "TYPE_INTEGER"},
+    {"name": "addToCarts", "type": "TYPE_INTEGER"},
+    {"name": "checkouts", "type": "TYPE_INTEGER"},
+    {"name": "transactions", "type": "TYPE_INTEGER"},
+    {"name": "totalRevenue", "type": "TYPE_CURRENCY"}
+  ],
+  "rows": [
+    {
+      "dimensionValues": [{"value": "20260909"}, {"value": "/collections/wireless-noise-cancelling-headphones"}, {"value": "Organic Search"}],
+      "metricValues": [{"value": "812"}, {"value": "594"}, {"value": "46"}, {"value": "31"}, {"value": "24"}, {"value": "5976.00"}]
+    },
+    {
+      "dimensionValues": [{"value": "20260909"}, {"value": "/blogs/guides/bose-quietcomfort-ultra-vs-xm5"}, {"value": "Organic Search"}],
+      "metricValues": [{"value": "344"}, {"value": "221"}, {"value": "9"}, {"value": "5"}, {"value": "4"}, {"value": "996.00"}]
+    },
+    {
+      "dimensionValues": [{"value": "20260909"}, {"value": "/collections/budget-noise-cancelling"}, {"value": "Organic Search"}],
+      "metricValues": [{"value": "188"}, {"value": "120"}, {"value": "8"}, {"value": "4"}, {"value": "3"}, {"value": "237.00"}]
+    },
+    {
+      "dimensionValues": [{"value": "20260910"}, {"value": "/collections/wireless-noise-cancelling-headphones"}, {"value": "Organic Search"}],
+      "metricValues": [{"value": "905"}, {"value": "661"}, {"value": "52"}, {"value": "36"}, {"value": "29"}, {"value": "7221.00"}]
+    },
+    {
+      "dimensionValues": [{"value": "20260910"}, {"value": "/blogs/guides/bose-quietcomfort-ultra-vs-xm5"}, {"value": "Organic Search"}],
+      "metricValues": [{"value": "329"}, {"value": "204"}, {"value": "7"}, {"value": "3"}, {"value": "2"}, {"value": "498.00"}]
+    },
+    {
+      "dimensionValues": [{"value": "20260910"}, {"value": "/collections/budget-noise-cancelling"}, {"value": "Organic Search"}],
+      "metricValues": [{"value": "201"}, {"value": "137"}, {"value": "10"}, {"value": "6"}, {"value": "5"}, {"value": "395.00"}]
+    }
+  ],
+  "rowCount": 6,
+  "metadata": {
+    "currencyCode": "USD",
+    "timeZone": "America/Los_Angeles"
+  }
+}

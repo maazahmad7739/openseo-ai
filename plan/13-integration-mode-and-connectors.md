@@ -1,0 +1,116 @@
+-- ============================================================
+-- 13 — INTEGRATION MODE & CONNECTOR SCHEMAS
+-- Central offline-mock architecture for all third-party connectors
+-- ============================================================
+
+-- §0 GOAL
+-- The application is decoupled from real third-party credentials. It runs
+-- completely offline on realistic sample data, behaves exactly as if connected
+-- to live services, and switches to real accounts later WITHOUT core-code
+-- changes — via one central switch.
+--
+-- §1 CENTRAL SWITCH
+--
+-- INTEGRATION_MODE ∈ {mock, live}    -- env var; default: mock
+--
+-- Resolution order per connector (mode.py::resolve_mode):
+--   1. explicit per-call config value (e.g. cfg["openseo.mode"])
+--   2. INTEGRATION_MODE env
+--   3. legacy per-connector envs (OPENSEO_MOCK_MODE, GSC_MOCK_MODE,
+--      SHOPIFY_MOCK_MODE, GA4_MOCK_MODE) — honored for backward compat
+--   4. default "mock"
+--
+-- Guarantees:
+--   - Default = mock. The application NEVER touches the network unless live
+--     mode is requested explicitly (per connector).
+--   - Invalid mode values raise ModeError loudly (no silent fallthrough).
+--   - Mock mode loads offline fixtures; missing fixture → typed provider_error,
+--     never a crash.
+--   - Live mode requires credentials; without them each facade raises a config
+--     error naming the exact env var to set.
+--
+-- §2 ADAPTER CONTRACT (all connectors)
+--
+-- Every connector implements exactly two methods:
+--   supports(capability: str) -> bool
+--   fetch(capability: str, params: dict) -> response
+--
+-- fetch() NEVER raises. Failure responses are typed and logged-and-skipped:
+--   {"ok": False, "capability": ..., "error": "unsupported_capability"}
+--   {"ok": False, "capability": ..., "error": "provider_error", "detail": ...}
+--
+-- §3 CONNECTOR REGISTRY
+--
+-- ┌────────────┬───────────┬─────────────────────────────┬──────────────────────────────┐
+-- │ connector  │ scope     │ live credential (env)        │ capabilities                 │
+-- ├────────────┼───────────┼─────────────────────────────┼──────────────────────────────┤
+-- │ openseo    │ global    │ DATAFORSEO_API_KEY           │ keyword_volume, serp,        │
+-- │ (DataForSEO│ (one      │ (Basic base64 email:pass)    │ competitors, backlinks       │
+-- │  wrapper)  │  company) │                              │                              │
+-- │ gsc        │ per-site  │ GSC_SERVICE_ACCOUNT_KEY_FILE │ sites, search_analytics      │
+-- │            │           │ _JSON; client_email must be  │                              │
+-- │            │           │ authorized user on property  │                              │
+-- │ shopify    │ per-site  │ SHOPIFY_DOMAIN +             │ products, collections        │
+-- │            │           │ SHOPIFY_ACCESS_TOKEN         │                              │
+-- │ ga4        │ per-site  │ GA4_PROPERTY_ID +            │ page_performance             │
+-- │            │           │ GA4_ACCESS_TOKEN (OAuth)     │                              │
+-- └────────────┴───────────┴─────────────────────────────┴──────────────────────────────┘
+--
+-- §4 NORMALIZED SCHEMAS (mock == live shapes; target tables in 00-schema.sql)
+--
+-- gsc.search_analytics → search_performance columns
+--   {date "YYYY-MM-DD", query, page_url, country ISO-3166-1-alpha-3, device
+--    DESKTOP|MOBILE|TABLET, clicks int, impressions int, ctr 0..1, position float}
+--   page_url_hash stays DB-generated (00-schema.sql:184 md5 STORED).
+--   Request: {site_url, start_date, end_date, dimensions, row_limit, start_row,
+--             type, data_state, dimension_filter_groups}
+--   GSC wire: {rows: [{keys[] (dimension order), clicks, impressions, ctr,
+--             position}], responseAggregationType}
+--
+-- gsc.sites → {site_url, permission_level}
+--   GSC wire: {siteEntry: [{siteUrl, permissionLevel}]}
+--
+-- shopify.products → catalogue rows
+--   {product_id str, title, handle, product_type, status active|draft,
+--    tags, total_inventory int, in_stock bool, variants:[{variant_id, sku,
+--    price str, inventory_quantity}]}
+--   Shopify wire: {products: [{id, title, handle, product_type, status, tags,
+--             variants: [{id, sku, price, inventory_quantity}]}]}
+--   (variants use wire key "id"; adapter maps to variant_id)
+--
+-- shopify.collections → {collection_id str, title, handle, collection_type
+--   smart|custom, published bool, url, rules[]}
+--   Shopify wire: {custom_collections: [...], smart_collections: [...]}
+--
+-- ga4.page_performance → page_business_performance columns
+--   {date ISO (GA4 wire YYYYMMDD → normalized), page_path, organic_sessions,
+--    engaged_sessions, add_to_carts, checkouts, orders, revenue,
+--    conversion_rate}
+--   GA4 wire: {rows: [{dimensionValues[], metricValues[]}], rowCount, metadata}
+--   Live request: runReport, Organic Search channel filter.
+--
+-- openseo.* → see plan/11 §4 (keyword_volume, serp, competitors, backlinks)
+--   Known gaps documented in plan/11 §4.5:
+--   overlap_score has no API source (null), competitors target-self skipped,
+--   serp organic-only with position=rank_absolute.
+--
+-- §5 FIXTURE UNIVERSE (tests/fixtures)
+-- One consistent fictional universe ("Aurora" headphone store, example.com):
+-- dataforseo_* (4), gsc_* (2), shopify_* (2), ga4_* (1). Dates, URLs, and
+-- queries interlock across fixtures (asserted in the integration harness) so
+-- joins across tables work end-to-end in mock mode.
+--
+-- §6 AI AGENT PROVIDER (Phase 4, reserved)
+-- Ollama Cloud is the primary LLM provider for the recommendation agent.
+-- Agent layer defaults to sample dummy output when offline; automatically
+-- routes to live Ollama calls once endpoint + credentials are provided.
+-- Same central-switch pattern: AGENT_MODE resolution + loud refusal when live
+-- is requested without credentials. Contract finalized in Phase 4.
+--
+-- §7 SWITCHING TO LIVE (future, zero code changes)
+-- 1. Set INTEGRATION_MODE=live (or per-connector cfg/env overrides).
+-- 2. Provide per-connector credentials from §3 table.
+-- 3. Adapters already implement the live HTTP paths; facades resolve the
+--    credentials only in live mode.
+-- Test-first recommendation: flip ONE connector at a time (e.g. gsc.mode=live)
+-- while the rest remain mock.
