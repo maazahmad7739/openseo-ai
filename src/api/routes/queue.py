@@ -235,6 +235,8 @@ def get_queue(
         )
         for r in rows
     ]
+    return QueueOut(site_id=site_id, total_proposed=total, showing=len(items),
+                    recommendations=items)
 
 
 def _parse_jsonb_queue(value):
@@ -247,8 +249,6 @@ def _parse_jsonb_queue(value):
         return json.loads(value)
     except (TypeError, ValueError):
         return None
-    return QueueOut(site_id=site_id, total_proposed=total, showing=len(items),
-                    recommendations=items)
 
 
 @router.get("/{recommendation_id}", response_model=QueueDetailOut)
