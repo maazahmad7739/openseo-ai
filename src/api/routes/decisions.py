@@ -7,6 +7,7 @@ the agent consumes as few-shot context next run (plan/08 learning loop).
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from uuid import UUID
 
 from api.common import get_conn, get_recommendation, validate_transition
 from api.models.schemas import (
@@ -83,3 +84,23 @@ def assign(recommendation_id, body: AssignRequest, conn=Depends(get_conn)):
     conn.commit()
     return AssignOut(recommendation_id=recommendation_id, status=rec["status"],
                      owner=body.owner)
+
+
+class TransitionOut(BaseModel):
+    recommendation_id: UUID
+    status: str
+
+
+@router.post("/{recommendation_id}/live", response_model=TransitionOut)
+def mark_live(recommendation_id, conn=Depends(get_conn)):
+    """in_progress -> live: the change shipped and is now observable."""
+    rec = get_recommendation(conn, recommendation_id)
+    validate_transition(rec["status"], "live")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE recommendations SET status = 'live' "
+            "WHERE recommendation_id = %s",
+            (recommendation_id,),
+        )
+    conn.commit()
+    return TransitionOut(recommendation_id=recommendation_id, status="live")
