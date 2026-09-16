@@ -552,8 +552,13 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=MOCK_SITE, force_refresh=False):
             "gsc.mode": "mock", "gsc.mock_fixtures_dir": fixtures_dir,
             "gsc.site_url": site["gsc_property"],
         })
+        # OpenSEO mode is env-driven (OPENSEO_MODE, default "mock"): the daily
+        # sync is the paid-data path, so it stays offline unless explicitly
+        # switched to live. GSC/Shopify/GA4 remain fixture-driven here — their
+        # live credentials arrive via their own connectors, not this job.
         openseo = get_openseo_adapter(config={
-            "openseo.mode": "mock", "openseo.mock_fixtures_dir": fixtures_dir,
+            "openseo.mode": os.environ.get("OPENSEO_MODE", "mock"),
+            "openseo.mock_fixtures_dir": fixtures_dir,
         })
         from connectors.costlog import log_cost
         openseo._on_fetch_complete = lambda capability, params, result: log_cost(
