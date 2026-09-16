@@ -96,17 +96,25 @@ def build_system_prompt(candidates, system_prompt=None):
             f"\n\n---\n\n# SKILL FILE (loaded for generator: {gen})\n\n{skill_text}"
         )
     if injected:
+        injected_names = sorted({
+            gen for gen in generators if SKILL_FILES_BY_GENERATOR.get(gen)
+        })
+        note = (
+            "SKILL FILE PRECEDENCE:\n"
+            f"Full skill files are APPENDED below only for: {', '.join(injected_names)}.\n"
+            "For those types the appended file supersedes the inline summary.\n"
+            "Candidate types WITHOUT an appended file (missing_page,\n"
+            "existing_opportunity) follow the inline SKILLS BY CANDIDATE TYPE\n"
+            "summaries exactly — they are complete rules, not placeholders.\n"
+            "'No skill file' is NEVER a valid rejection reason; evaluate every\n"
+            "candidate with the rules that apply to its type."
+        )
         summary_start = system_prompt.find("SKILLS BY CANDIDATE TYPE:")
         summary_end = system_prompt.find("OUTPUT:", summary_start)
         if summary_start != -1 and summary_end != -1:
-            replacement = (
-                "SKILLS BY CANDIDATE TYPE:\n"
-                "The full skill files for the candidate types in this batch are\n"
-                "appended below. For those types, follow the APPENDED skill files\n"
-                "(complete step-by-step rules, per-issue checks, and worked\n"
-                "examples); the summary above is superseded."
-            )
-            system_prompt = (system_prompt[:summary_start] + replacement +
+            system_prompt = (system_prompt[:summary_start] +
+                             system_prompt[summary_start:summary_end].rstrip() +
+                             "\n\n" + note + "\n\n" +
                              system_prompt[summary_end:])
         system_prompt = system_prompt + "".join(injected)
     return system_prompt
@@ -139,6 +147,7 @@ def build_agent_input(conn, site_id, max_candidates=25):
         for (rec_id, generator, action_type, target_url, proposed_url,
              cluster_id, diagnosis, evidence_json) in rows:
             cluster = None
+            serp_evidence = []
             if cluster_id:
                 cur.execute(
                     "SELECT cluster_id, primary_keyword, keywords, intent, search_volume, "
@@ -155,10 +164,95 @@ def build_agent_input(conn, site_id, max_candidates=25):
                         "search_volume": crow[4],
                         "commercial_value": crow[5],
                     }
+                # Live SERP evidence (skill 1 §1 requirement): the latest
+                # snapshot rows for this cluster — who outranks whom, at which
+                # positions. Cap at 10 rows; empty list when none exist (the
+                # agent may then reject for missing SERP confirmation, which
+                # is the honest verdict, not a payload defect).
+                cur.execute(
+                    """
+                    SELECT result_url, result_domain, position, is_self, snapshot_date
+                    FROM openseo_serp_snapshots
+                    WHERE site_id = %s AND cluster_id = %s
+                    ORDER BY snapshot_date DESC, position ASC LIMIT 10
+                    """,
+                    (site_id, cluster_id),
+                )
+                serp_evidence = [
+                    {
+                        "position": r[2],
+                        "url": r[1] and r[0] or r[0],
+                        "domain": r[1],
+                        "is_self": r[3],
+                        "snapshot_date": str(r[4]),
+                    }
+                    for r in cur.fetchall()
+                ]
             try:
-                evidence = json.loads(evidence_json) if evidence_json else []
+                # psycopg2 already decodes JSONB to dict/list; json.loads()
+                # would raise TypeError on those (silently emptied by the
+                # except below, starving the agent of all generator evidence).
+                if isinstance(evidence_json, (dict, list)):
+                    evidence = evidence_json
+                elif evidence_json:
+                    evidence = json.loads(evidence_json)
+                else:
+                    evidence = []
             except (TypeError, ValueError):
                 evidence = []
+            # Page context for skill validation (plan/16 skill 4 checks
+            # render_status / indexability / crawl depth; plan/06/07 need GSC
+            # signals): crawl columns from pages + 28-day GSC aggregate for
+            # the target URL. All optional — NULL when no page row exists.
+            page_context = None
+            target = target_url or proposed_url
+            if target:
+                full_url = target if target.startswith("http") else f"https://{domain}{target}"
+                cur.execute(
+                    """
+                    SELECT p.indexable, p.status_code, p.canonical_url, p.crawl_depth,
+                           p.internal_links_in, p.internal_links_out, p.product_count,
+                           p.is_orphan, p.has_structured_data, p.render_status,
+                           p.raw_html_hash, p.rendered_html_hash, p.page_type, p.title
+                    FROM pages p WHERE p.site_id = %s AND p.url = %s
+                    """,
+                    (site_id, full_url),
+                )
+                prow = cur.fetchone()
+                if prow:
+                    cur.execute(
+                        """
+                        SELECT COALESCE(SUM(s.clicks), 0), COALESCE(SUM(s.impressions), 0),
+                               COALESCE(AVG(s.position), NULL), COUNT(DISTINCT s.query)
+                        FROM search_performance s
+                        WHERE s.site_id = %s AND s.page_url = %s
+                          AND s.date >= CURRENT_DATE - 28
+                        """,
+                        (site_id, full_url),
+                    )
+                    srow = cur.fetchone()
+                    page_context = {
+                        "url": full_url,
+                        "indexable": prow[0],
+                        "status_code": prow[1],
+                        "canonical_url": prow[2],
+                        "crawl_depth": prow[3],
+                        "internal_links_in": prow[4],
+                        "internal_links_out": prow[4],
+                        "product_count": prow[5],
+                        "is_orphan": prow[6],
+                        "has_structured_data": prow[7],
+                        "render_status": prow[8],
+                        "rendering_verifiable": bool(prow[9] and prow[10] and prow[11]),
+                        "page_type": prow[12],
+                        "title": prow[13],
+                        "gsc_28d": {
+                            "clicks": int(srow[0]),
+                            "impressions": int(srow[1]),
+                            "avg_position": float(srow[2]) if srow[2] is not None else None,
+                            "queries": int(srow[3]),
+                        },
+                    }
             candidate_payloads.append({
                 "candidate_id": str(rec_id),
                 "generator": generator,
@@ -168,6 +262,8 @@ def build_agent_input(conn, site_id, max_candidates=25):
                 "cluster": cluster,
                 "candidate_diagnosis": diagnosis,
                 "evidence_summary": evidence if isinstance(evidence, (dict, list)) else [],
+                "serp_evidence": serp_evidence,
+                "page_context": page_context,
             })
 
         cur.execute(
