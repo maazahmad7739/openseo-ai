@@ -559,6 +559,9 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=MOCK_SITE, force_refresh=False):
         openseo._on_fetch_complete = lambda capability, params, result: log_cost(
             conn, site_id, f"openseo_{capability}",
             call_type=capability,
+            # Provider-reported cost rides on every ok result (adapter adds
+            # result["cost"] from the raw envelope); never cost=None anymore.
+            cost=result.get("cost"),
             metadata={"params": params},
         )
         shopify = get_shopify_adapter(config={

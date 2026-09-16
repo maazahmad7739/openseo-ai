@@ -69,8 +69,14 @@ class OpenseoRestAdapter:
         try:
             raw = self._call(capability, params)
             result = self._normalize(capability, raw, params)
-            if result.get("ok") and self._on_fetch_complete:
-                self._on_fetch_complete(capability, params, result)
+            # Billing truth travels on every successful result: the provider's
+            # per-task cost from the raw envelope (smoke test proved the field
+            # is present and reliable: $0.09/search_volume, $0.002/serp).
+            # log_cost() callers read it instead of logging cost=None.
+            if result.get("ok"):
+                result["cost"] = self._provider_cost(raw)
+                if self._on_fetch_complete:
+                    self._on_fetch_complete(capability, params, result)
             return result
         except OpenseoUnsupportedCapability as exc:
             return {"ok": False, "capability": capability, "error": "unsupported_capability"}
@@ -78,6 +84,17 @@ class OpenseoRestAdapter:
             return {"ok": False, "capability": capability, "error": "provider_error", "detail": str(exc)}
         except Exception as exc:
             return {"ok": False, "capability": capability, "error": "provider_error", "detail": str(exc)}
+
+    @staticmethod
+    def _provider_cost(raw):
+        """Extract the provider-reported cost from a raw DataForSEO envelope.
+        Prefers the per-task cost; falls back to the envelope-level cost."""
+        if not raw:
+            return None
+        for task in raw.get("tasks", []) or []:
+            if isinstance(task, dict) and task.get("cost") is not None:
+                return task["cost"]
+        return raw.get("cost")
 
     def _call(self, capability, params):
         if capability not in ENDPOINTS:
