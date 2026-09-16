@@ -3,32 +3,6 @@
     {
       "keys": [
         "2026-09-10",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-noise-cancelling-headphones",
-        "USA",
-        "MOBILE"
-      ],
-      "clicks": 482.0,
-      "impressions": 18200.0,
-      "ctr": 0.0265,
-      "position": 4.7
-    },
-    {
-      "keys": [
-        "2026-09-10",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-noise-cancelling-headphones",
-        "USA",
-        "DESKTOP"
-      ],
-      "clicks": 301.0,
-      "impressions": 9400.0,
-      "ctr": 0.032,
-      "position": 3.2
-    },
-    {
-      "keys": [
-        "2026-09-10",
         "best budget noise cancelling headphones",
         "https://example.com/collections/budget-noise-cancelling",
         "USA",
@@ -38,19 +12,6 @@
       "impressions": 6100.0,
       "ctr": 0.0252,
       "position": 5.8
-    },
-    {
-      "keys": [
-        "2026-09-09",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-noise-cancelling-headphones",
-        "USA",
-        "MOBILE"
-      ],
-      "clicks": 465.0,
-      "impressions": 17890.0,
-      "ctr": 0.026,
-      "position": 4.9
     },
     {
       "keys": [
@@ -77,97 +38,6 @@
       "impressions": 2285.0,
       "ctr": 0.0267,
       "position": 8.6
-    },
-    {
-      "keys": [
-        "2026-08-13",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-headphones",
-        "USA",
-        "MOBILE"
-      ],
-      "clicks": 210.0,
-      "impressions": 7000.0,
-      "ctr": 0.03,
-      "position": 7.4
-    },
-    {
-      "keys": [
-        "2026-08-20",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-headphones",
-        "USA",
-        "DESKTOP"
-      ],
-      "clicks": 195.0,
-      "impressions": 6800.0,
-      "ctr": 0.0287,
-      "position": 4.1
-    },
-    {
-      "keys": [
-        "2026-08-27",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-headphones",
-        "USA",
-        "MOBILE"
-      ],
-      "clicks": 230.0,
-      "impressions": 6400.0,
-      "ctr": 0.0359,
-      "position": 4.6
-    },
-    {
-      "keys": [
-        "2026-09-04",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-headphones",
-        "USA",
-        "MOBILE"
-      ],
-      "clicks": 150.0,
-      "impressions": 5800.0,
-      "ctr": 0.0259,
-      "position": 9.2
-    },
-    {
-      "keys": [
-        "2026-08-13",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-noise-cancelling-headphones",
-        "USA",
-        "DESKTOP"
-      ],
-      "clicks": 170.0,
-      "impressions": 5500.0,
-      "ctr": 0.0309,
-      "position": 7.3
-    },
-    {
-      "keys": [
-        "2026-08-20",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-noise-cancelling-headphones",
-        "USA",
-        "DESKTOP"
-      ],
-      "clicks": 205.0,
-      "impressions": 6100.0,
-      "ctr": 0.0336,
-      "position": 4.2
-    },
-    {
-      "keys": [
-        "2026-08-27",
-        "wireless noise cancelling headphones",
-        "https://example.com/collections/wireless-noise-cancelling-headphones",
-        "USA",
-        "MOBILE"
-      ],
-      "clicks": 260.0,
-      "impressions": 5200.0,
-      "ctr": 0.05,
-      "position": 6.1
     },
     {
       "keys": [
@@ -246,6 +116,331 @@
       "impressions": 1000.0,
       "ctr": 0.006,
       "position": 11.5
+    },
+    {
+      "keys": [
+        "2026-08-13",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 197.0,
+      "impressions": 8200.0,
+      "ctr": 0.024,
+      "position": 4.0
+    },
+    {
+      "keys": [
+        "2026-08-13",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 121.0,
+      "impressions": 4100.0,
+      "ctr": 0.0295,
+      "position": 4.2
+    },
+    {
+      "keys": [
+        "2026-08-13",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 62.0,
+      "impressions": 3100.0,
+      "ctr": 0.02,
+      "position": 7.5
+    },
+    {
+      "keys": [
+        "2026-08-13",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 28.0,
+      "impressions": 1500.0,
+      "ctr": 0.0187,
+      "position": 7.2
+    },
+    {
+      "keys": [
+        "2026-08-14",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 188.0,
+      "impressions": 7800.0,
+      "ctr": 0.0241,
+      "position": 4.1
+    },
+    {
+      "keys": [
+        "2026-08-14",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 55.0,
+      "impressions": 2900.0,
+      "ctr": 0.019,
+      "position": 7.3
+    },
+    {
+      "keys": [
+        "2026-08-20",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 211.0,
+      "impressions": 8800.0,
+      "ctr": 0.024,
+      "position": 4.0
+    },
+    {
+      "keys": [
+        "2026-08-20",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 126.0,
+      "impressions": 4200.0,
+      "ctr": 0.03,
+      "position": 4.3
+    },
+    {
+      "keys": [
+        "2026-08-20",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 66.0,
+      "impressions": 3300.0,
+      "ctr": 0.0182,
+      "position": 7.8
+    },
+    {
+      "keys": [
+        "2026-08-21",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 195.0,
+      "impressions": 8100.0,
+      "ctr": 0.0241,
+      "position": 4.4
+    },
+    {
+      "keys": [
+        "2026-08-21",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 54.0,
+      "impressions": 3000.0,
+      "ctr": 0.018,
+      "position": 8.1
+    },
+    {
+      "keys": [
+        "2026-08-27",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 218.0,
+      "impressions": 9100.0,
+      "ctr": 0.024,
+      "position": 4.2
+    },
+    {
+      "keys": [
+        "2026-08-27",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 132.0,
+      "impressions": 4400.0,
+      "ctr": 0.03,
+      "position": 4.4
+    },
+    {
+      "keys": [
+        "2026-08-27",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 58.0,
+      "impressions": 3400.0,
+      "ctr": 0.0171,
+      "position": 8.9
+    },
+    {
+      "keys": [
+        "2026-08-28",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 205.0,
+      "impressions": 8600.0,
+      "ctr": 0.0238,
+      "position": 4.3
+    },
+    {
+      "keys": [
+        "2026-08-28",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 52.0,
+      "impressions": 3200.0,
+      "ctr": 0.0163,
+      "position": 9.4
+    },
+    {
+      "keys": [
+        "2026-09-04",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 230.0,
+      "impressions": 9400.0,
+      "ctr": 0.0245,
+      "position": 3.9
+    },
+    {
+      "keys": [
+        "2026-09-04",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 138.0,
+      "impressions": 4600.0,
+      "ctr": 0.03,
+      "position": 4.2
+    },
+    {
+      "keys": [
+        "2026-09-04",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 61.0,
+      "impressions": 3600.0,
+      "ctr": 0.0169,
+      "position": 8.0
+    },
+    {
+      "keys": [
+        "2026-09-09",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 225.0,
+      "impressions": 9000.0,
+      "ctr": 0.0256,
+      "position": 4.1
+    },
+    {
+      "keys": [
+        "2026-09-09",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 58.0,
+      "impressions": 3400.0,
+      "ctr": 0.0171,
+      "position": 7.7
+    },
+    {
+      "keys": [
+        "2026-09-10",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 245.0,
+      "impressions": 9200.0,
+      "ctr": 0.0266,
+      "position": 4.0
+    },
+    {
+      "keys": [
+        "2026-09-10",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 140.0,
+      "impressions": 4400.0,
+      "ctr": 0.0318,
+      "position": 4.4
+    },
+    {
+      "keys": [
+        "2026-09-10",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "MOBILE"
+      ],
+      "clicks": 54.0,
+      "impressions": 3300.0,
+      "ctr": 0.0164,
+      "position": 8.2
+    },
+    {
+      "keys": [
+        "2026-09-10",
+        "wireless noise cancelling headphones",
+        "https://example.com/collections/wireless-noise-cancelling-headphones",
+        "USA",
+        "DESKTOP"
+      ],
+      "clicks": 26.0,
+      "impressions": 1600.0,
+      "ctr": 0.0163,
+      "position": 8.4
     }
   ],
   "responseAggregationType": "byPage",

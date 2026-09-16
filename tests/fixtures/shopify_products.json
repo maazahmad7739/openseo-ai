@@ -124,13 +124,99 @@
       "handle": "aurora-waterproof-sport-headphones",
       "product_type": "Waterproof Headphones",
       "status": "active",
-      "tags": "audio, waterproof, sport",
+      "tags": "audio, waterproof, swimming, sport",
       "variants": [
         {
           "id": 45119002801,
           "sku": "AUR-SPORT-ORG",
           "price": "109.00",
           "inventory_quantity": 41
+        }
+      ]
+    },
+    {
+      "id": 7812300459,
+      "title": "Aurora Swim Pro Waterproof Swimming Headphones",
+      "handle": "aurora-swim-pro-waterproof-swimming-headphones",
+      "product_type": "Headphones",
+      "status": "active",
+      "tags": "audio, waterproof, swimming, premium",
+      "variants": [
+        {
+          "id": 45119002591,
+          "sku": "AUR-SWIMPRO-BLK",
+          "price": "199.00",
+          "inventory_quantity": 64
+        },
+        {
+          "id": 45119002592,
+          "sku": "AUR-SWIMPRO-BLU",
+          "price": "199.00",
+          "inventory_quantity": 22
+        }
+      ]
+    },
+    {
+      "id": 7812300460,
+      "title": "Aurora AquaLite Waterproof Swimming Headphones",
+      "handle": "aurora-aqualite-waterproof-swimming-headphones",
+      "product_type": "Headphones",
+      "status": "active",
+      "tags": "audio, waterproof, swimming, budget",
+      "variants": [
+        {
+          "id": 45119002601,
+          "sku": "AUR-AQUALITE-WHT",
+          "price": "129.00",
+          "inventory_quantity": 88
+        }
+      ]
+    },
+    {
+      "id": 7812300461,
+      "title": "Aurora Underwater Waterproof Swimming Headphones",
+      "handle": "aurora-underwater-waterproof-swimming-headphones",
+      "product_type": "Headphones",
+      "status": "active",
+      "tags": "audio, waterproof, swimming, sport",
+      "variants": [
+        {
+          "id": 45119002611,
+          "sku": "AUR-UNDERW-YLW",
+          "price": "149.00",
+          "inventory_quantity": 37
+        }
+      ]
+    },
+    {
+      "id": 7812300462,
+      "title": "Aurora Kids Waterproof Swimming Headphones",
+      "handle": "aurora-kids-waterproof-swimming-headphones",
+      "product_type": "Headphones",
+      "status": "active",
+      "tags": "audio, kids, waterproof, swimming",
+      "variants": [
+        {
+          "id": 45119002621,
+          "sku": "AUR-KIDS-SWIM",
+          "price": "99.00",
+          "inventory_quantity": 51
+        }
+      ]
+    },
+    {
+      "id": 7812300463,
+      "title": "Aurora OpenWater Waterproof Swimming Headphones",
+      "handle": "aurora-openwater-waterproof-swimming-headphones",
+      "product_type": "Headphones",
+      "status": "active",
+      "tags": "audio, waterproof, swimming, open-water",
+      "variants": [
+        {
+          "id": 45119002631,
+          "sku": "AUR-OPENW-ORG",
+          "price": "179.00",
+          "inventory_quantity": 26
         }
       ]
     }
