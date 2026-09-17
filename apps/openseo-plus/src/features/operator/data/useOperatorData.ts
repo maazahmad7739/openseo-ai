@@ -167,6 +167,7 @@ function mapQueueItem(
   // Defensive evidence parse (Option A): chips hide on malformed payloads.
   const evidence = parseEvidence(item.evidence_json);
   const gsc = extractGscSignals(evidence);
+  const position = gsc?.position ?? extractPosition(item.diagnosis);
   const catalogue = evidence.find((e) => e.source === "catalogue");
   const inStockMatch = catalogue
     ? `${catalogue.value ?? ""} ${catalogue.finding}`.match(
@@ -208,12 +209,12 @@ function mapQueueItem(
   };
   const hasVolume = item.search_volume != null && item.search_volume > 0;
   const hasGsc = gsc != null && (gsc.impressions > 0 || gsc.clicks > 0);
-  if (!hasVolume && !hasGsc && inStockProducts == null) {
+  if (!hasVolume && !hasGsc && inStockProducts == null && position == null) {
     return { rec, stats: undefined };
   }
   const stats: RecommendationStats = {
     volume: item.search_volume ?? 0,
-    position: gsc?.position ?? null,
+    position,
     competitorCount: 0,
     impressions: gsc?.impressions ?? 0,
     clicks: gsc?.clicks ?? 0,
@@ -234,24 +235,34 @@ function parseEvidence(value: unknown): EvidenceItem[] {
   );
 }
 
+/** Extract a rank position from evidence values or diagnosis text. Tolerant of
+ * `=`, `:`, and phrasing like "avg_position = 6.53" or "ranked position 5.8";
+ * returns null when no position is present. */
+export function extractPosition(text: string | null | undefined): number | null {
+  const match = String(text ?? "").match(
+    /(?:avg_position|position)\s*[:=]?\s*([\d.]+)/i,
+  );
+  return match ? Number(match[1]) : null;
+}
+
 /** Pull compact GSC metrics out of structured evidence `value` strings for
  * card chips (Option A defensive parse). Evidence values look like
- * "56,790 impressions | 1,713 clicks | pos 5.07" — tolerant of format drift;
- * returns null whenever nothing usable is found, and chips hide. */
+ * "56,790 impressions | 1,713 clicks | pos 5.07"; sources may be "GSC" or
+ * "Google Search Console" — tolerant of format drift; returns null whenever
+ * nothing usable is found, and chips hide. */
 export function extractGscSignals(
   evidence: EvidenceItem[],
 ): { impressions: number; clicks: number; position: number | null } | null {
   for (const item of evidence) {
-    if (item.source !== "GSC") continue;
+    if (item.source !== "GSC" && String(item.source) !== "Google Search Console") continue;
     const raw = `${item.value ?? ""} ${item.finding}`;
     const impMatch = raw.match(/([\d.,]+\s*k?)\s*impressions?/i);
     const clkMatch = raw.match(/([\d.,]+\s*k?)\s*clicks?/i);
-    const posMatch = raw.match(/position\s*([\d.]+)/i);
     const parse = (s: string) =>
       Number(s.replace(/[,\s]/g, "").replace(/k$/i, "000"));
     const impressions = impMatch ? parse(impMatch[1]) : null;
     const clicks = clkMatch ? parse(clkMatch[1]) : null;
-    const position = posMatch ? Number(posMatch[1]) : null;
+    const position = extractPosition(raw);
     if (impressions != null || clicks != null) {
       return { impressions: impressions ?? 0, clicks: clicks ?? 0, position };
     }

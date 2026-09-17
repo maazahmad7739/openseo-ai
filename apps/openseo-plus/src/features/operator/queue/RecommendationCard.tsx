@@ -124,7 +124,7 @@ export function RecommendationCard({
             ) : null}
             <StatChip
               label="Position"
-              value={stats.position ?? "—"}
+              value={stats.position ?? "N/A"}
               tone={stats.position != null && stats.position <= 3 ? "good" : "neutral"}
             />
             {stats.inStockProducts != null ? (
@@ -136,7 +136,7 @@ export function RecommendationCard({
             ) : null}
             <StatChip
               label="Effort"
-              value={rec.effort === "days" ? "~several days" : "~a day"}
+              value={rec.effort === "hours" ? "~few hours" : "~several days"}
             />
           </div>
         ) : null}
