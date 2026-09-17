@@ -11,7 +11,7 @@ import { PageHeader, PageTitle } from "../components/PageHeader";
 import { KpiCard } from "../components/KpiCard";
 import { DetailDrawer } from "../components/DetailDrawer";
 import { SkeletonCard, SkeletonStrip } from "../components/Skeleton";
-import { PipelineCard, PipelineColumn, RawCandidatesCard } from "./PipelineCard";
+import { PipelineCard, PipelineColumn } from "./PipelineCard";
 import type { CandidateRun } from "../data/types";
 
 const RUN_META: Record<
@@ -24,18 +24,12 @@ const RUN_META: Record<
   measurement: { label: "Measurement" },
 };
 
-/** Horizontal kanban of the whole recommendation flow. The raw stage is
- * represented by the latest candidate run (candidates are not yet rows in the
- * queue), then proposed → approved → in progress (incl. live) → measured. */
+/** Horizontal kanban of the recommendation lifecycle: proposed → approved →
+ * in progress (incl. live) → measured. */
 export function PipelinesPage({ projectId }: { projectId: string }) {
   const data = useOperatorData(projectId);
   const rows = data.data?.recommendations ?? EMPTY_RECS;
   const runs = data.data?.runs ?? EMPTY_RUNS;
-
-  const proposedCount = useMemo(
-    () => rows.filter((r) => r.status === "proposed").length,
-    [rows],
-  );
 
   const byStage = useMemo(
     () => ({
@@ -80,7 +74,7 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
 
       <PageTitle
         title="Pipeline"
-        subtitle="Follow recommendations from raw candidate to measured outcome"
+        subtitle="Follow recommendations from proposal to measured outcome"
       />
 
       {/* Pipeline health KPIs */}
@@ -119,17 +113,9 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
       ) : null}
 
       {/* Kanban board */}
-      <div className="app-panel overflow-hidden">
-        <div className="overflow-x-auto p-4">
-          <div className="flex gap-4 pb-1">
-            <PipelineColumn
-              title="Raw"
-              accentColor="bg-base-content/30"
-              count={0}
-            >
-              <RawCandidatesCard proposedCount={proposedCount} />
-            </PipelineColumn>
-
+      <div className="app-panel h-[calc(100vh-240px)] min-h-[320px] overflow-hidden">
+        <div className="kanban-scroll h-full overflow-x-auto p-4">
+          <div className="flex h-full gap-4 pb-1">
             <PipelineColumn
               title="Proposed"
               accentColor="bg-violet-400"

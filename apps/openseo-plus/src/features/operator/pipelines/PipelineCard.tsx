@@ -1,16 +1,16 @@
 import {
   CalendarClock,
-  ChevronRight,
   TimerReset,
 } from "lucide-react";
 import type { Recommendation } from "../data/types";
 import {
+  ActionTypeBadge,
   GeneratorBadge,
   ImpactBadge,
   OwnerBadgeSolid,
   StatusBadge,
 } from "../components/Badge";
-import { actionTypeMeta } from "../components/meta";
+import { splitDiagnosis } from "../queue/RecommendationCard";
 
 export function daysUntil(iso: string | null): number | null {
   if (!iso) return null;
@@ -87,12 +87,33 @@ export function DueCountdown({
   );
 }
 
-/** Slug label from a full URL — the readable part of a long URL. */
+/** Clean URL label: the readable path when the url has a scheme, otherwise the
+ * slug/relative path itself. Strips protocol + host that only add noise. */
 function urlLabel(url: string | null): string {
   if (!url) return "—";
-  return url.split("/").filter(Boolean).pop() || url;
+  if (/^https?:\/\//i.test(url)) {
+    try {
+      const path = new URL(url).pathname;
+      return path && path !== "/" ? path : url;
+    } catch {
+      /* fall through to raw url */
+    }
+  }
+  return url;
 }
 
+/** Compact volume label, e.g. "8200" → "8.2k vol", "150" → "150 vol". */
+function fmtVol(volume: number | null | undefined): string | null {
+  if (volume == null || volume <= 0) return null;
+  if (volume >= 1000) {
+    const k = (volume / 1000).toFixed(1).replace(/\.0$/, "");
+    return `${k}k vol`;
+  }
+  return `${volume} vol`;
+}
+
+/** Kanban card: 3 scannable layers — badges (type + impact), target (clean
+ * path + keyword/volume), action (one-line intent). */
 export function PipelineCard({
   rec,
   onImplement,
@@ -105,26 +126,44 @@ export function PipelineCard({
   onOpenDetail?: (id: string) => void;
 }) {
   const url = rec.target_url ?? rec.proposed_url;
+  const { summary } = splitDiagnosis(rec.diagnosis);
+  const volume = fmtVol(rec.search_volume);
+
   return (
     <div
       className="group cursor-pointer rounded-xl border border-base-300 bg-base-100 p-3.5 shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md"
       onClick={() => onOpenDetail?.(rec.recommendation_id)}
     >
-      <div className="flex items-center justify-between gap-2">
+      {/* Layer 1 — action type + impact/score badges */}
+      <div className="flex flex-wrap items-center gap-1.5">
         <GeneratorBadge generator={rec.generator} />
-        <ImpactBadge impact={rec.impact} />
+        <ActionTypeBadge actionType={rec.action_type} />
+        <span className="ml-auto">
+          <ImpactBadge impact={rec.impact} />
+        </span>
       </div>
-      <p className="mt-2.5 line-clamp-2 break-all font-mono text-xs font-medium leading-snug text-base-content">
+
+      {/* Layer 2 — target: clean path + primary keyword & volume */}
+      <p className="mt-2.5 truncate font-mono text-xs font-medium leading-snug text-base-content">
         {urlLabel(url)}
       </p>
-      <p className="mt-1.5 flex items-center gap-1 text-[11px] text-base-content/45">
-        <span className="shrink-0">{actionTypeMeta[rec.action_type].label}</span>
-        <ChevronRight className="size-3 shrink-0" />
-        <span className={`truncate ${rec.target_url ? "" : "text-primary/80"}`}>
-          {rec.proposed_url ?? rec.target_url}
-        </span>
+      {rec.primary_keyword ? (
+        <p className="mt-1 flex items-center gap-1 text-[11px] text-base-content/60">
+          <span className="truncate">{rec.primary_keyword}</span>
+          {volume ? (
+            <span className="shrink-0 font-medium tabular-nums text-primary">
+              • {volume}
+            </span>
+          ) : null}
+        </p>
+      ) : null}
+
+      {/* Layer 3 — action / intent: one-line reason */}
+      <p className="mt-2 line-clamp-2 text-[11px] leading-snug text-base-content/70">
+        {summary}
       </p>
 
+      {/* Footer: owner, status, observation, stage actions */}
       <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-base-200 pt-2.5">
         <OwnerBadgeSolid owner={rec.owner} />
         {rec.status !== "proposed" ? <StatusBadge status={rec.status} /> : null}
@@ -177,8 +216,8 @@ export function PipelineColumn({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex w-72 shrink-0 flex-col rounded-xl border border-base-300/70 bg-base-200/50">
-      <div className="flex items-center justify-between border-b border-base-200 px-3.5 py-3">
+    <div className="flex h-full w-72 shrink-0 flex-col overflow-hidden rounded-xl border border-base-300/70 bg-base-200/50">
+      <div className="flex shrink-0 items-center justify-between border-b border-base-200 px-3.5 py-3">
         <div className="flex items-center gap-2">
           <span className={`size-2 rounded-full ${accentColor}`} />
           <span className="text-xs font-semibold uppercase tracking-wider text-base-content/60">
@@ -189,31 +228,8 @@ export function PipelineColumn({
           {count}
         </span>
       </div>
-      <div className="flex min-h-32 flex-1 flex-col gap-2.5 p-2.5">
+      <div className="kanban-scroll flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto p-2.5">
         {children}
-      </div>
-    </div>
-  );
-}
-
-/** Raw column content: the latest candidate run condensed into a readable
- * summary with a flow arrow, since raw candidates aren't yet recommendations. */
-export function RawCandidatesCard({
-  proposedCount,
-}: {
-  proposedCount: number;
-}) {
-  return (
-    <div className="flex min-h-32 flex-1 flex-col items-center justify-center rounded-xl border border-dashed border-base-300 bg-base-100/70 px-4 py-6 text-center">
-      <p className="text-[11px] text-base-content/50">raw candidates</p>
-      <div className="mt-3 flex flex-wrap items-center justify-center gap-x-1.5 gap-y-1 text-[11px] text-base-content/45">
-        <span>4 generators</span>
-        <ChevronRight className="size-3 text-base-content/25" />
-        <span>pre-rank 27</span>
-        <ChevronRight className="size-3 text-base-content/25" />
-        <span className="font-semibold text-primary">
-          agent → {proposedCount} proposed
-        </span>
       </div>
     </div>
   );

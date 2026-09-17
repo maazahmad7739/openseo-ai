@@ -193,6 +193,8 @@ class PipelineItemOut(BaseModel):
     diagnosis: str
     impact: str
     status: str
+    search_volume: Optional[int] = None
+    primary_keyword: Optional[str] = None
     approved_at: Optional[datetime] = None
     implemented_at: Optional[datetime] = None
     assigned_to: Optional[str] = None

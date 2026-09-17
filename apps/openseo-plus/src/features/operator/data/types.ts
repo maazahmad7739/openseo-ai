@@ -68,6 +68,10 @@ export interface Recommendation {
    */
   evidence_json: EvidenceItem[];
   work_required_json: WorkRequiredItem[];
+  /** Primary keyword the recommendation clusters on, from keyword_clusters. */
+  primary_keyword: string | null;
+  /** Searches/mo for the primary keyword, from keyword_clusters. */
+  search_volume: number | null;
   impact: ImpactLevel;
   confidence: ConfidenceLevel;
   effort: EffortLevel;

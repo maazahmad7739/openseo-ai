@@ -418,9 +418,12 @@ def get_pipeline(
             SELECT r.recommendation_id, r.site_id, r.generator, r.action_type,
                    r.target_url, r.proposed_url, r.diagnosis, r.impact, r.status,
                    r.approved_at, r.implemented_at, r.assigned_to,
-                   r.measurement_due_at, mwl.measurement_window_days
+                   r.measurement_due_at, mwl.measurement_window_days,
+                   COALESCE((kc.search_volume)::int, 0) AS search_volume,
+                   kc.primary_keyword
             FROM recommendations r
             LEFT JOIN measurement_window_lookup mwl ON mwl.action_type = r.action_type
+            LEFT JOIN keyword_clusters kc ON kc.cluster_id = r.cluster_id
             WHERE r.site_id = %s
               AND r.status IN ('approved', 'in_progress')
             ORDER BY
@@ -459,6 +462,8 @@ def get_pipeline(
             observation_window_days=window,
             days_remaining=days_remaining,
             measurement_due_at=r.get("measurement_due_at"),
+            search_volume=r["search_volume"] if r["search_volume"] else None,
+            primary_keyword=r["primary_keyword"],
         ))
 
     return PipelineOut(

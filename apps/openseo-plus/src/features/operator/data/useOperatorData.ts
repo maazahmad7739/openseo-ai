@@ -69,6 +69,8 @@ interface ApiPipelineItem {
   diagnosis: string;
   impact: string;
   status: string;
+  search_volume: number | null;
+  primary_keyword: string | null;
   approved_at: string | null;
   implemented_at: string | null;
   assigned_to: string | null;
@@ -185,6 +187,8 @@ function mapQueueItem(
     diagnosis: item.diagnosis,
     evidence_json: evidence,
     work_required_json: [],
+    primary_keyword: item.primary_keyword,
+    search_volume: item.search_volume,
     impact: item.impact as ImpactLevel,
     confidence: item.confidence as ConfidenceLevel,
     effort: item.effort as EffortLevel,
@@ -266,6 +270,8 @@ function mapPipelineItem(item: ApiPipelineItem): Recommendation {
     diagnosis: item.diagnosis,
     evidence_json: [],
     work_required_json: [],
+    primary_keyword: item.primary_keyword,
+    search_volume: item.search_volume,
     impact: item.impact as ImpactLevel,
     confidence: "medium" as ConfidenceLevel,
     effort: "days" as EffortLevel,
