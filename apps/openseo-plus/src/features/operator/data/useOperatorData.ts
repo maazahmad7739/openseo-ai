@@ -240,7 +240,7 @@ function parseEvidence(value: unknown): EvidenceItem[] {
  * returns null when no position is present. */
 export function extractPosition(text: string | null | undefined): number | null {
   const match = String(text ?? "").match(
-    /(?:avg_position|position)\s*[:=]?\s*([\d.]+)/i,
+    /(?:avg_position|position)\s*[:=]?\s*(\d+(?:\.\d+)?)/i,
   );
   return match ? Number(match[1]) : null;
 }
