@@ -1,9 +1,12 @@
 import json
 import os
+import urllib.parse
 import urllib.request
 import urllib.error
+from html import unescape as html_unescape
 
 from .mode import resolve_mode
+from .url_normalize import canonicalize_url
 
 SHOPIFY_API_BASE_DEFAULT = "https://{shop}.myshopify.com/admin/api/2024-10"
 MOCK_MODE_ENV = "SHOPIFY_MOCK_MODE"
@@ -95,16 +98,53 @@ class ShopifyRestAdapter:
         if not self.access_token:
             raise ShopifyError("no Shopify access token configured (per-site Admin API token)")
         limit = int(params.get("limit", 250))
-        url = f"{self.base_url}/{ENDPOINTS[capability].format(limit=limit)}"
+        max_pages = int(params.get("max_pages", 100))
+        base_url = f"{self.base_url}/{ENDPOINTS[capability].format(limit=limit)}"
+        if params.get("extra_params"):
+            extra = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params["extra_params"].items())
+            base_url = f"{base_url}&{extra}"
+        merged = {}
+        url = base_url
+        fetched_pages = 0
+        while url and fetched_pages < max_pages:
+            payload = self._get_raw(url)
+            for key, values in (payload or {}).items():
+                if isinstance(values, list):
+                    merged.setdefault(key, []).extend(values)
+                else:
+                    merged.setdefault(key, values)
+            fetched_pages += 1
+            url = self._next_page_url(payload)
+        else:
+            if url:
+                print(
+                    f"[shopify] {capability}: hit {max_pages} page cap — results may be "
+                    "truncated (raise max_pages if the store warrants it)",
+                    flush=True,
+                )
+        return merged
+
+    def _get_raw(self, url):
         req = urllib.request.Request(url, method="GET")
         req.add_header("X-Shopify-Access-Token", self.access_token)
         try:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                payload = json.loads(resp.read().decode("utf-8"))
+                self._link_header = resp.headers.get("Link")
+                return payload
         except urllib.error.HTTPError as exc:
             raise ShopifyError(f"HTTP {exc.code}")
         except urllib.error.URLError as exc:
             raise ShopifyError(f"connection failed: {exc.reason}")
+
+    def _next_page_url(self, payload):
+        link = getattr(self, "_link_header", None) or ""
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                url_part = part.split(";", 1)[0].strip().strip("<>")
+                if url_part.startswith("http"):
+                    return html_unescape(url_part).replace("&amp;", "&")
+        return None
 
     def _normalize(self, capability, raw):
         if capability == "products":
@@ -150,7 +190,9 @@ class ShopifyRestAdapter:
                     "handle": item.get("handle"),
                     "collection_type": kind,
                     "published": item.get("published_at") is not None,
-                    "url": f"https://{self.shop_domain}/collections/{item.get('handle')}" if self.shop_domain else None,
+                    "url": canonicalize_url(
+                        f"https://{self.shop_domain}/collections/{item.get('handle')}"
+                    ) if self.shop_domain else None,
                     "rules": item.get("rules") or [],
                 })
         return normalized

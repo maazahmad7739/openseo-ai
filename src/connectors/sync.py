@@ -1,4 +1,4 @@
-"""Daily sync orchestrator (plan/09 Data Flow 1) — fully offline in mock mode.
+"""Daily sync orchestrator (plan/09 Data Flow 1) — offline in mock mode.
 
 Per-site sequence:
   1. GSC search_analytics → search_performance (upsert on UNIQUE constraint)
@@ -6,20 +6,25 @@ Per-site sequence:
   3. GA4 page_performance → page_business_performance (upsert)
   4. OpenSEO keyword_volume → keyword_clusters.search_volume (existing clusters)
 
-Unsupported capabilities are skipped and logged, never fatal. Every fetch is
-idempotent via ON CONFLICT upserts, so re-running the sync is safe.
+Connector modes resolve via the central INTEGRATION_MODE switch (connectors/
+mode.py) with per-connector legacy env vars as fallback; when a live mode is
+requested but no credentials are present, each adapter falls back to mock
+instead of failing the whole sync. Every fetch is idempotent via ON CONFLICT
+upserts, so re-running the sync is safe.
 """
 
 import os
 import sys
 import json
+from datetime import date, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from connectors.openseo import get_openseo_adapter  # noqa: E402
-from connectors.gsc import get_gsc_adapter  # noqa: E402
-from connectors.shopify import get_shopify_adapter  # noqa: E402
-from connectors.ga4 import get_ga4_adapter  # noqa: E402
+from connectors.openseo import get_openseo_adapter, OpenseoConfigError  # noqa: E402
+from connectors.gsc import get_gsc_adapter, GscConfigError  # noqa: E402
+from connectors.shopify import get_shopify_adapter, ShopifyError  # noqa: E402
+from connectors.ga4 import get_ga4_adapter, Ga4Error  # noqa: E402
+from connectors.url_normalize import canonicalize_url  # noqa: E402
 
 import db as database  # noqa: E402
 
@@ -31,14 +36,57 @@ FIXTURES_DIR = os.path.normpath(os.path.join(
 # file is derived relative to FIXTURE_ANCHOR_DATE so the whole dataset moves
 # as one block and never drifts apart. The GSC fixture itself spans the 5
 # weeks ending on the anchor; GA4 covers the anchor's last two days; SERP is
-# snapshotted on the anchor.
+# snapshotted on the anchor. Live mode uses the real clock (or an explicit
+# reference_date); the anchor is only the fallback for mock fixtures.
 FIXTURE_ANCHOR_DATE = "2026-09-10"
+
+# Live-crawl/task polling budget for the on_page crawl flow (openseo adapter).
+CRAWL_READY_ATTEMPTS = 30
+CRAWL_READY_INTERVAL_SECONDS = 5
+
+
+def _reference_window(reference_date, live, days_back):
+    """Return (start, end) ISO date strings covering `days_back` days.
+
+    Live mode uses the real clock (today) or an explicit reference_date;
+    mock mode falls back to the fixture anchor so the sandbox dataset stays
+    coherent. This is the single date-decoupling seam (fix: anchor only in
+    mock).
+    """
+    if reference_date:
+        end = date.fromisoformat(str(reference_date)[:10])
+    elif live:
+        end = date.today()
+    else:
+        end = date.fromisoformat(FIXTURE_ANCHOR_DATE)
+    start = end - timedelta(days=days_back)
+    return str(start), str(end)
 
 
 def _days_before(days):
-    from datetime import date, timedelta
+    """Back-compat helper: anchor-relative date (mock universe only)."""
     anchor = date.fromisoformat(FIXTURE_ANCHOR_DATE)
     return str(anchor - timedelta(days=days))
+
+
+def _build_adapter(factory, key, config, fixtures_dir, error_types):
+    """Build a connector adapter honoring env-driven mode.
+
+    Per-call config wins over environment (connectors resolve mode via
+    resolve_mode()). If a live mode is requested but no credentials are
+    configured, the adapter factory raises a typed config error — we fall
+    back to the mock adapter so the sync never dies on a missing secret.
+    """
+    cfg = dict(config)
+    cfg[f"{key}.mock_fixtures_dir"] = fixtures_dir
+    try:
+        return factory(config=cfg)
+    except error_types as exc:
+        print(f"[sync] {key}: live mode unavailable ({exc}) — falling back to mock", flush=True)
+        cfg = dict(config)
+        cfg[f"{key}.mode"] = "mock"
+        cfg[f"{key}.mock_fixtures_dir"] = fixtures_dir
+        return factory(config=cfg)
 
 
 def _is_fresh(conn, site_id, capability, ttl_days):
@@ -112,11 +160,12 @@ def ensure_site(conn, site=MOCK_SITE):
         return cur.fetchone()[0]
 
 
-def sync_search_performance(conn, gsc, site_id, site):
+def sync_search_performance(conn, gsc, site_id, site, window=None):
+    start, end = window or _reference_window(None, False, 7)
     result = gsc.fetch("search_analytics", {
         "site_url": site["gsc_property"],
-        "start_date": _days_before(7),
-        "end_date": FIXTURE_ANCHOR_DATE,
+        "start_date": start,
+        "end_date": end,
     })
     if not result.get("ok"):
         print(f"[sync] gsc.search_analytics skipped: {result.get('error')}")
@@ -144,14 +193,14 @@ def sync_pages_from_shopify(conn, shopify, site_id, domain="example.com"):
         if not c.get("url"):
             continue
         rows.append({
-            "url": c["url"],
+            "url": canonicalize_url(c["url"], domain),
             "page_type": "collection",
             "title": c["title"],
             "indexable": bool(c["published"]),
         })
     product_urls = []
     for p in products["data"]:
-        url = f"https://{domain}/products/{p['handle']}"
+        url = canonicalize_url(f"https://{domain}/products/{p['handle']}")
         product_urls.append(url)
         rows.append({
             "url": url,
@@ -175,17 +224,18 @@ def sync_pages_from_shopify(conn, shopify, site_id, domain="example.com"):
     return inserted
 
 
-def sync_page_business_performance(conn, ga4, site_id):
+def sync_page_business_performance(conn, ga4, site_id, domain="example.com", window=None):
+    start, end = window or _reference_window(None, False, 1)
     result = ga4.fetch("page_performance", {
-        "start_date": _days_before(1),
-        "end_date": FIXTURE_ANCHOR_DATE,
+        "start_date": start,
+        "end_date": end,
     })
     if not result.get("ok"):
         print(f"[sync] ga4.page_performance skipped: {result.get('error')}")
         return 0
     rows = []
     for r in result["data"]:
-        url = f"https://{MOCK_SITE['domain']}{r['page_path']}"
+        url = canonicalize_url(f"https://{domain}{r['page_path']}")
         rows.append({
             "site_id": str(site_id),
             "date": r["date"],
@@ -307,7 +357,7 @@ def sync_keyword_clusters(conn, openseo, site_id, queries):
     return created
 
 
-def sync_serp_snapshots(conn, openseo, site_id, queries, skip=False):
+def sync_serp_snapshots(conn, openseo, site_id, queries, skip=False, reference_date=None, live=False):
     """Map SERP snapshot rows into openseo_serp_snapshots (is_self flag from domain)."""
     if skip:
         return 0
@@ -325,10 +375,9 @@ def sync_serp_snapshots(conn, openseo, site_id, queries, skip=False):
         )
         cluster_by_query = {q: cid for cid, q in cur.fetchall()}
     inserted = 0
-    snapshot_date = FIXTURE_ANCHOR_DATE
+    snapshot_date = _reference_window(reference_date, live, 0)[1]
     with conn.cursor() as cur:
         for r in queries[0].get("data", []):
-            query = cluster_by_query_lookup(cluster_by_query, r.get("query"))
             cluster_id = cluster_by_query.get(r.get("query"))
             if cluster_id is None:
                 continue
@@ -349,10 +398,6 @@ def sync_serp_snapshots(conn, openseo, site_id, queries, skip=False):
     return inserted
 
 
-def cluster_by_query_lookup(cluster_by_query, query):
-    return cluster_by_query.get(query)
-
-
 def sync_crawl_audit(conn, openseo, site_id, domain):
     """OpenSEO weekly crawl pull → pages.* crawl/audit columns (plan/09 Data Flow 1 step 5)."""
     result = openseo.fetch("crawl_audit", {"site": domain})
@@ -362,6 +407,8 @@ def sync_crawl_audit(conn, openseo, site_id, domain):
     updated = 0
     with conn.cursor() as cur:
         for page in result["data"]:
+            url = canonicalize_url(page.get("url"), domain)
+            canonical = canonicalize_url(page.get("canonical"), domain) if page.get("canonical") else None
             cur.execute(
                 "UPDATE pages SET "
                 "status_code = %s, indexable = %s, canonical_url = %s, template = %s, "
@@ -369,13 +416,13 @@ def sync_crawl_audit(conn, openseo, site_id, domain):
                 "raw_html_hash = %s, rendered_html_hash = %s, render_status = %s, "
                 "has_structured_data = %s, is_orphan = %s, last_crawled_at = now() "
                 "WHERE site_id = %s AND url = %s",
-                (page.get("status_code"), page.get("indexable"), page.get("canonical"),
+                (page.get("status_code"), page.get("indexable"), canonical,
                  page.get("template"), page.get("crawl_depth"), page.get("internal_links_in"),
                  page.get("internal_links_out"), page.get("raw_html_hash"),
                  page.get("rendered_html_hash"), page.get("render_status"),
-                 page.get("structured_data"), page.get("is_orphan"), site_id, page.get("url")),
+                 page.get("structured_data"), page.get("is_orphan"), site_id, url),
             )
-            if cur.rowcount == 0 and page.get("url"):
+            if cur.rowcount == 0 and url:
                 cur.execute(
                     "INSERT INTO pages (site_id, url, page_type, title, indexable, "
                     "status_code, canonical_url, template, crawl_depth, internal_links_in, "
@@ -383,9 +430,9 @@ def sync_crawl_audit(conn, openseo, site_id, domain):
                     "has_structured_data, is_orphan, last_crawled_at) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
                     "ON CONFLICT (site_id, url_hash) DO NOTHING",
-                    (site_id, page.get("url"), page.get("page_type") or "unknown",
-                     page.get("url"), page.get("indexable"), page.get("status_code"),
-                     page.get("canonical"), page.get("template"), page.get("crawl_depth"),
+                    (site_id, url, page.get("page_type") or "unknown",
+                     url, page.get("indexable"), page.get("status_code"),
+                     canonical, page.get("template"), page.get("crawl_depth"),
                      page.get("internal_links_in"), page.get("internal_links_out"),
                      page.get("raw_html_hash"), page.get("rendered_html_hash"),
                      page.get("render_status"), page.get("structured_data"), page.get("is_orphan")),
@@ -394,17 +441,23 @@ def sync_crawl_audit(conn, openseo, site_id, domain):
     return updated
 
 
-def sync_catalogue_coverage(conn, site_id, domain):
-    """Priority 3.7 job: compute catalogue_coverage per cluster (any_variant rule)."""
+def sync_catalogue_coverage(conn, site_id, domain, shopify=None):
+    """Priority 3.7 job: compute catalogue_coverage per cluster (any_variant rule).
+
+    `shopify` may be the adapter already resolved by run_sync (so a live
+    deployment reuses its mode/credentials); when omitted the function
+    constructs a mock adapter so the job stays runnable standalone.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT cluster_id, primary_keyword FROM keyword_clusters WHERE site_id = %s",
             (site_id,),
         )
         clusters = cur.fetchall()
-    shopify = get_shopify_adapter(config={
-        "shopify.mode": "mock", "shopify.mock_fixtures_dir": FIXTURES_DIR,
-    })
+    if shopify is None:
+        shopify = get_shopify_adapter(config={
+            "shopify.mode": "mock", "shopify.mock_fixtures_dir": FIXTURES_DIR,
+        })
     products_result = shopify.fetch("products", {})
     if not products_result.get("ok"):
         print(f"[sync] shopify.products (coverage) skipped: {products_result.get('error')}")
@@ -539,27 +592,34 @@ def sync_page_query_match_scores(conn, site_id):
     return inserted
 
 
-def run_sync(fixtures_dir=FIXTURES_DIR, site=MOCK_SITE, force_refresh=False):
-    """Full per-site sync; returns a dict of row counts. Idempotent."""
+def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, reference_date=None):
+    """Full per-site sync; returns a dict of row counts. Idempotent.
+
+    `site` may be a site_config-shaped dict (site_name, domain, gsc_property,
+    shopify_domain, ga4_property_id, catalogue_size_tier, min_in_stock_products)
+    built from the DB, or None to resolve the first configured site (falling
+    back to MOCK_SITE when none exists, which keeps the sandbox demo working).
+    `reference_date` overrides the clock (used by jobs for backfills); in live
+    mode without it, real "today" drives all windows (anchor only in mock).
+    """
     from urllib.parse import quote  # noqa: F401  (ensures parity with adapters)
 
     counts = {}
     conn = database.get_connection()
     try:
+        site = site or _resolve_default_site(conn)
         site_id = ensure_site(conn, site)
 
-        gsc = get_gsc_adapter(config={
-            "gsc.mode": "mock", "gsc.mock_fixtures_dir": fixtures_dir,
-            "gsc.site_url": site["gsc_property"],
-        })
-        # OpenSEO mode is env-driven (OPENSEO_MODE, default "mock"): the daily
-        # sync is the paid-data path, so it stays offline unless explicitly
-        # switched to live. GSC/Shopify/GA4 remain fixture-driven here — their
-        # live credentials arrive via their own connectors, not this job.
-        openseo = get_openseo_adapter(config={
-            "openseo.mode": os.environ.get("OPENSEO_MODE", "mock"),
-            "openseo.mock_fixtures_dir": fixtures_dir,
-        })
+        gsc = _build_adapter(
+            get_gsc_adapter, "gsc",
+            {"gsc.site_url": site["gsc_property"]}, fixtures_dir, (GscConfigError,),
+        )
+        # OpenSEO is the paid-data path: mode is env/config-driven (default
+        # mock) and falls back to mock when no credential is resolvable.
+        openseo = _build_adapter(
+            get_openseo_adapter, "openseo",
+            {}, fixtures_dir, (OpenseoConfigError,),
+        )
         from connectors.costlog import log_cost
         openseo._on_fetch_complete = lambda capability, params, result: log_cost(
             conn, site_id, f"openseo_{capability}",
@@ -569,16 +629,24 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=MOCK_SITE, force_refresh=False):
             cost=result.get("cost"),
             metadata={"params": params},
         )
-        shopify = get_shopify_adapter(config={
-            "shopify.mode": "mock", "shopify.mock_fixtures_dir": fixtures_dir,
-        })
-        ga4 = get_ga4_adapter(config={
-            "ga4.mode": "mock", "ga4.mock_fixtures_dir": fixtures_dir,
-        })
+        shopify = _build_adapter(
+            get_shopify_adapter, "shopify",
+            {"shopify.domain": site["shopify_domain"]}, fixtures_dir, (ShopifyError,),
+        )
+        ga4 = _build_adapter(
+            get_ga4_adapter, "ga4",
+            {"ga4.property_id": site["ga4_property_id"]}, fixtures_dir, (Ga4Error,),
+        )
 
-        counts["search_performance"] = sync_search_performance(conn, gsc, site_id, site)
+        # Any connector in live mode uses the real clock (or reference_date);
+        # only a fully-mock sync anchors to the fixture universe.
+        live = any(not a.mock_mode for a in (gsc, shopify, ga4, openseo))
+
+        counts["search_performance"] = sync_search_performance(
+            conn, gsc, site_id, site, _reference_window(reference_date, live, 7))
         counts["pages"] = sync_pages_from_shopify(conn, shopify, site_id, site["domain"])
-        counts["page_business_performance"] = sync_page_business_performance(conn, ga4, site_id)
+        counts["page_business_performance"] = sync_page_business_performance(
+            conn, ga4, site_id, site["domain"], _reference_window(reference_date, live, 1))
 
         # ── keyword_volume TTL gate ──────────────────────────────────
         with conn.cursor() as cur:
@@ -604,7 +672,7 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=MOCK_SITE, force_refresh=False):
                     "best wireless headphones for travel",
                     "bose quietcomfort comparison",
                 ],
-                "date": _days_before(9),
+                "date": _reference_window(reference_date, live, 9)[0],
             })
             counts["keyword_clusters"] = sync_keyword_clusters(conn, openseo, site_id, [kw] if kw.get("ok") else [])
             counts["keyword_clusters_updated"] = sync_keyword_volumes(conn, openseo, site_id, [kw] if kw.get("ok") else [])
@@ -617,10 +685,13 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=MOCK_SITE, force_refresh=False):
             serp = openseo.fetch("serp", {
                 "query": "wireless noise cancelling headphones", "limit": 10, "geo": "us",
             })
-            counts["openseo_serp_snapshots"] = sync_serp_snapshots(conn, openseo, site_id, [serp] if serp.get("ok") else [])
+            counts["openseo_serp_snapshots"] = sync_serp_snapshots(
+                conn, openseo, site_id, [serp] if serp.get("ok") else [],
+                reference_date=reference_date, live=live,
+            )
 
         counts["crawl_audit_updated"] = sync_crawl_audit(conn, openseo, site_id, site["domain"])
-        counts["catalogue_coverage"] = sync_catalogue_coverage(conn, site_id, site["domain"])
+        counts["catalogue_coverage"] = sync_catalogue_coverage(conn, site_id, site["domain"], shopify)
         counts["page_query_match_scores"] = sync_page_query_match_scores(conn, site_id)
         counts["openseo_serp_snapshots"] = counts.get("openseo_serp_snapshots", 0)  # Generator 1 feeds on these
 
@@ -631,6 +702,30 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=MOCK_SITE, force_refresh=False):
         raise
     finally:
         conn.close()
+
+
+def _resolve_default_site(conn):
+    """First configured site from site_config, else the mock-site fallback.
+
+    This is the only remaining place that touches MOCK_SITE: real deployments
+    have ≥1 row in site_config and daily_sync iterates every row; an empty
+    site_config falls back to the sandbox site so the demo keeps working.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT site_name, domain, gsc_property, shopify_domain, "
+            "ga4_property_id, catalogue_size_tier, min_in_stock_products "
+            "FROM site_config ORDER BY created_at LIMIT 1",
+        )
+        row = cur.fetchone()
+    if not row:
+        return dict(MOCK_SITE)
+    site = dict(zip(("site_name", "domain", "gsc_property", "shopify_domain",
+                     "ga4_property_id", "catalogue_size_tier",
+                     "min_in_stock_products"), row))
+    if site.get("min_in_stock_products") is None:
+        site["min_in_stock_products"] = 1
+    return site
 
 
 def main():

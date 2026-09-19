@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import urllib.request
 import urllib.error
 
@@ -11,8 +12,19 @@ ENDPOINTS = {
     "serp": "v3/serp/google/organic/live/regular",
     "competitors": "v3/dataforseo_labs/google/competitors_domain/live",
     "backlinks": "v3/backlinks/backlinks/live",
-    "crawl_audit": "v3/on_page/summary",
+    "crawl_audit": "v3/on_page/pages",
+    "crawl_audit_task_post": "v3/on_page/task_post",
+    "crawl_audit_tasks_ready": "v3/on_page/tasks_ready",
 }
+
+# on_page/pages is a two-phase endpoint: task_post starts an async crawl and
+# returns a task id; tasks_ready polls readiness; pages pulls per-page rows.
+# These budgets bound that live flow (unbounded polling costs money and wall
+# time). Mock mode never touches them.
+CRAWL_READY_ATTEMPTS = int(os.environ.get("CRAWL_READY_ATTEMPTS", "30"))
+CRAWL_READY_INTERVAL_SECONDS = float(os.environ.get("CRAWL_READY_INTERVAL_SECONDS", "5"))
+CRAWL_PAGE_SIZE = 100
+CRAWL_PAGE_LIMIT = 20
 
 MOCK_FIXTURES = {
     "keyword_volume": "dataforseo_keyword_volume.json",
@@ -101,6 +113,8 @@ class OpenseoRestAdapter:
             raise OpenseoUnsupportedCapability(capability)
         if self.mock_mode:
             return self._load_mock_fixture(capability)
+        if capability == "crawl_audit":
+            return self._crawl_audit_pages(params)
         return self._post(capability, params)
 
     def _load_mock_fixture(self, capability):
@@ -134,6 +148,106 @@ class OpenseoRestAdapter:
         if payload.get("status_code") not in OK_STATUS_CODES or payload.get("tasks_error", 0) > 0:
             raise OpenseoError(payload.get("status_message", "provider returned errors"))
         return payload
+
+    def _raw_post(self, endpoint, body):
+        url = f"{self.base_url}/{endpoint}"
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if self.credential:
+            req.add_header("Authorization", f"Basic {self.credential}")
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise OpenseoError(f"HTTP {exc.code}")
+        except urllib.error.URLError as exc:
+            raise OpenseoError(f"connection failed: {exc.reason}")
+
+    def _raw_get(self, endpoint):
+        url = f"{self.base_url}/{endpoint}"
+        req = urllib.request.Request(url, method="GET")
+        if self.credential:
+            req.add_header("Authorization", f"Basic {self.credential}")
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise OpenseoError(f"HTTP {exc.code}")
+        except urllib.error.URLError as exc:
+            raise OpenseoError(f"connection failed: {exc.reason}")
+
+    def _crawl_audit_pages(self, params):
+        """Two-phase on_page crawl → per-page rows.
+
+        on_page/pages requires a task id produced by task_post, so live mode
+        chains: task_post (target, max_crawl_pages) → poll tasks_ready for the
+        task id → pull pages with limit/offset until short pages or cap.
+        Returns a synthetic single-task envelope so _normalize_crawl_audit sees
+        the same shape as the mock fixture.
+        """
+        body = self._build_request_body("crawl_audit", params)
+        task_payload = self._raw_post(ENDPOINTS["crawl_audit_task_post"], body)
+        if task_payload.get("status_code") not in OK_STATUS_CODES or task_payload.get("tasks_error", 0) > 0:
+            raise OpenseoError(task_payload.get("status_message", "task_post failed"))
+        task_id = None
+        for task in task_payload.get("tasks", []) or []:
+            if task.get("id"):
+                task_id = task["id"]
+                break
+        if not task_id:
+            raise OpenseoError("task_post returned no task id")
+
+        ready = False
+        for _ in range(CRAWL_READY_ATTEMPTS):
+            ready_payload = self._raw_get(ENDPOINTS["crawl_audit_tasks_ready"])
+            if ready_payload.get("status_code") not in OK_STATUS_CODES:
+                raise OpenseoError(ready_payload.get("status_message", "tasks_ready failed"))
+            if any(task.get("id") == task_id for task in ready_payload.get("tasks", []) or []):
+                ready = True
+                break
+            time.sleep(CRAWL_READY_INTERVAL_SECONDS)
+        if not ready:
+            raise OpenseoError(f"on_page task {task_id} not ready within "
+                               f"{CRAWL_READY_ATTEMPTS} polls")
+
+        items = []
+        offset = 0
+        max_crawl_pages = int(params.get("limit", CRAWL_PAGE_LIMIT))
+        fetched = 0
+        while len(items) < max_crawl_pages and fetched < CRAWL_PAGE_LIMIT:
+            page_body = [{
+                "id": task_id,
+                "limit": min(CRAWL_PAGE_SIZE, max_crawl_pages - len(items)),
+                "offset": offset,
+            }]
+            page = self._raw_post(ENDPOINTS["crawl_audit"], page_body)
+            if page.get("status_code") not in OK_STATUS_CODES or page.get("tasks_error", 0) > 0:
+                raise OpenseoError(page.get("status_message", "pages pull failed"))
+            result = (page.get("tasks") or [])
+            batch = []
+            for task in result:
+                for res in task.get("result", []) or []:
+                    if isinstance(res, list):
+                        batch.extend(res)
+                    else:
+                        batch.extend(res.get("items", []) or [])
+            items.extend(batch)
+            fetched += 1
+            if not batch:
+                break
+            offset += len(batch)
+        if fetched >= CRAWL_PAGE_LIMIT and len(items) >= max_crawl_pages:
+            print(
+                f"[openseo] crawl_audit: reached {max_crawl_pages} page cap — "
+                "results may be truncated (raise limit or CRAWL_PAGE_LIMIT)",
+                flush=True,
+            )
+        return {
+            "status_code": 20000,
+            "tasks": [{"id": task_id, "result": [{"items": items}],
+                       "cost": task_payload.get("cost")}],
+        }
 
     def _build_request_body(self, capability, params):
         params = params or {}
@@ -171,7 +285,7 @@ class OpenseoRestAdapter:
         if capability == "crawl_audit":
             return [{
                 "target": params.get("site", ""),
-                "max_crawl_pages": int(params.get("limit", 100)),
+                "max_crawl_pages": int(params.get("limit", CRAWL_PAGE_LIMIT)),
             }]
         raise OpenseoUnsupportedCapability(capability)
 
@@ -264,21 +378,39 @@ class OpenseoRestAdapter:
     def _normalize_crawl_audit(self, raw, params):
         normalized = []
         for item in self._result_items(raw):
-            for page in (item.get("pages") or item.get("items") or []):
+            # Mock fixture shape: result[].pages[] (top-level keys).
+            # Live on_page/pages shape: result[].items[] with per-page
+            # status_code/url + nested meta.canonical and link counts.
+            pages = item.get("pages") or item.get("items") or []
+            for page in pages:
+                meta = page.get("meta") or {}
+                status_code = page.get("status_code") or meta.get("status_code")
+                indexable = page.get("indexable")
+                if indexable is None:
+                    indexable = status_code == 200
+                canonical = page.get("canonical") or meta.get("canonical")
+                if isinstance(canonical, dict):
+                    canonical = canonical.get("value") or canonical.get("href")
                 normalized.append({
                     "url": page.get("url"),
-                    "status_code": page.get("status_code"),
-                    "indexable": page.get("indexable"),
-                    "canonical": page.get("canonical"),
-                    "page_type": page.get("page_type"),
+                    "status_code": status_code,
+                    "indexable": indexable,
+                    "canonical": canonical,
+                    "page_type": page.get("page_type") or meta.get("page_type"),
                     "template": page.get("template"),
                     "crawl_depth": page.get("crawl_depth"),
-                    "internal_links_in": page.get("internal_links_in"),
-                    "internal_links_out": page.get("internal_links_out"),
+                    "internal_links_in": page.get("internal_links_in")
+                        if page.get("internal_links_in") is not None
+                        else meta.get("internal_links_count"),
+                    "internal_links_out": page.get("internal_links_out")
+                        if page.get("internal_links_out") is not None
+                        else meta.get("external_links_count"),
                     "raw_html_hash": page.get("raw_html_hash"),
                     "rendered_html_hash": page.get("rendered_html_hash"),
                     "render_status": page.get("render_status"),
-                    "structured_data": page.get("structured_data"),
+                    "structured_data": page.get("structured_data")
+                        if page.get("structured_data") is not None
+                        else (1 if (meta.get("structured_data") or meta.get("has_structured_data")) else 0),
                     "is_orphan": page.get("is_orphan"),
                 })
         return normalized

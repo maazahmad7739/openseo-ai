@@ -5,6 +5,7 @@ import urllib.error
 from urllib.parse import quote
 
 from .mode import resolve_mode
+from .url_normalize import canonicalize_url
 
 GSC_API_BASE_DEFAULT = "https://www.googleapis.com/webmasters/v3"
 MOCK_MODE_ENV = "GSC_MOCK_MODE"
@@ -198,19 +199,36 @@ class GscRestAdapter:
         end_date = params.get("end_date") or params.get("endDate")
         if not start_date or not end_date:
             raise GscError("search_analytics requires start_date and end_date (YYYY-MM-DD)")
-        body = {
-            "startDate": start_date,
-            "endDate": end_date,
-            "dimensions": params.get("dimensions") or params.get("dimension") or DEFAULT_DIMENSIONS,
-            "rowLimit": int(params.get("row_limit") or params.get("rowLimit") or 1000),
-            "startRow": int(params.get("start_row") or params.get("startRow") or 0),
-            "type": params.get("type", "web"),
-        }
-        if params.get("dimension_filter_groups"):
-            body["dimensionFilterGroups"] = params["dimension_filter_groups"]
-        if params.get("data_state") or params.get("dataState"):
-            body["dataState"] = params.get("data_state") or params.get("dataState")
-        return self._request("POST", f"{self.base_url}/{path}", payload=body)
+        row_limit = int(params.get("row_limit") or params.get("rowLimit") or 1000)
+        max_pages = int(params.get("max_pages") or params.get("maxPages") or 100)
+        merged_rows = []
+        start_row = int(params.get("start_row") or params.get("startRow") or 0)
+        for _page in range(max_pages):
+            body = {
+                "startDate": start_date,
+                "endDate": end_date,
+                "dimensions": params.get("dimensions") or params.get("dimension") or DEFAULT_DIMENSIONS,
+                "rowLimit": row_limit,
+                "startRow": start_row,
+                "type": params.get("type", "web"),
+            }
+            if params.get("dimension_filter_groups"):
+                body["dimensionFilterGroups"] = params["dimension_filter_groups"]
+            if params.get("data_state") or params.get("dataState"):
+                body["dataState"] = params.get("data_state") or params.get("dataState")
+            page = self._request("POST", f"{self.base_url}/{path}", payload=body)
+            page_rows = page.get("rows", []) or []
+            merged_rows.extend(page_rows)
+            if len(page_rows) < row_limit:
+                break
+            start_row += row_limit
+        else:
+            print(
+                f"[gsc] search_analytics: hit {max_pages} page cap at startRow={start_row} "
+                "— results may be truncated (raise max_pages if the site warrants it)",
+                flush=True,
+            )
+        return {"rows": merged_rows}
 
     def _get(self, capability):
         return self._request("GET", f"{self.base_url}/{ENDPOINTS[capability]}")
@@ -245,7 +263,7 @@ class GscRestAdapter:
             normalized.append({
                 "date": item.get("date"),
                 "query": item.get("query"),
-                "page_url": page_url,
+                "page_url": canonicalize_url(page_url),
                 "country": item.get("country", "all"),
                 "device": item.get("device", "all"),
                 "clicks": int(clicks) if float(clicks).is_integer() else clicks,
