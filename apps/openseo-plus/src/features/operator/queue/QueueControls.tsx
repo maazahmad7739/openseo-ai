@@ -105,7 +105,7 @@ function buildPills(
   const pills: FilterPill[] = [];
   if (status !== "all") pills.push({ group: "status", value: status, label: statusMeta[status as RecommendationStatus].label });
   if (generator !== "all") pills.push({ group: "generator", value: generator, label: generatorMeta[generator as GeneratorType].label });
-  if (owner !== "all") pills.push({ group: "owner", value: owner, label: ownerMeta[owner as Owner].label });
+  if (owner !== "all") pills.push({ group: "owner", value: owner, label: ownerMeta[owner as Owner]?.label ?? owner });
   if (actionType !== "all") pills.push({ group: "actionType", value: actionType, label: actionTypeMeta[actionType as ActionType].label });
   if (impact !== "all") pills.push({ group: "impact", value: impact, label: impactMeta[impact as ImpactLevel].label });
   if (effort !== "all") pills.push({ group: "effort", value: effort, label: effort === "hours" ? "< 1 day" : "Several days" });

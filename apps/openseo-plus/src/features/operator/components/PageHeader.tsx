@@ -1,6 +1,36 @@
-import { Link, useMatchRoute } from "@tanstack/react-router";
-import { BarChart3, ClipboardList, GitBranch, Globe, Moon, Sun } from "lucide-react";
+import { Link, useMatchRoute, useNavigate } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
+import { BarChart3, ChevronDown, ClipboardList, GitBranch, Globe, Moon, Sun } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
+import { API_BASE } from "../data/useOperatorData";
+
+const LAST_SITE_KEY = "openseo.lastSiteId";
+
+interface SiteOption {
+  site_id: string;
+  site_name: string;
+  domain: string;
+}
+
+/** Fetch the configured sites for the header switcher. */
+function useSites(): SiteOption[] {
+  const [sites, setSites] = useState<SiteOption[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/queue/sites`)
+      .then((res) => (res.ok ? res.json() : { sites: [] }))
+      .then((body: { sites?: SiteOption[] }) => {
+        if (!cancelled) setSites(body.sites ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setSites([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return sites;
+}
 
 const OPERATOR_TABS = [
   {
@@ -90,7 +120,7 @@ export function PageHeader({
 
           <div className="flex shrink-0 items-center gap-2">
             <ThemeToggle />
-            <SiteBadge siteId={projectId} />
+            <SiteSwitcher projectId={projectId} />
           </div>
         </div>
 
@@ -143,21 +173,63 @@ function ThemeToggle() {
   );
 }
 
-function SiteBadge({ siteId }: { siteId: string }) {
+/** Site switcher: dropdown of configured sites; changing navigates the
+ * route param, which re-keys every site-scoped react-query cache. */
+function SiteSwitcher({ projectId }: { projectId: string }) {
+  const sites = useSites();
+  const navigate = useNavigate();
+  const current = sites.find((s) => s.site_id === projectId);
+  const label = current?.site_name ?? "Site";
+  const known = sites.length > 0;
+
+  const onChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const next = event.target.value;
+    if (!next || next === projectId) return;
+    localStorage.setItem(LAST_SITE_KEY, next);
+    void navigate({
+      to: "/p/$projectId/action-queue",
+      params: { projectId: next },
+    });
+  };
+
   return (
     <div
       className="flex items-center gap-2 rounded-xl border border-base-300 bg-base-100 py-1.5 pl-1.5 pr-3 shadow-sm"
-      title={siteId}
+      title={current ? `${current.site_name} (${current.domain})` : projectId}
     >
       <div className="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary">
         <Globe className="size-4" />
       </div>
       <div className="hidden leading-tight sm:block">
-        <p className="text-xs font-semibold">Aurora Audio</p>
-        <p className="font-mono text-[10px] text-base-content/50">
-          {siteId.slice(0, 8)}
-        </p>
+        {known ? (
+          <>
+            <select
+              aria-label="Switch site"
+              className="max-w-[160px] cursor-pointer truncate border-0 bg-transparent p-0 text-xs font-semibold outline-none"
+              value={projectId}
+              onChange={onChange}
+            >
+              {sites.map((site) => (
+                <option key={site.site_id} value={site.site_id}>
+                  {site.site_name || site.site_id.slice(0, 8)}
+                </option>
+              ))}
+              {!current ? <option value={projectId}>{projectId.slice(0, 8)}</option> : null}
+            </select>
+            <p className="font-mono text-[10px] text-base-content/50">
+              {projectId.slice(0, 8)}
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="text-xs font-semibold">{label}</p>
+            <p className="font-mono text-[10px] text-base-content/50">
+              {projectId.slice(0, 8)}
+            </p>
+          </>
+        )}
       </div>
+      {known ? <ChevronDown className="size-3.5 text-base-content/40 sm:hidden" /> : null}
     </div>
   );
 }

@@ -1,5 +1,7 @@
 # Secrets & local config
 .env
+.env.vercel-prod
+.env.local
 *.pem
 *service-account*.json
 *service_account*.json

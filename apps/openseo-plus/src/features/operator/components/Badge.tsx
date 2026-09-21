@@ -7,7 +7,6 @@ import {
   generatorMeta,
   impactMeta,
   ownerMeta,
-  ownerSolidClass,
   resultMeta,
   statusMeta,
 } from "./meta";
@@ -47,19 +46,18 @@ export function ActionTypeBadge({ actionType }: { actionType: ActionType }) {
 }
 
 export function OwnerBadge({ owner }: { owner: Owner }) {
-  const meta = ownerMeta[owner];
+  const meta = ownerMeta[owner] ?? { label: owner, badgeClass: "tag-chip-slate" };
   return <Chip className={meta.badgeClass}>{meta.label}</Chip>;
 }
 
 /** Solid (white-on-color) owner chip for colored surfaces like kanban cards. */
 export function OwnerBadgeSolid({ owner }: { owner: Owner }) {
-  const { label } = ownerMeta[owner];
+  const meta = ownerMeta[owner];
+  const solid =
+    meta && "solidClass" in meta ? meta.solidClass : "bg-slate-500";
+  const label = meta?.label ?? owner;
   return (
-    <span
-      className={`${chipBaseClass} ${ownerSolidClass[owner]} text-white`}
-    >
-      {label}
-    </span>
+    <span className={`${chipBaseClass} ${solid} text-white`}>{label}</span>
   );
 }
 
