@@ -115,14 +115,14 @@ def main():
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE recommendations SET status = 'approved', measured_at = NULL, "
-                    "approved_at = now() "
+                    "approved_at = now(), implemented_at = %s "
                     "WHERE recommendation_id = ("
                     "  SELECT recommendation_id FROM recommendations "
                     "  WHERE site_id = %s AND status = 'raw' AND action_type != 'create_page' "
                     "  AND target_url IS NOT NULL "
                     "  ORDER BY created_at DESC LIMIT 1"
                     ") RETURNING recommendation_id",
-                    (site[0],))
+                    (IMPL_DATE, site[0],))
                 approved = cur.fetchone()
             conn.commit()
         else:
@@ -137,14 +137,14 @@ def main():
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE recommendations SET status = 'approved', approved_at = now(), "
-                    "measured_at = NULL "
+                    "measured_at = NULL, implemented_at = %s "
                     "WHERE recommendation_id = ("
                     "  SELECT recommendation_id FROM recommendations "
                     "  WHERE site_id = %s AND status = 'proposed' "
                     "  AND action_type != 'create_page' AND target_url IS NOT NULL "
                     "  ORDER BY created_at DESC LIMIT 1"
                     ") RETURNING recommendation_id",
-                    (site[0],))
+                    (IMPL_DATE, site[0],))
                 approved = cur.fetchone()
             conn.commit()
 
@@ -158,13 +158,16 @@ def main():
         stage("4. measurement batch (baseline + post snapshots)")
         from measurement.measure import run_measurement_batch, store_post_snapshots
         from measurement.baseline import resolve_window_days
+        from measurement.thresholds import GSC_SETTLE_DAYS
         with conn.cursor() as cur:
             cur.execute("SELECT action_type FROM recommendations WHERE recommendation_id = %s",
                         (approved_id,))
             action_type = cur.fetchone()[0]
         window = resolve_window_days(conn, action_type)
+        # Reference date must clear the GSC settle buffer (impl + window + settle)
+        # — the batch skips windows that close inside the buffer.
         batch = run_measurement_batch(conn, [approved_id],
-                                      reference_date=IMPL_DATE)
+                                      reference_date=IMPL_DATE + timedelta(days=window + GSC_SETTLE_DAYS))
         print(json.dumps(batch, indent=1, default=str))
         allok &= len(batch["measured"]) == 1 and len(batch["skipped"]) == 0
         # post window ends at impl + window (day-in-the-life compression)

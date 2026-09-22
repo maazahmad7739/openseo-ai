@@ -32,3 +32,12 @@ DID_IMPROVE_THRESHOLD = 0.10
 # it is added by plan migration (see 14-min-measure-sample.sql) — when absent,
 # resolve_min_sample falls back cleanly to this default.
 MIN_SAMPLE_FOR_SIGNIFICANCE = 50
+
+# GSC reporting lag: Google Search Console performance data is typically
+# 3-4 days behind the present. A recommendation whose observation window ends
+# "today" would be evaluated against incomplete final days and could be
+# misclassified. The measurement clock therefore requires the window to have
+# been closed for this many additional days before it fires. Fixed constant
+# for now; expose in site_config only if real-world latency patterns vary
+# across stores (post-cutover evidence needed before adding that knob).
+GSC_SETTLE_DAYS = 4

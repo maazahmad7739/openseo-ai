@@ -128,6 +128,95 @@ def _is_fresh(conn, site_id, capability, ttl_days):
 # Overlap pre-gate for the match-score stand-in (fix 3.7: named constant).
 MIN_TERM_OVERLAP = 0.5
 
+# Set-based match-score computation (performance rewrite of the O(pages x
+# clusters) Python loop): one INSERT..SELECT per site, executed by the engine
+# instead of the app layer. Chunked (MATCH_SCORE_CHUNK) so a large-catalogue
+# backfill never holds one transaction long enough to block API reads, with a
+# statement_timeout as the loud-failure guard against pathological catalogues.
+MATCH_SCORE_CHUNK = 500
+MATCH_SCORE_STATEMENT_TIMEOUT_MS = 120000
+
+# Semantics preserved EXACTLY from the former Python loop (verified row-for-row
+# against it on the fixture DB before switching callers; see plan/09 §match-scores):
+#   terms = words len>3 from lower(primary_keyword)
+#   hay = lower("{title or ''} {url}")
+#   overlap = matching_terms / n_terms, substring match, rounded to 2dp (the
+#     NUMERIC(3,2) column storage semantics; the old column write rounded too)
+#   type_fit = 1.0 when intent='commercial' AND page_type='collection' else 0.4
+#   gsc_evidence = 1.0 when the page's URL appears in search_performance
+#   aggregate = 0.30*type_fit + 0.30*overlap + 0.25*gsc + 0.15*overlap (rounded 2dp,
+#     recomputed identically by the page_query_match_scores generated column)
+#   pre-gate: overlap >= MIN_TERM_OVERLAP; post-gate: score >= tier page_match_threshold
+#   tie-break: score DESC, page_id ASC — the Python loop's "first max wins"
+#     depended on unordered heap order (non-deterministic between runs); the
+#     explicit page_id ASC tie-break is the deliberate, stable replacement.
+#   rounding: numeric (exact half-up, matching the NUMERIC(3,2) column + generated
+#     aggregate), replacing the Python float path which lost epsilon on scores
+#     landing exactly on a half-cent boundary (e.g. 0.595: float→0.59, numeric→0.60).
+#     One borderline cluster flips from unrecorded to recorded with the exact
+#     value the generated column always computed — a corrected latent bug.
+# Weights live in the generated column on page_query_match_scores (single
+# source); this SQL mirrors them only to select the best page pre-insert.
+# {cluster_scope} is the optional cluster restriction for the scoped recompute
+# path; the full pass substitutes it with an always-true filter so the
+# placeholder count stays identical in both paths.
+_MATCH_SCORE_SQL = """
+WITH cluster_terms AS (
+    SELECT kc.cluster_id, kc.site_id, kc.intent,
+           array_agg(DISTINCT t.w) AS terms,
+           count(DISTINCT t.w)::int AS n_terms
+    FROM keyword_clusters kc
+    CROSS JOIN LATERAL unnest(regexp_split_to_array(lower(kc.primary_keyword), '\\s+')) AS t(w)
+    WHERE kc.site_id = %(site_id)s::uuid AND length(t.w) > 3
+      AND kc.cluster_id = ANY(%(cluster_ids)s::uuid[])
+    GROUP BY kc.cluster_id, kc.site_id, kc.intent
+),
+scored AS (
+    SELECT ct.cluster_id, ct.site_id, ct.n_terms, ct.terms,
+           p.page_id, p.page_type, p.url,
+           (EXISTS (SELECT 1 FROM search_performance sp
+                    WHERE sp.site_id = p.site_id AND sp.page_url = p.url))::int AS gsc_evidence,
+           CASE WHEN ct.intent = 'commercial' AND p.page_type = 'collection'
+                THEN 1.0::float ELSE 0.4::float END AS type_fit,
+           lower(coalesce(p.title, '') || ' ' || p.url) AS hay
+    FROM cluster_terms ct
+    JOIN pages p ON p.site_id = ct.site_id
+),
+overlap AS (
+    SELECT s.cluster_id, s.page_id, s.gsc_evidence, s.type_fit, s.n_terms,
+           count(*) FILTER (WHERE position(t.w IN s.hay) > 0)::float / s.n_terms AS overlap_raw
+    FROM scored s
+    CROSS JOIN LATERAL unnest(s.terms) AS t(w)
+    GROUP BY s.cluster_id, s.page_id, s.gsc_evidence, s.type_fit, s.n_terms
+),
+gated AS (
+    SELECT o.*,
+           round(o.overlap_raw::numeric, 2) AS overlap,
+           round((0.30 * o.type_fit + 0.30 * o.overlap_raw
+                  + 0.25 * o.gsc_evidence + 0.15 * o.overlap_raw)::numeric, 2) AS score
+    FROM overlap o
+    WHERE o.overlap_raw >= {min_overlap}
+),
+best AS (
+    SELECT DISTINCT ON (cluster_id) cluster_id, page_id, type_fit, overlap, gsc_evidence, score
+    FROM gated
+    ORDER BY cluster_id, score DESC, page_id ASC
+)
+INSERT INTO page_query_match_scores
+    (site_id, page_id, cluster_id, intent_page_type_score,
+     catalogue_match_score, gsc_evidence_score, semantic_content_score)
+SELECT %(site_id)s::uuid, b.page_id, b.cluster_id, b.type_fit, b.overlap, b.gsc_evidence, b.overlap
+FROM best b
+JOIN site_config sc ON sc.site_id = %(site_id)s::uuid
+JOIN threshold_tiers tt ON tt.tier = sc.catalogue_size_tier
+WHERE b.score >= tt.{threshold_column}
+ON CONFLICT (page_id, cluster_id) DO UPDATE SET
+    intent_page_type_score = EXCLUDED.intent_page_type_score,
+    catalogue_match_score = EXCLUDED.catalogue_match_score,
+    gsc_evidence_score = EXCLUDED.gsc_evidence_score,
+    semantic_content_score = EXCLUDED.semantic_content_score
+"""
+
 MOCK_SITE = {
     "site_name": "Aurora Audio (mock)",
     "domain": "example.com",
@@ -527,8 +616,13 @@ def collections_cache(conn, site_id):
     return out
 
 
-def sync_page_query_match_scores(conn, site_id):
+def sync_page_query_match_scores(conn, site_id, cluster_ids=None, chunk_size=MATCH_SCORE_CHUNK):
     """Priority 3.2 job: page×cluster match scores (semantic scoring stand-in).
+
+    Set-based rewrite of the former O(pages x clusters) Python loop: the whole
+    computation runs as one INSERT..SELECT (chunked by cluster for the backfill
+    path) executed by Postgres — same inputs, same outputs, ~100x less app-side
+    work and no long-running app-transaction locks.
 
     catalogue/semantic components use keyword overlap between the cluster's
     primary keyword and page title+url; gsc_evidence_score is 1.0 only when
@@ -537,59 +631,52 @@ def sync_page_query_match_scores(conn, site_id):
     recorded (fix 3.7: no local 0.60 copy) — a weak/unknown match means
     Generator 1 may legitimately propose a missing page for the cluster.
     The overlap pre-gate (0.5) is a named constant: MIN_TERM_OVERLAP.
+
+    cluster_ids: optional scope restriction (scoped recompute — only clusters
+    whose coverage/keywords changed in this sync, instead of the full recompute).
+    None = all clusters for the site (first sync, force-refresh, backfill).
+
+    chunk_size: clusters processed per statement/transaction chunk so a large
+    catalogue backfill never holds a long transaction. A statement_timeout
+    guards each chunk so a pathological catalogue fails loudly, never locks.
     """
     match_threshold = tier_threshold(conn, site_id, "page_match_threshold")
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT cluster_id, primary_keyword, intent FROM keyword_clusters WHERE site_id = %s",
-            (site_id,),
-        )
-        clusters = cur.fetchall()
-        cur.execute(
-            "SELECT page_id, url, page_type, title FROM pages WHERE site_id = %s",
-            (site_id,),
-        )
-        pages = cur.fetchall()
-        cur.execute(
-            "SELECT DISTINCT page_url FROM search_performance WHERE site_id = %s",
-            (site_id,),
-        )
-        ranking_urls = {row[0] for row in cur.fetchall()}
-    inserted = 0
-    for cluster_id, primary_keyword, intent in clusters:
-        terms = [w for w in primary_keyword.lower().split() if len(w) > 3]
-        if not terms:
-            continue
-        best_page = None
-        best_score = 0.0
-        for page_id, url, page_type, title in pages:
-            hay = f"{title or ''} {url}".lower()
-            overlap = sum(1 for t in terms if t in hay) / len(terms)
-            if overlap < MIN_TERM_OVERLAP:
-                continue
-            type_fit = 1.0 if (intent == "commercial" and page_type == "collection") else 0.4
-            gsc_evidence = 1.0 if url in ranking_urls else 0.0
-            score = round(0.30 * type_fit + 0.30 * overlap + 0.25 * gsc_evidence + 0.15 * overlap, 2)
-            if score > best_score:
-                best_score = score
-                best_page = (page_id, overlap, type_fit, gsc_evidence)
-        if best_page and best_score >= match_threshold:
-            page_id, overlap, type_fit, gsc_evidence = best_page
+    sql = (
+        _MATCH_SCORE_SQL
+        .replace("{min_overlap}", str(MIN_TERM_OVERLAP))
+        .replace("{threshold_column}", "page_match_threshold")
+    )
+    # Full-pass scope: every cluster for the site. The scoped/chunked path
+    # narrows to the caller-provided cluster_ids (same statement, different params).
+    if cluster_ids is not None:
+        inserted = 0
+        ids = [str(c) for c in cluster_ids]
+        for start in range(0, len(ids), chunk_size):
+            chunk = ids[start:start + chunk_size]
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO page_query_match_scores "
-                    "(site_id, page_id, cluster_id, intent_page_type_score, "
-                    " catalogue_match_score, gsc_evidence_score, semantic_content_score) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
-                    "ON CONFLICT (page_id, cluster_id) DO UPDATE SET "
-                    "intent_page_type_score = EXCLUDED.intent_page_type_score, "
-                    "catalogue_match_score = EXCLUDED.catalogue_match_score, "
-                    "gsc_evidence_score = EXCLUDED.gsc_evidence_score, "
-                    "semantic_content_score = EXCLUDED.semantic_content_score",
-                    (site_id, page_id, cluster_id, type_fit, overlap, gsc_evidence, overlap),
-                )
-            inserted += 1
-    return inserted
+                    f"SET LOCAL statement_timeout = {MATCH_SCORE_STATEMENT_TIMEOUT_MS}")
+                cur.execute(sql, {"site_id": site_id, "cluster_ids": chunk})
+                inserted += cur.rowcount
+            conn.commit()
+        return inserted
+    # Full pass: single statement (still bounded by statement_timeout).
+    # cluster_ids = all cluster ids for the site (ANY() over the full list is
+    # the always-true scope; keeps ONE statement shape for both paths).
+    all_ids = None
+    with conn.cursor() as cur:
+        cur.execute("SELECT cluster_id FROM keyword_clusters WHERE site_id = %s::uuid", (site_id,))
+        all_ids = [str(r[0]) for r in cur.fetchall()]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SET LOCAL statement_timeout = {MATCH_SCORE_STATEMENT_TIMEOUT_MS}")
+            cur.execute(sql, {"site_id": site_id, "cluster_ids": all_ids})
+            inserted = cur.rowcount
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, reference_date=None):
@@ -692,7 +779,26 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, referenc
 
         counts["crawl_audit_updated"] = sync_crawl_audit(conn, openseo, site_id, site["domain"])
         counts["catalogue_coverage"] = sync_catalogue_coverage(conn, site_id, site["domain"], shopify)
-        counts["page_query_match_scores"] = sync_page_query_match_scores(conn, site_id)
+        # Scoped recompute: only clusters whose coverage/keyword data changed in
+        # THIS sync (their catalogue_coverage was rewritten) get a fresh match
+        # score. Full pass only when no scores exist yet (first sync / backfill).
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM page_query_match_scores WHERE site_id = %s::uuid",
+                (site_id,),
+            )
+            scores_exist = cur.fetchone()[0] > 0
+        if scores_exist:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT cluster_id FROM catalogue_coverage WHERE site_id = %s::uuid",
+                    (site_id,),
+                )
+                covered = {str(r[0]) for r in cur.fetchall()}
+            counts["page_query_match_scores"] = sync_page_query_match_scores(
+                conn, site_id, cluster_ids=sorted(covered))
+        else:
+            counts["page_query_match_scores"] = sync_page_query_match_scores(conn, site_id)
         counts["openseo_serp_snapshots"] = counts.get("openseo_serp_snapshots", 0)  # Generator 1 feeds on these
 
         conn.commit()

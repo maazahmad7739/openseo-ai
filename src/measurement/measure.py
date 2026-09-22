@@ -25,6 +25,7 @@ from measurement.baseline import (
     CONTROL_GROUP_LIMIT,
     store_baseline,
 )
+from measurement.thresholds import GSC_SETTLE_DAYS
 
 
 def _load_paired_control_urls(conn, recommendation_id):
@@ -265,6 +266,18 @@ def run_measurement_batch(conn, recommendation_ids=None, reference_date=None):
                 )
                 action_type, target_url, cluster_id = cur.fetchone()
             anchor = implemented_at.date() if implemented_at else reference_date
+            window_days = resolve_window_days(conn, action_type)
+            # GSC settle gate (thresholds.py single source): a window that
+            # closes inside the settle buffer is not yet measurable — GSC's
+            # final days would be incomplete. Shift the evaluation anchor
+            # past the buffer; the window length itself is unchanged.
+            if anchor + timedelta(days=window_days) > reference_date - timedelta(days=GSC_SETTLE_DAYS):
+                skipped.append({
+                    "recommendation_id": str(rec_id),
+                    "reason": f"window closes within the {GSC_SETTLE_DAYS}-day "
+                              "GSC settle buffer — not yet measurable",
+                })
+                continue
             if action_type == "create_page":
                 from measurement.baseline import NIL_CLUSTER_ID, store_cluster_baseline
                 if not cluster_id or str(cluster_id) == NIL_CLUSTER_ID:
@@ -276,8 +289,7 @@ def run_measurement_batch(conn, recommendation_ids=None, reference_date=None):
                     continue
                 store_cluster_baseline(conn, rec_id, anchor)
                 post_info = store_cluster_post_snapshots(
-                    conn, rec_id,
-                    anchor + timedelta(days=resolve_window_days(conn, action_type)))
+                    conn, rec_id, anchor + timedelta(days=window_days))
             elif not target_url:
                 skipped.append({
                     "recommendation_id": str(rec_id),
@@ -288,8 +300,7 @@ def run_measurement_batch(conn, recommendation_ids=None, reference_date=None):
             else:
                 store_baseline(conn, rec_id, anchor)
                 post_info = store_post_snapshots(
-                    conn, rec_id,
-                    anchor + timedelta(days=resolve_window_days(conn, action_type)))
+                    conn, rec_id, anchor + timedelta(days=window_days))
             measured.append({
                 "recommendation_id": str(rec_id),
                 "action_type": action_type,

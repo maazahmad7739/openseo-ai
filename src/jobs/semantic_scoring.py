@@ -15,15 +15,25 @@ EMBEDDING_ENV = "EMBEDDING_ENDPOINT"
 
 
 def run(site_id=None, reference_date=None):
+    from jobs.locks import job_lock, LOCK_KEYS, already_running
     endpoint = os.environ.get(EMBEDDING_ENV)
     if not endpoint:
         print("[semantic_scoring] embedding endpoint not configured — "
               "semantic_content_score unchanged (stand-in scoring remains)", flush=True)
         return {"skipped": "embedding_endpoint_not_configured"}
     # Skeleton: real implementation marks the one model call it makes.
-    raise NotImplementedError(
-        "semantic scoring requires the embedding contract decision (founder); "
-        "endpoint is configured but the embedding call is not implemented yet")
+    # Lock acquisition precedes any model spend so an overlapping run can
+    # never double-bill the embedding call.
+    conn = __import__("db").get_connection()
+    try:
+        with job_lock(conn, LOCK_KEYS["semantic_scoring"]) as got:
+            if not got:
+                return already_running("semantic_scoring")
+            raise NotImplementedError(
+                "semantic scoring requires the embedding contract decision (founder); "
+                "endpoint is configured but the embedding call is not implemented yet")
+    finally:
+        conn.close()
 
 
 def main():

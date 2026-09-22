@@ -18,13 +18,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from measurement.baseline import resolve_window_days, store_baseline  # noqa: E402
 from measurement.measure import store_post_snapshots  # noqa: E402
 from measurement.classify import classify_recommendation, persist_classification  # noqa: E402
+from measurement.thresholds import GSC_SETTLE_DAYS  # noqa: E402
 
 
 def run_measurement_sweep(conn, reference_date=None, site_id=None):
     """For every recommendation in 'live' past its window: measure + classify.
 
     Window check: implemented_at + measurement_window_lookup[action_type] days
-    <= reference_date (default: today UTC — visible parameter at the caller).
+    + GSC_SETTLE_DAYS <= reference_date (default: today UTC — visible parameter
+    at the caller). The settle days absorb Google Search Console's ~3-4 day
+    reporting lag so the post window is never evaluated against incomplete
+    final-days data (thresholds.py is the single source for the constant).
     Idempotent: existing snapshots for the rec are replaced, classification is
     recomputed from the snapshots (same inputs → same verdict).
 
@@ -38,9 +42,10 @@ def run_measurement_sweep(conn, reference_date=None, site_id=None):
             "FROM recommendations r "
             "JOIN measurement_window_lookup mwl ON mwl.action_type = r.action_type "
             "WHERE r.status = 'live' AND r.implemented_at IS NOT NULL "
-            "AND r.implemented_at::date + mwl.measurement_window_days <= %s"
+            "AND r.implemented_at::date + mwl.measurement_window_days "
+            "    + %s::int <= %s::date"
         )
-        params = [reference_date]
+        params = [GSC_SETTLE_DAYS, reference_date]
         if site_id:
             sql += " AND r.site_id = %s"
             params.append(site_id)
@@ -50,6 +55,9 @@ def run_measurement_sweep(conn, reference_date=None, site_id=None):
     measured, pending, skipped = [], [], []
     for rec_id, action_type, implemented_at in due:
         window = resolve_window_days(conn, action_type)
+        # Post-window anchor: implementation date + window, NOT including the
+        # settle days — settle shifts WHEN the sweep fires, not WHAT the post
+        # window covers (the window length stays exactly measurement_window_days).
         measured_at = implemented_at.date() if hasattr(implemented_at, "date") else implemented_at
         measured_at = measured_at + timedelta(days=window)
         try:
@@ -90,11 +98,18 @@ def main():
                         help="injectable clock (YYYY-MM-DD); default today")
     args = parser.parse_args()
     import db as database
+    from jobs.locks import job_lock, LOCK_KEYS, already_running
     reference_date = date.fromisoformat(args.reference_date) if args.reference_date else date.today()
     conn = database.get_connection()
     try:
-        summary = run_measurement_sweep(conn, reference_date=reference_date,
-                                        site_id=args.site_id)
+        # Global sweep lock: two overlapping measurement runs would race the
+        # delete-before-rewrite of post snapshots.
+        with job_lock(conn, LOCK_KEYS["measurement_clock"]) as got:
+            if not got:
+                print("measurement_clock:", json.dumps(already_running("measurement_clock")))
+                return
+            summary = run_measurement_sweep(conn, reference_date=reference_date,
+                                            site_id=args.site_id)
         print(json.dumps(summary, indent=1))
     finally:
         conn.close()

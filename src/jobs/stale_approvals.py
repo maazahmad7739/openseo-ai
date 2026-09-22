@@ -25,33 +25,37 @@ import env as env_loader
 def run(site_id=None, reference_date=None):
     env_loader.load_env_file(quiet=True)
     from api.routes.queue import STALE_APPROVAL_DAYS
+    from jobs.locks import job_lock, LOCK_KEYS, already_running
     from jobs.notify import send_summary
     conn = database.get_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT r.recommendation_id, r.site_id, r.generator, r.action_type,
-                       r.diagnosis, r.impact, r.assigned_to,
-                       (%s::date - r.approved_at::date) AS stale_days
-                FROM recommendations r
-                WHERE r.status = 'approved'
-                  AND r.approved_at IS NOT NULL
-                  AND (%s::date - r.approved_at::date) >= %s
-                ORDER BY stale_days DESC
-                """,
-                (reference_date or date.today(),
-                 reference_date or date.today(),
-                 STALE_APPROVAL_DAYS),
-            )
-            columns = [d[0] for d in cur.description]
-            items = [dict(zip(columns, r)) for r in cur.fetchall()]
-        conn.rollback()
-        summary = {
-            "stale_threshold_days": STALE_APPROVAL_DAYS,
-            "count": len(items),
-            "items": items,
-        }
+        with job_lock(conn, LOCK_KEYS["stale_approvals"]) as got:
+            if not got:
+                return already_running("stale_approvals")
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT r.recommendation_id, r.site_id, r.generator, r.action_type,
+                           r.diagnosis, r.impact, r.assigned_to,
+                           (%s::date - r.approved_at::date) AS stale_days
+                    FROM recommendations r
+                    WHERE r.status = 'approved'
+                      AND r.approved_at IS NOT NULL
+                      AND (%s::date - r.approved_at::date) >= %s
+                    ORDER BY stale_days DESC
+                    """,
+                    (reference_date or date.today(),
+                     reference_date or date.today(),
+                     STALE_APPROVAL_DAYS),
+                )
+                columns = [d[0] for d in cur.description]
+                items = [dict(zip(columns, r)) for r in cur.fetchall()]
+            conn.rollback()
+            summary = {
+                "stale_threshold_days": STALE_APPROVAL_DAYS,
+                "count": len(items),
+                "items": items,
+            }
         send_summary("stale_approvals", summary)
         return summary
     finally:

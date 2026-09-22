@@ -3,6 +3,11 @@ import sys
 import json
 from datetime import timedelta, date
 
+# Windows console (cp1252) chokes on the arrows/unicode in check names and
+# classification reasons — force UTF-8 stdout for the whole suite.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from measurement.significance import two_proportion_z_test, is_significant, sample_sufficient  # noqa: E402
@@ -12,7 +17,7 @@ from measurement.baseline import (  # noqa: E402
 )
 from measurement.measure import store_post_snapshots, load_snapshots, run_measurement_batch  # noqa: E402
 from measurement.classify import classify_recommendation, persist_classification  # noqa: E402
-from measurement.thresholds import ALPHA, MIN_SAMPLE_FOR_SIGNIFICANCE, DID_IMPROVE_THRESHOLD  # noqa: E402
+from measurement.thresholds import ALPHA, MIN_SAMPLE_FOR_SIGNIFICANCE, DID_IMPROVE_THRESHOLD, GSC_SETTLE_DAYS  # noqa: E402
 
 import db as database  # noqa: E402
 
@@ -149,19 +154,18 @@ def main():
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO recommendations (site_id, generator, action_type, proposed_url, "
-                    "cluster_id, diagnosis, status) "
+                    "cluster_id, diagnosis, status, implemented_at) "
                     "VALUES (%s, 'missing_page', 'create_page', %s, %s, 'cp measurement test', "
-                    "'approved') RETURNING recommendation_id",
-                    (cp_site, proposed_url, cluster_id))
+                    "'approved', %s) RETURNING recommendation_id",
+                    (cp_site, proposed_url, cluster_id, impl_date))
                 return str(cur.fetchone()[0])
 
         cp_recs = {}
+        impl_date = date(2026, 9, 11)  # 49-day window -> baseline 07-24..09-11
         cp_recs["weak"] = _cp_rec(clusters["weak"], f"/collections/cp-weak-{token}")
         cp_recs["zero"] = _cp_rec(clusters["zero"], f"/collections/cp-zero-{token}")
         cp_recs["tiny"] = _cp_rec(clusters["tiny"], f"/collections/cp-tiny-{token}")
         conn.commit()
-
-        impl_date = date(2026, 9, 11)  # 49-day window -> baseline 07-24..09-11
 
         try:
             from measurement.baseline import store_cluster_baseline, load_baseline
@@ -229,10 +233,13 @@ def main():
                            json.dumps(cls_tiny, default=str)[:300])
 
             print("\n-- batch measures create_page (no longer skipped) --")
+            # The batch now honors the GSC settle buffer: reference must be at
+            # least impl_date + window + GSC_SETTLE_DAYS for measurement to run.
             from measurement.measure import run_measurement_batch
             batch_rec = _cp_rec(clusters["weak"], f"/collections/cp-batch-{token}")
             conn.commit()
-            batch = run_measurement_batch(conn, [batch_rec], reference_date=impl_date)
+            batch = run_measurement_batch(conn, [batch_rec],
+                                          reference_date=impl_date + timedelta(days=49 + GSC_SETTLE_DAYS))
             allok &= check("create_page measured via batch (weak cluster footprint)",
                            len(batch["measured"]) == 1 and len(batch["skipped"]) == 0,
                            json.dumps(batch, default=str))
@@ -243,9 +250,12 @@ def main():
             conn.commit()
 
             print("\n-- create_page without cluster_id -> skipped loudly --")
+            # Same reference date (past settle): the skip reason must be the
+            # missing cluster, NOT the settle gate.
             no_cluster_rec = _cp_rec(None, f"/collections/cp-nocluster-{token}")
             conn.commit()
-            batch2 = run_measurement_batch(conn, [no_cluster_rec], reference_date=impl_date)
+            batch2 = run_measurement_batch(conn, [no_cluster_rec],
+                                           reference_date=impl_date + timedelta(days=49 + GSC_SETTLE_DAYS))
             allok &= check("create_page with no cluster skipped (never crashes the batch)",
                            len(batch2["measured"]) == 0 and len(batch2["skipped"]) == 1
                            and "no cluster_id" in batch2["skipped"][0]["reason"],
@@ -302,24 +312,174 @@ def main():
                     (cp_site, f"control-post-{token}"))
             conn.commit()
 
+        print("\n== GSC settle buffer (fix: measurement correctness) ==")
+        allok &= check("settle constant is 4 (fixed, single source)",
+                       GSC_SETTLE_DAYS == 4, str(GSC_SETTLE_DAYS))
+
+        # Self-contained site + target URL for the settle/sweep/late tests
+        # (the edge-case section that defines edge_url runs later in the file).
+        import uuid as _uuid3
+        settle_token = _uuid3.uuid4().hex[:10]
+        with conn.cursor() as cur:
+            cur.execute("SELECT site_id FROM site_config WHERE domain = 'example.com'")
+            settle_site = cur.fetchone()[0]
+            settle_url = f"https://example.com/collections/settle-target-{settle_token}"
+            cur.execute(
+                "INSERT INTO pages (site_id, url, page_type, template) "
+                "VALUES (%s, %s, 'collection', 'settle.liquid')",
+                (settle_site, settle_url))
+
+        # run_measurement_batch must skip a rec whose window closes inside
+        # the settle buffer, and measure once past it.
+        from measurement.measure import run_measurement_batch as _rmb
+        settle_impl = date(2026, 9, 11)  # improve_page 28-day window
+        settle_rec_probe = None
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO recommendations (site_id, generator, action_type, "
+                "target_url, diagnosis, status, implemented_at) "
+                "VALUES (%s, 'existing_opportunity', 'improve_page', %s, "
+                "'settle test', 'approved', %s) RETURNING recommendation_id",
+                (settle_site, settle_url, settle_impl))
+            settle_rec_probe = str(cur.fetchone()[0])
+        conn.commit()
+        # Seed search history around both windows so baseline would succeed
+        # if it were attempted (proves the gate, not missing data, causes the skip).
+        for day in (date(2026, 8, 15), date(2026, 10, 1)):
+            _sp_row(conn, settle_site, day, f"settle-{settle_rec_probe[:8]}",
+                    settle_url, 100, 2000)
+        conn.commit()
+        # Window closes 2026-10-09; settle requires reference >= 2026-10-13.
+        batch3 = _rmb(conn, [settle_rec_probe], reference_date=date(2026, 10, 12))
+        allok &= check("window closing within settle buffer -> skipped",
+                       len(batch3["measured"]) == 0 and len(batch3["skipped"]) == 1
+                       and "settle buffer" in batch3["skipped"][0]["reason"],
+                       json.dumps(batch3, default=str))
+        batch4 = _rmb(conn, [settle_rec_probe], reference_date=date(2026, 10, 13))
+        allok &= check("one day past settle buffer -> measured",
+                       len(batch4["measured"]) == 1, json.dumps(batch4, default=str))
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM measurement_snapshots WHERE recommendation_id = %s",
+                        (settle_rec_probe,))
+            cur.execute("DELETE FROM recommendations WHERE recommendation_id = %s",
+                        (settle_rec_probe,))
+            cur.execute("DELETE FROM search_performance WHERE site_id = %s AND query LIKE %s",
+                        (settle_site, f"settle-{settle_rec_probe[:8]}%"))
+        conn.commit()
+
+        # The clock sweep: due-condition includes settle days.
+        from jobs.measurement_clock import run_measurement_sweep as _sweep
+        sweep_impl = date(2026, 9, 11)  # improve_page 28d -> closes 10-09, due 10-13
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO recommendations (site_id, generator, action_type, "
+                "target_url, diagnosis, status, implemented_at, measurement_due_at) "
+                "VALUES (%s, 'existing_opportunity', 'improve_page', %s, "
+                "'sweep settle test', 'live', %s, %s) RETURNING recommendation_id",
+                (settle_site, settle_url,
+                 sweep_impl, sweep_impl + timedelta(days=28)))
+            sweep_rec = str(cur.fetchone()[0])
+            # history in baseline AND post windows so measurement can complete
+            for day, clicks in ((date(2026, 8, 15), 40), (date(2026, 10, 1), 120)):
+                _sp_row(conn, settle_site, day, f"sweep-{sweep_rec[:8]}",
+                        settle_url, clicks, 2000)
+        conn.commit()
+        out_before = _sweep(conn, reference_date=sweep_impl + timedelta(days=31))  # 10-12: pre-settle
+        allok &= check("clock: pre-settle run does not fire",
+                       len(out_before["measured"]) == 0
+                       and not any(m["recommendation_id"] == sweep_rec for m in out_before["measured"]),
+                       json.dumps(out_before, default=str)[:300])
+        out_after = _sweep(conn, reference_date=sweep_impl + timedelta(days=32))  # 10-13: due
+        hit = [m for m in out_after["measured"] if m["recommendation_id"] == sweep_rec]
+        allok &= check("clock: fires on the first day past the settle buffer",
+                       len(hit) == 1, json.dumps(out_after, default=str)[:400])
+        # measured_at anchor excludes settle days: post window ends at impl+28,
+        # not impl+32.
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT max(period_end) FROM measurement_snapshots "
+                "WHERE recommendation_id = %s AND snapshot_type = 'post_implementation'",
+                (sweep_rec,))
+            post_end = cur.fetchone()[0]
+        allok &= check("clock: post window anchor excludes settle days",
+                       post_end is not None and str(post_end) == str(sweep_impl + timedelta(days=28)),
+                       f"post_end={post_end} expected={sweep_impl + timedelta(days=28)}")
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM measurement_snapshots WHERE recommendation_id = %s", (sweep_rec,))
+            cur.execute("DELETE FROM recommendations WHERE recommendation_id = %s", (sweep_rec,))
+            cur.execute("DELETE FROM search_performance WHERE site_id = %s AND query LIKE %s",
+                        (settle_site, f"sweep-{sweep_rec[:8]}%"))
+        conn.commit()
+
+        # settle_token page cleanup happens in the paired-controls cleanup below
+        # (same site; URL pattern settle-target-).
+
+        print("\n== late-implement due-date recompute (fix: measurement_due_at) ==")
+        # The implement endpoint must overwrite the agent's promotion-time
+        # due date with implemented_at + window (single-statement UPDATE).
+        late_rec = None
+        with conn.cursor() as cur:
+            cur.execute("SELECT site_id FROM site_config WHERE domain = 'example.com'")
+            late_site = cur.fetchone()[0]
+            cur.execute(
+                "INSERT INTO recommendations (site_id, generator, action_type, "
+                "target_url, diagnosis, status, measurement_due_at) "
+                "VALUES (%s, 'technical_fix', 'technical_fix', %s, "
+                "'late implement test', 'approved', '2026-09-15') "
+                "RETURNING recommendation_id",
+                (late_site, settle_url))
+            late_rec = str(cur.fetchone()[0])
+        conn.commit()
+        from api.routes.measurements import implement as _implement
+        from api.models.schemas import ImplementRequest
+        late_impl_date = "2026-10-01"  # implemented 10 days after promotion-time due
+        _implement(late_rec, ImplementRequest(implemented_at=late_impl_date), conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT measurement_due_at FROM recommendations WHERE recommendation_id = %s",
+                        (late_rec,))
+            due_at = cur.fetchone()[0]
+        expected_due = date(2026, 10, 1) + timedelta(days=21)  # technical_fix window
+        allok &= check("implement recomputes due date from implemented_at + window",
+                       due_at is not None and hasattr(due_at, "date") and due_at.date() == expected_due,
+                       f"due_at={due_at} expected={expected_due}")
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM measurement_snapshots WHERE recommendation_id = %s", (late_rec,))
+            cur.execute("DELETE FROM recommendations WHERE recommendation_id = %s", (late_rec,))
+        conn.commit()
+
         print("\n== end-to-end on real DB (approved technical_fix) ==")
         # Self-contained: when no approved rec with a target_url exists, promote
-        # one proposed row for the test and restore it afterwards.
+        # one proposed row for the test. Scoped to the example.com site and its
+        # own pages so a cross-site data artifact can never wedge the section;
+        # self-healing: drop 'did scratch'/'test-approved' recs stranded by a
+        # previously crashed run (their DiD pages are gone -> selector wedges).
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM measurement_snapshots WHERE recommendation_id IN "
+                "(SELECT recommendation_id FROM recommendations "
+                "WHERE diagnosis IN ('did scratch', 'test-approved'))")
+            cur.execute(
+                "DELETE FROM recommendations WHERE diagnosis IN ('did scratch', 'test-approved')")
+        conn.commit()
         created_here = False
         with conn.cursor() as cur:
             cur.execute(
+                "SELECT site_id FROM site_config WHERE domain = 'example.com'")
+            e2e_site = cur.fetchone()[0]
+            cur.execute(
                 "SELECT recommendation_id, site_id, action_type, target_url FROM recommendations "
                 "WHERE status = 'approved' AND target_url IS NOT NULL "
-                "ORDER BY measured_at NULLS FIRST, created_at LIMIT 1")
+                "AND site_id = %s "
+                "ORDER BY measured_at NULLS FIRST, created_at LIMIT 1",
+                (e2e_site,))
             rec = cur.fetchone()
             if not rec:
                 cur.execute(
-                    "SELECT site_id FROM site_config WHERE domain = 'example.com'")
-                site_id = cur.fetchone()[0]
-                cur.execute(
-                    "SELECT url FROM pages p WHERE NOT EXISTS "
+                    "SELECT url FROM pages p WHERE p.site_id = %s "
+                    "AND NOT EXISTS "
                     "  (SELECT 1 FROM recommendations r WHERE r.target_url = p.url) "
-                    "ORDER BY url LIMIT 1")
+                    "ORDER BY url LIMIT 1",
+                    (e2e_site,))
                 fresh_url = cur.fetchone()
                 if not fresh_url:
                     raise RuntimeError("no unused fixture page URL for measurement test")
@@ -328,7 +488,7 @@ def main():
                     "VALUES (%s, 'technical_fix', 'technical_fix', "
                     "%s, "
                     "'test-approved', 'approved') RETURNING recommendation_id, site_id, action_type, target_url",
-                    (site_id, fresh_url[0]))
+                    (e2e_site, fresh_url[0]))
                 rec = cur.fetchone()
                 created_here = True
         conn.commit()
@@ -466,6 +626,15 @@ def main():
         # active changes): baseline must pair 1-2 controls and store their
         # URLs + per-URL metrics in control_group_json on the baseline
         # control snapshot; the post capture must reuse the identical set.
+        # Self-healing: clear any 'did scratch' rec a previously crashed run
+        # may have stranded (its DiD pages are long gone, which would wedge
+        # the e2e selector above).
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM measurement_snapshots WHERE recommendation_id IN "
+                "(SELECT recommendation_id FROM recommendations WHERE diagnosis = 'did scratch')")
+            cur.execute("DELETE FROM recommendations WHERE diagnosis = 'did scratch'")
+        conn.commit()
         import uuid as _uuid2
         did_token = _uuid2.uuid4().hex[:10]
         with conn.cursor() as cur:
@@ -619,6 +788,8 @@ def main():
                             (did_site, f"did-peer-{did_token}-%"))
                 cur.execute("DELETE FROM pages WHERE site_id = %s AND url LIKE %s",
                             (did_site, f"%{did_token}%"))
+                cur.execute("DELETE FROM pages WHERE site_id = %s AND url LIKE %s",
+                            (settle_site, f"%settle-{settle_token}%"))
             conn.commit()
     finally:
         conn.close()

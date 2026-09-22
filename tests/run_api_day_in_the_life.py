@@ -49,13 +49,18 @@ def check(name, value, detail=""):
 
 
 def seed_raw_candidates(conn, site_id, n=5):
-    """Insert up to n deterministic raw candidates against real fixture pages."""
+    """Insert up to n deterministic raw candidates against real fixture pages.
+
+    Targets are restricted to the site's OWN pages — the fixture DB holds two
+    sites and an unrestricted query can pair a target URL with the wrong
+    site_id, wedging measurement with 'target page not in pages table'.
+    """
     ids = []
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT url FROM pages p WHERE NOT EXISTS "
+            "SELECT url FROM pages p WHERE p.site_id = %s AND NOT EXISTS "
             "  (SELECT 1 FROM recommendations r WHERE r.target_url = p.url) "
-            "ORDER BY url LIMIT %s", (n,))
+            "ORDER BY url LIMIT %s", (site_id, n))
         urls = [r[0] for r in cur.fetchall()]
         for i, url in enumerate(urls):
             rec_id = str(uuid.uuid4())
@@ -239,6 +244,7 @@ def main():
 
         from measurement.measure import store_post_snapshots
         from measurement.baseline import resolve_window_days
+        from measurement.thresholds import GSC_SETTLE_DAYS
         with conn.cursor() as cur:
             cur.execute("SELECT action_type FROM recommendations WHERE recommendation_id=%s",
                         (approved_ids[0],))

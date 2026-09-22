@@ -17,10 +17,8 @@ import env as env_loader
 def run(site_id=None, reference_date=None):
     env_loader.load_env_file(quiet=True)
     from connectors.openseo import get_openseo_adapter
+    from jobs.locks import job_lock, LOCK_KEYS, already_running
     adapter = get_openseo_adapter(config={"openseo.mode": os.environ.get("INTEGRATION_MODE", "mock")})
-    if not adapter.supports("crawl_audit"):
-        print("[weekly_crawl] OpenSEO not configured for crawl_audit — skipped", flush=True)
-        return {"skipped": "openseo_not_configured"}
     conn = database.get_connection()
     try:
         with conn.cursor() as cur:
@@ -32,7 +30,11 @@ def run(site_id=None, reference_date=None):
         from connectors.sync import sync_crawl_audit
         out = {}
         for sid, domain in sites:
-            out[str(sid)] = sync_crawl_audit(conn, adapter, sid, domain)
+            with job_lock(conn, LOCK_KEYS["weekly_crawl"], site_id=str(sid)) as got:
+                if not got:
+                    out[str(sid)] = already_running("weekly_crawl", sid)
+                    continue
+                out[str(sid)] = sync_crawl_audit(conn, adapter, sid, domain)
         conn.commit()
         return {"crawled": out}
     finally:

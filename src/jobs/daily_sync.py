@@ -14,8 +14,9 @@ import db as database
 import env as env_loader
 
 # Columns mirrored from site_config; run_sync(site=...) accepts this shape.
+# site_id is included so per-site advisory locks can key on the UUID.
 _SITE_COLS = (
-    "site_name", "domain", "gsc_property", "shopify_domain",
+    "site_id", "site_name", "domain", "gsc_property", "shopify_domain",
     "ga4_property_id", "catalogue_size_tier", "min_in_stock_products",
 )
 
@@ -44,6 +45,7 @@ def run(site_id=None, reference_date=None, force_refresh=False):
     env_loader.load_env_file(quiet=True)
     from connectors.costlog import check_budget
     from connectors.sync import run_sync
+    from jobs.locks import job_lock, LOCK_KEYS, already_running
     from jobs.notify import send_summary, send_budget_alert
 
     conn = database.get_connection()
@@ -65,18 +67,28 @@ def run(site_id=None, reference_date=None, force_refresh=False):
         if not sites:
             # No configured sites: run_sync falls back to the sandbox mock site
             # so the empty-database demo keeps working.
-            summary = run_sync(site=None, reference_date=reference_date,
-                               force_refresh=force_refresh)
+            summary = {}
+            with job_lock(conn, LOCK_KEYS["daily_sync"], site_id=None) as got:
+                if not got:
+                    return already_running("daily_sync")
+                summary = run_sync(site=None, reference_date=reference_date,
+                                   force_refresh=force_refresh)
         else:
             summary = {}
             for site in sites:
-                try:
-                    per_site = run_sync(site=site, reference_date=reference_date,
-                                        force_refresh=force_refresh)
-                except Exception as exc:
-                    print(f"[daily_sync] site {site.get('domain')}: sync failed ({exc})", flush=True)
-                    per_site = {"error": str(exc)}
-                summary[site.get("domain")] = per_site
+                # Per-site advisory lock: overlapping runs for the same site are
+                # impossible; other sites proceed unaffected.
+                with job_lock(conn, LOCK_KEYS["daily_sync"], site_id=site.get("site_id")) as got:
+                    if not got:
+                        summary[site.get("domain")] = already_running("daily_sync", site.get("site_id"))
+                        continue
+                    try:
+                        per_site = run_sync(site=site, reference_date=reference_date,
+                                            force_refresh=force_refresh)
+                    except Exception as exc:
+                        print(f"[daily_sync] site {site.get('domain')}: sync failed ({exc})", flush=True)
+                        per_site = {"error": str(exc)}
+                    summary[site.get("domain")] = per_site
     finally:
         conn.close()
     send_summary("daily_sync", summary)

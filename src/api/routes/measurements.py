@@ -21,6 +21,29 @@ logger = logging.getLogger("api.measurements")
 
 router = APIRouter(tags=["measurements"])
 
+# measurement_due_at is recomputed at IMPLEMENT time (not at agent promotion —
+# the old promotion-time value skewed the countdown when operators implemented
+# days later). Window comes from measurement_window_lookup joined in the same
+# UPDATE so the transition and the due date can never diverge. The column is a
+# display projection; the measurement clock computes its own due condition from
+# implemented_at + window + GSC_SETTLE_DAYS and never reads this column.
+def _transition_to_in_progress(cur, recommendation_id, implemented_at, assigned_to):
+    """Transition UPDATE that also recomputes measurement_due_at (single statement)."""
+    cur.execute(
+        """
+        UPDATE recommendations r
+        SET status = 'in_progress',
+            implemented_at = COALESCE(%s::date, now()::date),
+            assigned_to = COALESCE(%s, r.assigned_to),
+            measurement_due_at = (COALESCE(%s::date, now()::date)
+                + (SELECT mwl.measurement_window_days
+                   FROM measurement_window_lookup mwl
+                   WHERE mwl.action_type = r.action_type))
+        WHERE r.recommendation_id = %s
+        """,
+        (implemented_at, assigned_to, implemented_at, recommendation_id),
+    )
+
 
 def _load_json(value):
     """control_group_json arrives as a dict (psycopg2 jsonb) or a JSON string.
@@ -48,12 +71,7 @@ def implement(recommendation_id, body: ImplementRequest, conn=Depends(get_conn))
         )
     implemented_at = body.implemented_at
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE recommendations SET status = 'in_progress', "
-            "implemented_at = COALESCE(%s::date, now()::date), "
-            "assigned_to = COALESCE(%s, assigned_to) WHERE recommendation_id = %s",
-            (implemented_at, body.assigned_to, recommendation_id),
-        )
+        _transition_to_in_progress(cur, recommendation_id, implemented_at, body.assigned_to)
     if rec["action_type"] == "create_page":
         from measurement.baseline import store_cluster_baseline
         baseline_info = store_cluster_baseline(conn, recommendation_id, implemented_at)
@@ -88,12 +106,7 @@ def implement_safe(recommendation_id, body: ImplementRequest, conn=Depends(get_c
         )
     implemented_at = body.implemented_at
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE recommendations SET status = 'in_progress', "
-            "implemented_at = COALESCE(%s::date, now()::date), "
-            "assigned_to = COALESCE(%s, assigned_to) WHERE recommendation_id = %s",
-            (implemented_at, body.assigned_to, recommendation_id),
-        )
+        _transition_to_in_progress(cur, recommendation_id, implemented_at, body.assigned_to)
     if rec["action_type"] == "create_page":
         from measurement.baseline import store_cluster_baseline
         baseline_fn = store_cluster_baseline
@@ -106,12 +119,7 @@ def implement_safe(recommendation_id, body: ImplementRequest, conn=Depends(get_c
     except Exception as exc:  # never-crash policy: transition wins
         conn.rollback()
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE recommendations SET status = 'in_progress', "
-                "implemented_at = COALESCE(%s::date, now()::date), "
-                "assigned_to = COALESCE(%s, assigned_to) WHERE recommendation_id = %s",
-                (implemented_at, body.assigned_to, recommendation_id),
-            )
+            _transition_to_in_progress(cur, recommendation_id, implemented_at, body.assigned_to)
         baseline_info = {
             "degraded": f"baseline skipped: {type(exc).__name__}",
             "window_days": None,

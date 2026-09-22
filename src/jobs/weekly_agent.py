@@ -15,6 +15,7 @@ def run(site_id=None, reference_date=None):
     env_loader.load_env_file(quiet=True)
     from agents.seo_agent import run_agent
     from connectors.costlog import check_budget
+    from jobs.locks import job_lock, LOCK_KEYS, already_running
     from jobs.notify import send_summary, send_budget_alert, send_failure
     from jobs.run_multi import run_across_sites
 
@@ -48,7 +49,18 @@ def run(site_id=None, reference_date=None):
         def notify_failure(sid, result):
             send_failure("weekly_agent", sid, result.get("error"))
 
-        out = run_across_sites(sites, run_agent, on_failure=notify_failure)
+        def locked(sid):
+            """Worker entry: per-site advisory lock on the worker's own connection."""
+            wconn = database.get_connection()
+            try:
+                with job_lock(wconn, LOCK_KEYS["weekly_agent"], site_id=sid) as got:
+                    if not got:
+                        return already_running("weekly_agent", sid)
+                    return run_agent(sid)
+            finally:
+                wconn.close()
+
+        out = run_across_sites(sites, locked, on_failure=notify_failure)
         send_summary("weekly_agent", out)
         return out
     finally:
