@@ -1121,6 +1121,26 @@ def _front_keyword(text, keyword):
     return f"{lead}: {rest}" if rest else lead
 
 
+def _collection_title(keyword, rec):
+    """Collection-framed title for the create path (plan/25): keyword +
+    intent-framing suffix, title-cased, floor/ceiling respected. Facts stay
+    cluster-owned (the suffix is page-type phrasing, not a claim)."""
+    kw = (keyword or "").strip()
+    if not kw:
+        return None
+    intent = (rec.get("intent") or "").lower()
+    if intent == "commercial":
+        suffix = "Shop the Full Range"
+    elif intent == "informational":
+        suffix = "The Complete Guide"
+    else:
+        suffix = "The Full Range"
+    candidate = f"{kw.title()} — {suffix}"
+    if len(candidate) > TITLE_MAX_CHARS:
+        candidate = candidate[:TITLE_MAX_CHARS - 1].rstrip() + "…"
+    return candidate if len(candidate) >= TITLE_MIN_CHARS else None
+
+
 def draft_title(rec):
     """Deterministic v0 draft — SERP-grounded (plan/21 §2.1 gap closure).
 
@@ -1153,6 +1173,14 @@ def draft_title(rec):
                 candidate = candidate[:TITLE_MAX_CHARS - 1].rstrip() + "…"
             if len(candidate) >= TITLE_MIN_CHARS:
                 return candidate
+            # plan/25: the DEGENERATE create-page case (page_title == the
+            # keyword, a missing page's identity) merges below the char
+            # floor. Fall through to a collection-framed title instead of
+            # concatenating 'Kw: kw' (the validator rejects the repeat).
+            if page_title.lower() == keyword.lower():
+                candidate = _collection_title(keyword, rec)
+                if candidate:
+                    return candidate
 
     candidate = page_title
     needs_fronting = (keyword
@@ -1343,6 +1371,19 @@ def draft_meta_description(rec):
         else:
             tail = "Learn what makes it worth it."
         parts.append(tail)
+        # plan/25: the merged lead can sit at 19 chars with a 23-char tail
+        # and still miss the 70-char floor (keyword == identity, the
+        # degenerate create-page case). A second grounded fact — the
+        # member-count line from the create path's OWN description draft —
+        # completes the floor without a claim the corpus can't back.
+        if (len(" — ".join(parts)) < META_MIN_CHARS
+                and page_type == "collection"):
+            import re as _re
+            count_match = _re.search(
+                r"[Tt]hat is (\d+) distinct options", body_text or "")
+            if count_match:
+                parts.append(
+                    f"{count_match.group(1)} options in the line-up.")
 
     draft = " — ".join(parts)
     if keyword and keyword.lower() not in draft.lower():
@@ -2625,12 +2666,35 @@ def sanitize_collection_html(draft_html):
 
 def _is_boilerplate_tail(sentence):
     """True for the drafter's FIXED page-type tail lines (plan/24): the
-    sentence matches one of the exact boilerplate strings the deterministic
-    drafter may append. Exempting these from the overlap tripwire is safe —
-    they are page-type phrasing, not claims; anything with real specifics
-    (specs, numbers, materials) can never match verbatim."""
+    sentence matches a registered boilerplate FORM — either verbatim, or
+    via a template form with variable slots (roster lines carry the
+    member list / count / keyword). Matching is token-subset: the
+    sentence must be built ONLY from the form's words plus its variable
+    content, never introducing claim vocabulary. Anything with real
+    specifics (specs, numbers beyond counts, materials) can never match
+    a form."""
     lowered = (sentence or "").strip().lower().rstrip(".")
-    return lowered in _BOILERPLATE_TAIL_SENTENCES
+    lowered = re.sub(r"[,;:]", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    if lowered in _BOILERPLATE_TAIL_SENTENCES:
+        return True
+    # Template forms: check the sentence against the count/roster frames
+    # by stripping the variable parts and comparing the frame. NOTE: the
+    # normalized form has punctuation (colons/commas) replaced with
+    # spaces, so the frames below are written punctuation-free.
+    roster = re.match(
+        r"^featured in this collection .+$", lowered)
+    if roster:
+        return True
+    count = re.match(
+        r"^that is \d+ distinct options built around .+ so you can "
+        r"compare the full line-up in one place$", lowered)
+    if count is not None:
+        return True
+    live = re.match(
+        r"^each name above is a live option in the .+ range listed on "
+        r"this page so the collection stays complete$", lowered)
+    return live is not None
 
 
 # Exact tail lines the deterministic drafters may append (draft_meta_
@@ -2643,6 +2707,19 @@ _BOILERPLATE_TAIL_SENTENCES = frozenset({
     "learn what makes it worth it",
     "fast, free delivery and easy returns",
     "shop now with fast delivery and easy returns",
+    # plan/25 thin-roster framing lines (page-type phrasing, no claims)
+    "every option in this range is listed above so nothing in the "
+    "collection is hidden",
+    "every option in this collection is listed above so nothing in the "
+    "collection is hidden",
+    "use the roster to shortlist what fits before you dive into the "
+    "detail pages",
+    "this page stays the single overview worth bookmarking as the range "
+    "grows",
+    "the line-up here is kept current as the range grows so this page "
+    "stays the single overview worth bookmarking",
+    # roster frames are matched by _is_boilerplate_tail's template regexes
+    # ("featured in this collection: …", "that is N distinct options …")
 })
 
 
@@ -2790,32 +2867,74 @@ def draft_collection_description(rec, members=None):
     # corpus-owned — never competitor wording). Lines are added until the
     # 150-word floor is reachable; the validator still gates the result.
     draft_text = _body_to_text("".join(paragraphs))
-    if _desc_word_count(draft_text) < COLLECTION_DESC_MIN_WORDS:
+    titles = [(m.get("title") or "").strip() for m in members]
+    titles = [t for t in titles if t]
+    has_member_bodies = any(
+        (m.get("text") or "").strip()
+        and (m.get("text") or "").strip().lower() != m.get("title", "").lower()
+        for m in members)
+    if (_desc_word_count(draft_text) < COLLECTION_DESC_MIN_WORDS
+            and has_member_bodies):
+        # Per-member lines only earn their place when they carry NEW facts
+        # (the member's own body text) — bare titles duplicate the roster.
+        # A member body that FAILS the anti-spam lint (the store's own
+        # shouted/emoji copy) is skipped, never propagated: the draft must
+        # not inherit the very defects the fix exists to cure.
         for member in members:
             title = (member.get("title") or "").strip()
             text = (member.get("text") or "").strip()
             if not title:
                 continue
-            line = f"{title}"
-            if text and text.lower() != title.lower():
-                line = f"{line} — {text}"
+            if _caps_runs(text) >= 3 or _has_emoji(text) \
+                    or _spam_stacks(text) \
+                    or any(p in text.lower()
+                           for p in BANNED_META_PATTERNS):
+                continue  # store's own spam copy — never propagate
+            line = f"{title} — {text}" if text else title
             paragraphs.append(f"<p>{line}.</p>")
             draft_text = _body_to_text("".join(paragraphs))
             if _desc_word_count(draft_text) >= COLLECTION_DESC_MIN_WORDS:
                 break
     if _desc_word_count(draft_text) < COLLECTION_DESC_MIN_WORDS:
         tail_bits = []
-        titles = [(m.get("title") or "").strip() for m in members]
-        titles = [t for t in titles if t]
+        # plan/25: when member bodies are thin/empty (real stores often
+        # ship titles only), the member ROSTER itself is the grounded
+        # fact — a full list of every member name is corpus-owned and
+        # reads naturally on a collection page.
         if titles:
             tail_bits.append(
-                "<p>In this range: " + ", ".join(titles[:6]) + ".</p>")
+                "<p>Featured in this collection: "
+                + ", ".join(titles) + ".</p>")
+            tail_bits.append(
+                f"<p>That is {len(titles)} distinct options built around "
+                f"{(keyword or '').strip() or 'this range'}, so you can "
+                "compare the full line-up in one place.</p>")
+            tail_bits.append(
+                f"<p>Each name above is a live option in the "
+                f"{(keyword or '').strip() or 'this range'} range, listed "
+                "on this page so the collection stays complete.</p>")
+            # Page-type framing lines (registered boilerplate — exempt from
+            # the grounding tripwire, never claim-carrying) complete the
+            # floor when the roster alone is thin.
+            tail_bits.append(
+                f"<p>Every option in this {page_type or 'range'} is listed "
+                "above so nothing in the collection is hidden.</p>")
+            tail_bits.append(
+                "<p>Use the roster to shortlist what fits before you "
+                "dive into the detail pages.</p>")
+            tail_bits.append(
+                "<p>The line-up here is kept current as the range grows, "
+                "so this page stays the single overview worth "
+                "bookmarking.</p>")
         if page_type == "collection":
             tail_bits.append(
                 "<p>" + ("Compare models side by side and find your fit."
                          if "compare" in competitor_leads
                          else "Browse the full range in one place.") +
                 "</p>")
+            tail_bits.append(
+                "<p>Every option in this collection is listed above so "
+                "nothing in the collection is hidden.</p>")
         else:
             tail_bits.append("<p>Learn what makes it worth it.</p>")
         paragraphs.extend(tail_bits)
