@@ -24,8 +24,9 @@ const RUN_META: Record<
   measurement: { label: "Measurement" },
 };
 
-/** Horizontal kanban of the 3-stage lifecycle: approved (audit-validated,
- * ready to implement) → in progress (observation window) → measured. */
+/** Horizontal kanban of the 3-stage lifecycle: approved (operator explicitly
+ * approved in the Action Queue) → in progress (observation window) → measured.
+ * Raw 'proposed' rows stay in the Action Queue — they never appear here. */
 export function PipelinesPage({ projectId }: { projectId: string }) {
   const data = useOperatorData(projectId);
   const rows = data.data?.recommendations ?? EMPTY_RECS;
@@ -86,9 +87,9 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
           tone={inObservation > 0 ? "good" : "neutral"}
         />
         <KpiCard
-          label="Ready to implement"
+          label="Approved"
           value={byStage.approved.length}
-          sub="audit-validated, awaiting action"
+          sub="approved, ready to implement"
         />
         <KpiCard
           label="Measured"

@@ -488,13 +488,13 @@ def get_pipeline(
     site_id,
     conn=Depends(get_conn),
 ):
-    """Active pipeline (3-stage kanban): approved, in_progress, measured-pending.
+    """Active pipeline (3-stage kanban): approved, in_progress, measured.
 
-    Stage mapping: agent-enriched 'proposed' rows land directly in the
-    APPROVED column (the pipeline view maps them to status='approved' —
-    ready to implement). 'approved' + 'in_progress' rows render natively.
-    ActionQueue still renders raw DB 'proposed' rows for rejection flow;
-    the pipeline no longer surfaces a separate PROPOSED stage.
+    STRICT stage gating: the APPROVED column shows only rows the operator
+    explicitly approved (DB status = 'approved'); raw 'proposed' rows stay
+    in the Action Queue until a decision is recorded. The measurement clock
+    promotes window-complete 'in_progress' rows to 'measured', which lands
+    in the MEASURED column.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -510,9 +510,9 @@ def get_pipeline(
             LEFT JOIN measurement_window_lookup mwl ON mwl.action_type = r.action_type
             LEFT JOIN keyword_clusters kc ON kc.cluster_id = r.cluster_id
             WHERE r.site_id = %s
-              AND r.status IN ('proposed', 'approved', 'in_progress')
+              AND r.status IN ('approved', 'in_progress', 'measured')
             ORDER BY
-                CASE r.status WHEN 'approved' THEN 1 WHEN 'proposed' THEN 1 ELSE 2 END,
+                CASE r.status WHEN 'approved' THEN 1 ELSE 2 END,
                 COALESCE(r.implemented_at, r.approved_at, r.created_at) DESC NULLS LAST
             """,
             (site_id,),
@@ -524,14 +524,10 @@ def get_pipeline(
     today = request.scope.get("today", date.today())
     items: list[PipelineItemOut] = []
     for r in rows:
-        # 3-stage kanban mapping: agent-validated 'proposed' rows ARE the
-        # APPROVED column (land ready-to-implement); raw DB status is
-        # unchanged so ActionQueue/reject flow keeps its contract.
-        stage = "approved" if r["status"] == "proposed" else r["status"]
         window = r["measurement_window_days"]
         imp = r["implemented_at"]
         days_remaining = None
-        if stage == "in_progress" and window and imp:
+        if r["status"] == "in_progress" and window and imp:
             imp_date = imp.date() if hasattr(imp, "date") else imp
             due = imp_date + timedelta(days=window)
             days_remaining = max(int((due - today).days), 0)
@@ -544,7 +540,7 @@ def get_pipeline(
             proposed_url=r["proposed_url"],
             diagnosis=r["diagnosis"],
             impact=r["impact"],
-            status=stage,
+            status=r["status"],
             approved_at=r["approved_at"],
             implemented_at=r["implemented_at"],
             assigned_to=r["assigned_to"],

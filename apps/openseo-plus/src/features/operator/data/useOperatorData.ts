@@ -574,10 +574,9 @@ export function useOperatorData(siteId: string) {
 
   const data = useMemo<OperatorData | undefined>(() => {
     if (!queue.data || !pipeline.data || !results.data) return undefined;
-    // 3-stage kanban: the pipeline endpoint owns the board (it maps
-    // agent-validated 'proposed' rows to the approved stage). Queue rows
-    // only fill gaps the pipeline does not already carry, and a queue row
-    // must never overwrite a pipeline stage with the raw 'proposed' status.
+    // Pipeline rows are the board truth (strict gating: only explicitly
+    // approved / in_progress / measured). Queue rows (proposed) fill gaps
+    // for the Action Queue and are filtered out by the board's stage maps.
     const seen = new Set<string>();
     const recommendations: Recommendation[] = [];
     for (const rec of pipeline.data.recommendations) {
