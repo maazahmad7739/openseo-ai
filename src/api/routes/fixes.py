@@ -28,7 +28,8 @@ class FixOut(BaseModel):
     action_type: str
     sub_type: Optional[str] = None
     target_url: str
-    target_entity_ref: str
+    # plan/25: NULL until the executor mints the GID (collection_create).
+    target_entity_ref: Optional[str] = None
     payload_json: Any = None
     diff_json: Any = None
     generation_source: str
