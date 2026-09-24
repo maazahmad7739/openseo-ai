@@ -511,6 +511,25 @@ export function useOperatorData(siteId: string) {
     }
   };
 
+  /** Optimistically REMOVE a card from the Action Queue cache. Approve/reject
+   * take the row out of the operator's decision list instantly — the approved
+   * card re-appears only in the Pipeline's APPROVED column (via the pipeline
+   * cache patch + refetch). */
+  const removeFromQueue = (id: string) => {
+    queryClient.setQueryData<{ recommendations: Recommendation[] }>(
+      queueKey,
+      (current) =>
+        current
+          ? {
+              ...current,
+              recommendations: current.recommendations.filter(
+                (rec) => rec.recommendation_id !== id,
+              ),
+            }
+          : current,
+    );
+  };
+
   const approveMutation = useMutation({
     mutationFn: (id: string) =>
       api<{ recommendation_id: string; status: string }>(
@@ -518,6 +537,7 @@ export function useOperatorData(siteId: string) {
         { method: "POST" },
       ),
     onMutate: (id) => {
+      removeFromQueue(id);
       patchRecommendation(id, {
         status: "approved",
         approved_at: nowIso(),
@@ -536,6 +556,7 @@ export function useOperatorData(siteId: string) {
         },
       ),
     onMutate: ({ id, reason }) => {
+      removeFromQueue(id);
       patchRecommendation(id, {
         status: "rejected",
         rejected_at: nowIso(),

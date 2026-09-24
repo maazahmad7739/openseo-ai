@@ -1,6 +1,16 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { CheckCircle2, Circle, Wrench, Zap } from "lucide-react";
+import {
+  CheckCircle2,
+  Circle,
+  Loader2,
+  Wrench,
+  X,
+  Zap,
+} from "lucide-react";
+import { toast } from "sonner";
+import { api } from "../data/useOperatorData";
 import type { FixStatus, WorkRequiredItem } from "../data/types";
 import {
   manualTaskKey,
@@ -50,8 +60,185 @@ export function FixStatusBadge({ status }: { status: FixStatus }) {
   return <Chip className={meta.badgeClass}>{meta.label}</Chip>;
 }
 
-/** Interactive row-level task list: auto-fix tasks show their fix status +
- * a Review in Action Queue link; manual tasks get a completion checkbox. */
+/* ── Fix diff preview + gate-2 approval ──────────────────────────────── */
+
+interface FixDto {
+  fix_id: string;
+  sub_type: string | null;
+  status: FixStatus;
+  diff_json: Array<{ field: string; old_value?: string; new_value?: string }> | null;
+  generation_source: string;
+}
+
+const FIELD_LABELS: Record<string, string> = {
+  "seo.title": "Title tag",
+  "seo.description": "Meta description",
+};
+
+function DiffRow({ field, oldValue, newValue }: {
+  field: string;
+  oldValue?: string;
+  newValue?: string;
+}) {
+  return (
+    <div className="rounded-lg border border-base-200 bg-base-200/30 p-2.5">
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-base-content/45">
+        {FIELD_LABELS[field] ?? field}
+      </p>
+      <div className="mt-1.5 space-y-1.5 text-xs leading-relaxed">
+        {oldValue != null ? (
+          <p className="flex items-start gap-1.5">
+            <span className="shrink-0 rounded bg-error/10 px-1 font-mono text-[10px] font-bold text-error">
+              −
+            </span>
+            <span className="text-base-content/50 line-through">{oldValue}</span>
+          </p>
+        ) : null}
+        {newValue != null ? (
+          <p className="flex items-start gap-1.5">
+            <span className="shrink-0 rounded bg-success/10 px-1 font-mono text-[10px] font-bold text-success">
+              +
+            </span>
+            <span className="font-medium text-base-content">{newValue}</span>
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/** Drafted old → new diff + gate-2 approve/reject for one auto-fix task. */
+function FixDiffPreview({
+  recommendationId,
+  fixStatus,
+}: {
+  recommendationId: string;
+  fixId?: string;
+  fixStatus?: FixStatus;
+}) {
+  const queryClient = useQueryClient();
+  const [busy, setBusy] = useState(false);
+
+  const fixes = useQuery({
+    queryKey: ["openseo", "fixes", recommendationId],
+    queryFn: () => api<FixDto[]>(`/recommendations/${recommendationId}/fix`),
+    staleTime: 15_000,
+  });
+
+  const act = async (fix: FixDto, action: "approve" | "reject") => {
+    setBusy(true);
+    try {
+      if (action === "approve") {
+        await api(`/fixes/${fix.fix_id}/approve`, { method: "POST" });
+        toast.success("Fix approved and queued for execution");
+      } else {
+        await api(`/fixes/${fix.fix_id}/reject`, {
+          method: "POST",
+          body: JSON.stringify({ reason: "Operator rejected the drafted diff" }),
+        });
+        toast.success("Drafted fix rejected");
+      }
+      void queryClient.invalidateQueries({
+        queryKey: ["openseo", "fixes", recommendationId],
+      });
+      void queryClient.invalidateQueries({ queryKey: ["openseo", "detail", recommendationId] });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (fixes.isPending) {
+    return (
+      <p className="mt-2 flex items-center gap-1.5 text-[11px] text-base-content/40">
+        <Loader2 className="size-3 animate-spin" /> Loading drafted fix…
+      </p>
+    );
+  }
+  if (fixes.isError) {
+    return (
+      <p className="mt-2 text-[11px] text-base-content/40">
+        Drafted fix could not be loaded.
+      </p>
+    );
+  }
+
+  const rows = fixes.data ?? [];
+  if (rows.length === 0) {
+    return (
+      <p className="mt-2 text-[11px] text-base-content/40">
+        No drafted fix yet — the engine drafts the title/meta rewrite once this
+        recommendation is approved in the queue.
+      </p>
+    );
+  }
+
+  const decided = fixStatus === "queued" || fixStatus === "applied";
+
+  return (
+    <div className="mt-2 space-y-2">
+      {rows.map((fix) => {
+        const diffs = fix.diff_json ?? [];
+        const actionable = fix.status === "generated";
+        return (
+          <div key={fix.fix_id} className="space-y-2">
+            {diffs.map((d, di) => (
+              <DiffRow
+                key={di}
+                field={d.field}
+                oldValue={d.old_value}
+                newValue={d.new_value}
+              />
+            ))}
+            <div className="flex flex-wrap items-center gap-2">
+              {actionable && !decided ? (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-xs btn-primary"
+                    disabled={busy}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void act(fix, "approve");
+                    }}
+                  >
+                    {busy ? <Loader2 className="size-3 animate-spin" /> : null}
+                    Approve &amp; Queue
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-xs btn-ghost text-error"
+                    disabled={busy}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void act(fix, "reject");
+                    }}
+                  >
+                    <X className="size-3" />
+                    Reject
+                  </button>
+                </>
+              ) : (
+                <span className="text-[11px] text-base-content/40">
+                  {fix.status === "queued"
+                    ? "Queued — the executor will apply this change"
+                    : fix.status === "applied"
+                      ? "Applied to the store"
+                      : "Reviewed"}
+                </span>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ── Task list ───────────────────────────────────────────────────────── */
+
+/** Interactive row-level task list: auto-fix tasks show the drafted
+ * old → new diff with inline Approve & Queue / Reject; manual tasks get a
+ * completion checkbox. */
 export function WorkTaskList({
   work,
   recommendationId,
@@ -143,6 +330,12 @@ export function WorkTaskList({
                     {item.acceptance_criteria}
                   </span>
                 </p>
+                {automated && recommendationId ? (
+                  <FixDiffPreview
+                    recommendationId={recommendationId}
+                    fixStatus={item.fix_status}
+                  />
+                ) : null}
                 {automated ? (
                   <div className="mt-2 flex items-center gap-2">
                     {projectId ? (

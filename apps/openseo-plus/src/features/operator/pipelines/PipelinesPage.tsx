@@ -77,8 +77,8 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
         subtitle="Follow recommendations from proposal to measured outcome"
       />
 
-      {/* Pipeline health KPIs */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {/* Pipeline health KPIs — one per kanban stage, same 3-col rhythm */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <KpiCard
           label="In observation"
           value={inObservation}
@@ -107,10 +107,10 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
         </div>
       ) : null}
 
-      {/* Kanban board */}
+      {/* Kanban board — 3 equal-width columns spanning the full container */}
       <div className="app-panel h-[calc(100vh-240px)] min-h-[320px] overflow-hidden">
-        <div className="kanban-scroll h-full overflow-x-auto p-4">
-          <div className="flex h-full gap-4 pb-1">
+        <div className="h-full p-4">
+          <div className="grid h-full min-h-0 grid-cols-1 gap-4 md:grid-cols-3">
             <PipelineColumn
               title="Approved"
               accentColor="bg-emerald-500"

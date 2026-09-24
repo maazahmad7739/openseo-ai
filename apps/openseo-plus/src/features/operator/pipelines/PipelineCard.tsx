@@ -219,7 +219,7 @@ export function PipelineColumn({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex h-full w-72 shrink-0 flex-col overflow-hidden rounded-xl border border-base-300/70 bg-base-200/50">
+    <div className="flex h-full min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-base-300/70 bg-base-200/50">
       <div className="flex shrink-0 items-center justify-between border-b border-base-200 px-3.5 py-3">
         <div className="flex items-center gap-2">
           <span className={`size-2 rounded-full ${accentColor}`} />

@@ -57,6 +57,9 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
   const filtered = useMemo(() => {
     const term = query.trim().toLowerCase();
     const list = rows.filter((rec) => {
+      // Exclusivity: the Action Queue IS the proposed backlog. Approved cards
+      // live only in the Pipeline's APPROVED column — never here.
+      if (rec.status !== "proposed") return false;
       if (status !== "all" && rec.status !== status) return false;
       if (generator !== "all" && rec.generator !== generator) return false;
       if (owner !== "all" && rec.owner.toLowerCase() !== owner) return false;
