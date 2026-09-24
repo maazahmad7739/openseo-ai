@@ -13,7 +13,7 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import Any, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 
 from api.common import get_conn, get_recommendation
@@ -63,6 +63,12 @@ class FixGenerateOut(BaseModel):
     status: str
     created: bool
     diff_json: Any = None
+
+
+class FixDraftOut(BaseModel):
+    """Lazy-draft result: what was generated (or why nothing could be)."""
+    drafts: List[dict] = []
+    unsupported: List[dict] = []
 
 
 class FixRejectRequest(BaseModel):
@@ -208,6 +214,61 @@ def generate_meta_fix(recommendation_id, conn=Depends(get_conn)):
         created=result["created"],
         diff_json=result["diff"],
     )
+
+
+@router.post("/recommendations/{recommendation_id}/draft-fixes",
+             response_model=FixDraftOut)
+def draft_fixes(recommendation_id, conn=Depends(get_conn)):
+    """Lazy-draft every engine-supported fix for an approved recommendation.
+
+    Called by the drawer's Auto-fix task when no diff exists yet: drafts the
+    seo.title fix and (independently) the seo.description fix, tolerating
+    per-field failures — a title draft that passes the quality gate while the
+    meta draft fails validation is a NORMAL outcome, not an error. Returns
+    what was created plus a per-field reason for anything unsupported so the
+    UI can say honestly why no diff exists.
+    """
+    from fixes.generator import (
+        generate_fix_for_recommendation, generate_meta_fix_for_recommendation,
+        FixGenerationError, FixNotSupported)
+    from fixes.policy import PolicyBlocked
+
+    rec = get_recommendation(conn, recommendation_id)  # 404 when unknown
+    if rec["status"] not in ("approved", "in_progress"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"drafting requires an approved recommendation "
+                   f"(current status: '{rec['status']}')",
+        )
+
+    drafts: List[dict] = []
+    unsupported: List[dict] = []
+    for label, fn, kwargs in (
+        ("seo.title", generate_fix_for_recommendation,
+         {"live_seo_title": _fresh_live_seo_title(conn, recommendation_id)}),
+        ("seo.description", generate_meta_fix_for_recommendation,
+         {"live_meta_description": _fresh_live_meta_description(conn, recommendation_id)}),
+    ):
+        try:
+            result = fn(conn, recommendation_id, **kwargs_safe(kwargs))
+            drafts.append({
+                "fix_id": result["fix_id"],
+                "sub_type": label,
+                "status": result["status"],
+                "created": result["created"],
+                "diff_json": result["diff"],
+            })
+        except FixNotSupported as exc:
+            unsupported.append({"sub_type": label, "reason": str(exc)})
+        except (PolicyBlocked, FixGenerationError) as exc:
+            reason = getattr(exc, "reason", None) or str(exc)
+            unsupported.append({"sub_type": label, "reason": reason})
+    conn.rollback()
+    return FixDraftOut(drafts=drafts, unsupported=unsupported)
+
+
+def kwargs_safe(kwargs):
+    return kwargs
 
 
 @router.post("/recommendations/{recommendation_id}/publish-fix", response_model=FixGenerateOut)

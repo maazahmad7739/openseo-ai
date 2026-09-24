@@ -1,7 +1,11 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { Link } from "@tanstack/react-router";
 import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useState } from "react";
+import {
+  AlertTriangle,
   CheckCircle2,
   Circle,
   Loader2,
@@ -107,9 +111,15 @@ function DiffRow({ field, oldValue, newValue }: {
   );
 }
 
-/** Drafted old → new diff + gate-2 approve/reject for one auto-fix task. */
+/** Drafted old → new diff + gate-2 approve/reject for one auto-fix task.
+ *
+ * The fix engine drafts lazily: when the drawer opens on an approved
+ * recommendation with no generated_fixes rows yet, this component calls
+ * POST /recommendations/{id}/draft-fixes once, then reads the diff.
+ */
 function FixDiffPreview({
   recommendationId,
+  fixId,
   fixStatus,
 }: {
   recommendationId: string;
@@ -124,6 +134,44 @@ function FixDiffPreview({
     queryFn: () => api<FixDto[]>(`/recommendations/${recommendationId}/fix`),
     staleTime: 15_000,
   });
+
+  // Lazy draft: only fire when the fix list came back EMPTY and no fix has
+  // been decided yet. Idempotent server-side (uq_fixes_active_per_target).
+  const shouldDraft =
+    !fixes.isPending &&
+    !fixes.isError &&
+    (fixes.data ?? []).length === 0 &&
+    fixId == null &&
+    fixStatus == null;
+
+  const draft = useMutation({
+    mutationFn: () =>
+      api<{ drafts: FixDto[]; unsupported: Array<{ sub_type: string; reason: string }> }>(
+        `/recommendations/${recommendationId}/draft-fixes`,
+        { method: "POST" },
+      ),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["openseo", "fixes", recommendationId],
+      });
+      void queryClient.invalidateQueries({ queryKey: ["openseo", "detail", recommendationId] });
+    },
+  });
+
+  if (fixes.isPending) {
+    return (
+      <p className="mt-2 flex items-center gap-1.5 text-[11px] text-base-content/40">
+        <Loader2 className="size-3 animate-spin" /> Loading drafted fix…
+      </p>
+    );
+  }
+  if (fixes.isError) {
+    return (
+      <p className="mt-2 text-[11px] text-base-content/40">
+        Drafted fix could not be loaded.
+      </p>
+    );
+  }
 
   const act = async (fix: FixDto, action: "approve" | "reject") => {
     setBusy(true);
@@ -147,27 +195,59 @@ function FixDiffPreview({
     }
   };
 
-  if (fixes.isPending) {
-    return (
-      <p className="mt-2 flex items-center gap-1.5 text-[11px] text-base-content/40">
-        <Loader2 className="size-3 animate-spin" /> Loading drafted fix…
-      </p>
-    );
-  }
-  if (fixes.isError) {
-    return (
-      <p className="mt-2 text-[11px] text-base-content/40">
-        Drafted fix could not be loaded.
-      </p>
-    );
+  if (shouldDraft) {
+    if (draft.isPending) {
+      return (
+        <p className="mt-2 flex items-center gap-1.5 text-[11px] text-base-content/40">
+          <Loader2 className="size-3 animate-spin" /> Drafting fix — the engine
+          is writing the proposed rewrite…
+        </p>
+      );
+    }
+    if (draft.isError) {
+      return (
+        <p className="mt-2 flex items-center gap-1.5 text-[11px] text-base-content/40">
+          <AlertTriangle className="size-3" /> Drafting failed —{" "}
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:text-primary"
+            onClick={(e) => {
+              e.stopPropagation();
+              draft.mutate();
+            }}
+          >
+            retry
+          </button>
+        </p>
+      );
+    }
+    if (draft.data) {
+      if (draft.data.drafts.length > 0) return null; // diff renders below on refetch
+      return (
+        <div className="mt-2 space-y-1">
+          {draft.data.unsupported.map((u) => (
+            <p
+              key={u.sub_type}
+              className="flex items-start gap-1.5 text-[11px] leading-relaxed text-base-content/40"
+            >
+              <AlertTriangle className="mt-0.5 size-3 shrink-0 text-warning" />
+              <span>
+                No draft for {u.sub_type === "seo.title" ? "the title tag" : "the meta description"}
+                : {u.reason}
+              </span>
+            </p>
+          ))}
+        </div>
+      );
+    }
+    return null;
   }
 
   const rows = fixes.data ?? [];
   if (rows.length === 0) {
     return (
       <p className="mt-2 text-[11px] text-base-content/40">
-        No drafted fix yet — the engine drafts the title/meta rewrite once this
-        recommendation is approved in the queue.
+        No drafted fix yet.
       </p>
     );
   }
@@ -242,11 +322,9 @@ function FixDiffPreview({
 export function WorkTaskList({
   work,
   recommendationId,
-  projectId,
 }: {
   work: WorkRequiredItem[];
   recommendationId?: string;
-  /** Present enables the Review-in-Action-Queue deep link (pipelines card). */
   projectId?: string;
 }) {
   const [manualDone, setManualDone] = useState(() => readManualTaskDone());
@@ -333,26 +411,9 @@ export function WorkTaskList({
                 {automated && recommendationId ? (
                   <FixDiffPreview
                     recommendationId={recommendationId}
+                    fixId={item.fix_id}
                     fixStatus={item.fix_status}
                   />
-                ) : null}
-                {automated ? (
-                  <div className="mt-2 flex items-center gap-2">
-                    {projectId ? (
-                      <Link
-                        to="/p/$projectId/action-queue"
-                        params={{ projectId }}
-                        className="btn btn-xs btn-outline btn-primary"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        Review in Action Queue
-                      </Link>
-                    ) : (
-                      <span className="text-[11px] text-base-content/40">
-                        Manage in Action Queue
-                      </span>
-                    )}
-                  </div>
                 ) : null}
               </div>
             </div>
