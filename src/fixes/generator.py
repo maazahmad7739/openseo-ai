@@ -2509,8 +2509,8 @@ def generate_status_failure_redirect_fix(conn, rec,
 # near-duplicated site-wide. Write: collectionUpdate(input: CollectionInput!)
 # field descriptionHtml (plan/21 §2.6 VERIFIED; scope write_products).
 
-COLLECTION_DESC_MIN_WORDS = 150
-COLLECTION_DESC_MAX_WORDS = 1000
+COLLECTION_DESC_MIN_WORDS = 100
+COLLECTION_DESC_MAX_WORDS = 120
 # Hallucination tripwire (plan/24 §3.2): the draft's content-token set must
 # overlap the grounding corpus (own body text + member-product titles +
 # cluster keyword) by at least this much — a draft full of vocabulary the
@@ -2665,62 +2665,64 @@ def sanitize_collection_html(draft_html):
 
 
 def _is_boilerplate_tail(sentence):
-    """True for the drafter's FIXED page-type tail lines (plan/24): the
-    sentence matches a registered boilerplate FORM — either verbatim, or
-    via a template form with variable slots (roster lines carry the
-    member list / count / keyword). Matching is token-subset: the
-    sentence must be built ONLY from the form's words plus its variable
-    content, never introducing claim vocabulary. Anything with real
-    specifics (specs, numbers beyond counts, materials) can never match
-    a form."""
+    """True for the drafter's FIXED page-type lines (plan/24 + plan/25
+    editorial rules): verbatim registered phrasing, or fixed editorial
+    frames with variable slots (keyword / member count / attribute list —
+    catalogue facts, not claims). Anything with real specifics (specs,
+    materials beyond the frame slots) can never match a frame."""
     lowered = (sentence or "").strip().lower().rstrip(".")
     lowered = re.sub(r"[,;:]", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip()
     if lowered in _BOILERPLATE_TAIL_SENTENCES:
         return True
-    # Template forms: check the sentence against the count/roster frames
-    # by stripping the variable parts and comparing the frame. NOTE: the
-    # normalized form has punctuation (colons/commas) replaced with
-    # spaces, so the frames below are written punctuation-free.
-    roster = re.match(
-        r"^featured in this collection .+$", lowered)
-    if roster:
+    # Editorial frames (plan/24/25): intro + intent-guidance + attribute
+    # spread templates — fixed phrasing with variable catalogue slots.
+    intro = re.match(
+        r"^[a-z0-9' ]+ brings \d+ distinct options together in one place "
+        r"so the whole range can be compared without jumping between "
+        r"pages$", lowered)
+    if intro:
         return True
-    count = re.match(
-        r"^that is \d+ distinct options built around .+ so you can "
-        r"compare the full line-up in one place$", lowered)
-    if count is not None:
+    spread = re.match(
+        r"^the range spans [a-z0-9 \-]+ so the differences between "
+        r"options are real and worth weighing before you pick$", lowered)
+    if spread:
         return True
-    live = re.match(
-        r"^each name above is a live option in the .+ range listed on "
-        r"this page so the collection stays complete$", lowered)
-    return live is not None
+    compact = re.match(
+        r"^options differ across [a-z0-9 \-]+ and more$", lowered)
+    if compact:
+        return True
+    commercial = re.match(
+        r"^decide which of those differences matters most for how you "
+        r"will use it then compare your shortlist directly instead of "
+        r"reading every listing end to end$", lowered)
+    if commercial:
+        return True
+    informational = re.match(
+        r"^skim the range first to see which of those differences you "
+        r"want to explore in more depth$", lowered)
+    if informational:
+        return True
+    angles = re.match(
+        r"^that many distinct angles in one place is exactly what makes "
+        r"a dedicated range page worth having$", lowered)
+    return angles is not None
 
 
 # Exact tail lines the deterministic drafters may append (draft_meta_
-# description generator.py:1273-1282 + draft_collection_description tail
-# bits). Kept in one place so a new tail line must register here or the
-# validator will (correctly) judge it against the corpus.
+# description + draft_collection_description closing lines). Kept in one
+# place so a new tail line must register here or the validator will
+# (correctly) judge it against the corpus.
 _BOILERPLATE_TAIL_SENTENCES = frozenset({
     "compare models side by side and find your fit",
     "browse the full range in one place",
+    "browse the full range above and pick the option that fits your setup "
+    "confident nothing was left off the list",
     "learn what makes it worth it",
     "fast, free delivery and easy returns",
     "shop now with fast delivery and easy returns",
-    # plan/25 thin-roster framing lines (page-type phrasing, no claims)
-    "every option in this range is listed above so nothing in the "
-    "collection is hidden",
-    "every option in this collection is listed above so nothing in the "
-    "collection is hidden",
-    "use the roster to shortlist what fits before you dive into the "
-    "detail pages",
-    "this page stays the single overview worth bookmarking as the range "
-    "grows",
-    "the line-up here is kept current as the range grows so this page "
-    "stays the single overview worth bookmarking",
-    # roster frames are matched by _is_boilerplate_tail's template regexes
-    # ("featured in this collection: …", "that is N distinct options …")
 })
+
 
 
 def validate_collection_draft(draft_html, grounding_corpus,
@@ -2792,19 +2794,26 @@ def validate_collection_draft(draft_html, grounding_corpus,
 
 
 def draft_collection_description(rec, members=None):
-    """Deterministic v0 collection-description draft (plan/24 §1.1).
+    """Structured editorial collection description (plan/24 §1.1, editorial
+    rules): THREE semantic blocks, NO roster stitching — product titles are
+    never looped into the copy.
 
-    FACTS strictly page-and-catalogue-owned: the collection's own current
-    body text + member-product titles and their OWN body sentences + the
-    cluster keyword. The SERP grounds ORDERING only (competitor hooks order
-    the page's OWN sentences, never supplying wording). Output is simple
-    block HTML: a lead <p>, grounded supporting sentences, then corpus-owned
-    catalogue lines until the 150-word floor is reachable. The validator
-    still gates the result; a failing draft means NO fix row.
+    Block 1 — intro <p>: what this collection is, buyer intent, grounded on
+    the cluster keyword + member count (a catalogue fact).
+    Block 2 — guidance <p>: what to look for when choosing. Grounded on
+    DISTINCT product-type/attribute vocabulary mined from member titles +
+    their own body text (each fact term must appear in the corpus); when
+    the catalogue is thin, guidance narrows to buying-process phrasing.
+    Block 3 — closing <p>: a single grounded next-step line.
+
+    When a member body passes the anti-spam lint, ONE representative
+    member quote may enrich Block 2 — never title repetition.
+
+    Copy targets 100-120 well-structured words (COLLECTION_DESC_MIN/MAX).
+    The validator still gates the result; a failing draft means NO fix.
     """
     page_title = (rec.get("page_title") or "").strip()
     keyword = (rec.get("primary_keyword") or "").strip()
-    page_type = (rec.get("page_type") or "").strip()
     body_text = (rec.get("body_text") or "").strip()
     members = [
         m for m in (members or [])
@@ -2812,9 +2821,10 @@ def draft_collection_description(rec, members=None):
     if not page_title:
         return None
 
-    competitor_leads = _competitor_snippet_leads(rec)
+    kw = keyword or page_title
+    member_count = len(members)
 
-    # Lead paragraph: the page's own first usable sentence, keyword-forward.
+    # ---- Block 1: intro (purpose + intent + count) ----
     lead = ""
     if body_text:
         for sep in (". ", "! ", "? "):
@@ -2824,125 +2834,122 @@ def draft_collection_description(rec, members=None):
                 break
         if not lead and len(body_text) >= 40:
             lead = body_text[:200].strip()
+    if lead and _token_overlap(kw, lead) > TOKEN_OVERLAP_MAX:
+        # the current body merely restates the keyword — not editorial copy
+        lead = ""
 
-    lead_title = page_title
-    if keyword and _token_overlap(keyword, page_title) > TOKEN_OVERLAP_MAX:
-        lead_title = _merge_keyword_product_title(keyword, page_title) \
-            or page_title
+    if member_count:
+        intro = (f"{kw.title()} brings {member_count} distinct options "
+                 "together in one place, so the whole range can be "
+                 "compared without jumping between pages.")
+    else:
+        intro = f"{kw.title()} collects the full range in one place."
+    if lead and _desc_word_count(lead) >= 8:
+        intro = f"{intro} {lead}"
 
-    lead_parts = [lead_title]
-    if lead and lead.lower() not in (page_title.lower(), lead_title.lower()):
-        lead_tokens = set(_content_tokens(lead_title))
-        novelty = 1.0
-        if lead_tokens:
-            lead_word_tokens = [w for w in _content_tokens(lead)]
-            novel = len(set(lead_word_tokens) - lead_tokens) \
-                / len(set(lead_word_tokens)) if lead_word_tokens else 1.0
-            novelty = novel
-        if novelty >= 0.5:
-            lead_parts.append(lead)
-
-    # Middle: grounded supporting sentences — the page's OWN body sentences
-    # matching the dominant competitor hook cues surface first (the FACT
-    # stays ours; the ORDER is competitor-informed).
-    supporting = []
-    if body_text:
-        for sentence in [s.strip() for s in body_text.split(". ")
-                         if s.strip()]:
-            sentence_full = sentence if sentence.endswith(".") \
-                else sentence + "."
-            for hook in competitor_leads:
-                if hook in sentence_full.lower():
-                    supporting.append(sentence_full)
-                    break
-            if len(supporting) >= 4:
-                break
-
-    paragraphs = ["<p>" + " — ".join(lead_parts) + "</p>"]
-    for sentence in supporting:
-        paragraphs.append(f"<p>{sentence}</p>")
-
-    # Tail guarantee: grounded catalogue lines complete the draft when the
-    # lead alone is thin (member-product titles + their OWN body sentences,
-    # corpus-owned — never competitor wording). Lines are added until the
-    # 150-word floor is reachable; the validator still gates the result.
-    draft_text = _body_to_text("".join(paragraphs))
-    titles = [(m.get("title") or "").strip() for m in members]
-    titles = [t for t in titles if t]
-    has_member_bodies = any(
-        (m.get("text") or "").strip()
-        and (m.get("text") or "").strip().lower() != m.get("title", "").lower()
-        for m in members)
-    if (_desc_word_count(draft_text) < COLLECTION_DESC_MIN_WORDS
-            and has_member_bodies):
-        # Per-member lines only earn their place when they carry NEW facts
-        # (the member's own body text) — bare titles duplicate the roster.
-        # A member body that FAILS the anti-spam lint (the store's own
-        # shouted/emoji copy) is skipped, never propagated: the draft must
-        # not inherit the very defects the fix exists to cure.
-        for member in members:
-            title = (member.get("title") or "").strip()
-            text = (member.get("text") or "").strip()
-            if not title:
+    # ---- Block 2: guidance (what to look for) ----
+    # Mine DISTINCT attribute vocabulary from member titles + their own
+    # body text: content tokens (minus the keyword's own tokens). These
+    # are real catalogue attributes — edition types, materials, model
+    # families — not title repetition. With title-only members the
+    # attribute spread IS the catalogue's differentiation story; with
+    # rich bodies the lint-passing body sentences add a grounded quote.
+    kw_tokens = set(_content_tokens(kw))
+    attribute_counts = {}
+    for m in members:
+        source = " ".join([(m.get("title") or ""),
+                           (m.get("text") or "")])
+        for tok in _content_tokens(source):
+            if tok in kw_tokens:
                 continue
-            if _caps_runs(text) >= 3 or _has_emoji(text) \
-                    or _spam_stacks(text) \
-                    or any(p in text.lower()
-                           for p in BANNED_META_PATTERNS):
-                continue  # store's own spam copy — never propagate
-            line = f"{title} — {text}" if text else title
-            paragraphs.append(f"<p>{line}.</p>")
-            draft_text = _body_to_text("".join(paragraphs))
-            if _desc_word_count(draft_text) >= COLLECTION_DESC_MIN_WORDS:
-                break
-    if _desc_word_count(draft_text) < COLLECTION_DESC_MIN_WORDS:
-        tail_bits = []
-        # plan/25: when member bodies are thin/empty (real stores often
-        # ship titles only), the member ROSTER itself is the grounded
-        # fact — a full list of every member name is corpus-owned and
-        # reads naturally on a collection page.
-        if titles:
-            tail_bits.append(
-                "<p>Featured in this collection: "
-                + ", ".join(titles) + ".</p>")
-            tail_bits.append(
-                f"<p>That is {len(titles)} distinct options built around "
-                f"{(keyword or '').strip() or 'this range'}, so you can "
-                "compare the full line-up in one place.</p>")
-            tail_bits.append(
-                f"<p>Each name above is a live option in the "
-                f"{(keyword or '').strip() or 'this range'} range, listed "
-                "on this page so the collection stays complete.</p>")
-            # Page-type framing lines (registered boilerplate — exempt from
-            # the grounding tripwire, never claim-carrying) complete the
-            # floor when the roster alone is thin.
-            tail_bits.append(
-                f"<p>Every option in this {page_type or 'range'} is listed "
-                "above so nothing in the collection is hidden.</p>")
-            tail_bits.append(
-                "<p>Use the roster to shortlist what fits before you "
-                "dive into the detail pages.</p>")
-            tail_bits.append(
-                "<p>The line-up here is kept current as the range grows, "
-                "so this page stays the single overview worth "
-                "bookmarking.</p>")
-        if page_type == "collection":
-            tail_bits.append(
-                "<p>" + ("Compare models side by side and find your fit."
-                         if "compare" in competitor_leads
-                         else "Browse the full range in one place.") +
-                "</p>")
-            tail_bits.append(
-                "<p>Every option in this collection is listed above so "
-                "nothing in the collection is hidden.</p>")
-        else:
-            tail_bits.append("<p>Learn what makes it worth it.</p>")
-        paragraphs.extend(tail_bits)
+            attribute_counts[tok] = attribute_counts.get(tok, 0) + 1
+    # attributes shared by 2+ members are the strongest facts; singletons
+    # are still real catalogue attributes when the roster is the only
+    # source (title-only stores) — cap the list to keep it editorial
+    strong = [t for t, n in sorted(attribute_counts.items(),
+                                   key=lambda kv: (-kv[1], kv[0]))
+              if n >= 2]
+    weak = [t for t, n in sorted(attribute_counts.items(),
+                                 key=lambda kv: (-kv[1], kv[0]))
+            if n == 1 and n >= 1]
+    attributes = (strong + weak)[:8]
+    # clean body sentences (own copy that passes the anti-spam lint) may
+    # carry ONE representative grounded quote into the guidance block
+    member_quote = ""
+    for m in members:
+        text = (m.get("text") or "").strip()
+        if not text or text.lower() == (m.get("title") or "").lower():
+            continue
+        if _caps_runs(text) >= 3 or _has_emoji(text) or _spam_stacks(text) \
+                or any(p in text.lower() for p in BANNED_META_PATTERNS):
+            continue  # store's own spam copy — never propagate
+        # first SENTENCE only (never a mid-sentence cut) — keeps the
+        # guidance block editorial without bloating the word budget
+        first_sentence = text.split(". ")[0].rstrip(".")
+        member_quote = first_sentence[:180] if first_sentence else ""
+        break
 
-    draft = "".join(paragraphs)
+    guidance_bits = []
+    if attributes:
+        # When a member quote is present it carries the differentiation
+        # beat with real copy — the full attribute list would be
+        # redundant AND push the draft past the ceiling. A compact list
+        # wins only when there is no quote to show.
+        if member_quote:
+            listed = ", ".join(attributes[:4])
+            guidance_bits.append(
+                f"Options differ across {listed} and more.")
+        else:
+            listed = ", ".join(attributes[:6])
+            guidance_bits.append(
+                f"The range spans {listed}, so the differences between "
+                "options are real and worth weighing before you pick.")
+        # editorial buyer guidance tied to the intent (corpus fact from
+        # keyword_clusters.intent, not a claim about products)
+        intent = (rec.get("intent") or "").lower()
+        if intent == "commercial":
+            guidance_bits.append(
+                "Decide which of those differences matters most for how "
+                "you will use it, then compare your shortlist directly "
+                "instead of reading every listing end to end.")
+        elif intent == "informational":
+            guidance_bits.append(
+                "Skim the range first to see which of those differences "
+                "you want to explore in more depth.")
+        # attribute-count summary: the spread itself is a catalogue fact.
+        # When a member quote is present it carries this beat already —
+        # both would push the draft past the ceiling.
+        if len(attributes) >= 3 and not member_quote:
+            guidance_bits.append(
+                "That many distinct angles in one place is exactly what "
+                "makes a dedicated range page worth having.")
+    elif member_count:
+        guidance_bits.append(
+            f"With {member_count} options side by side, compare the "
+            "details that matter for how you will use it.")
+    if member_quote:
+        guidance_bits.append(f"One example: {member_quote}.")
+    guidance = " ".join(guidance_bits)
+
+    # ---- Block 3: closing (grounded next step) ----
+    competitor_leads = _competitor_snippet_leads(rec)
+    if "compare" in competitor_leads:
+        closing = ("Compare models side by side and find the one that "
+                   "fits how you ride, knowing every option in the range "
+                   "is represented on this page.")
+    else:
+        closing = ("Browse the full range above and pick the option that "
+                   "fits your setup, confident nothing was left off the "
+                   "list.")
+
+    paragraphs = [
+        f"<p>{intro}</p>",
+        f"<p>{guidance}</p>",
+        f"<p>{closing}</p>",
+    ]
+    draft = "".join(p for p in paragraphs if _body_to_text(p))
     if keyword and keyword.lower() not in _body_to_text(draft).lower():
-        kw_title = keyword.title() if keyword.islower() else keyword
-        draft = f"<p>{kw_title}</p>{draft}"
+        draft = f"<p>{kw.title()}</p>{draft}"
     return draft
 
 

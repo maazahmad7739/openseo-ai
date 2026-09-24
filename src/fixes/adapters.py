@@ -1810,8 +1810,8 @@ ADAPTERS.update({
 # ------------------------------------------------------------
 
 COLLECTION_CREATE_MUTATION = """
-mutation FixCollectionCreate($collection: CollectionInput!) {
-  collectionCreate(collection: $collection) {
+mutation FixCollectionCreate($input: CollectionInput!) {
+  collectionCreate(input: $input) {
     collection { id title handle descriptionHtml seo { title description } }
     userErrors { field message }
   }
@@ -1965,8 +1965,11 @@ def collection_create_execute(conn, fix_row, config, dry_run=False,
                            "variables": variables}}
 
     try:
+        # LIVE-VERIFIED (2026-09-24, action-seo-test 2026-01): the pinned
+        # schema requires `input:` — the `collection:` arg seen in newer
+        # docs is NOT accepted by the 2026-01 endpoint (argumentnotaccepted).
         write = client.run("collectionCreate", COLLECTION_CREATE_MUTATION,
-                           {"collection": variables})
+                           {"input": variables})
     except Exception as exc:
         return {"ok": False, "outcome": "no_credentials", "detail": str(exc),
                 "adapter": ADAPTER_COLLECTION_CREATE}

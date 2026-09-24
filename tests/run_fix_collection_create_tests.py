@@ -94,7 +94,8 @@ class FakeCreateClient:
                     "seo": {"title": "t", "description": "d"}}}}
             return {"ok": True, "data": {"collectionByHandle": None}}
         if mutation_name == "collectionCreate":
-            coll = (variables or {}).get("collection") or {}
+            # live-verified 2026-01 shape: the adapter sends {"input": ...}
+            coll = (variables or {}).get("input") or {}
             gid = f"gid://shopify/Collection/{len(STATE.created) + 900001}"
             STATE.created[coll.get("handle")] = {"gid": gid,
                                                  "title": coll.get("title")}
