@@ -190,6 +190,12 @@ function FixDiffPreview({
         queryKey: ["openseo", "fixes", recommendationId],
       });
       void queryClient.invalidateQueries({ queryKey: ["openseo", "detail", recommendationId] });
+    } catch (err) {
+      // Surface the API rejection (409 policy/cap blocks, network, etc.)
+      // instead of failing silently — the operator must see WHY nothing
+      // happened.
+      const detail = err instanceof Error ? err.message : String(err);
+      toast.error(`Could not ${action} the fix — ${detail}`);
     } finally {
       setBusy(false);
     }

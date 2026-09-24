@@ -154,7 +154,16 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (token) headers.authorization = `Bearer ${token}`;
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (!res.ok) {
-    throw new Error(`API ${res.status} ${path}`);
+    // Include the API's detail message (FastAPI {"detail": …}) so callers
+    // can surface WHY a mutation was rejected (409 policy/cap blocks etc.).
+    let detail = "";
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body?.detail === "string") detail = body.detail;
+    } catch {
+      /* non-JSON error body — fall through to the generic message */
+    }
+    throw new Error(detail ? `${detail} (HTTP ${res.status})` : `API ${res.status} ${path}`);
   }
   return (await res.json()) as T;
 }
