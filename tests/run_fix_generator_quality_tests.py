@@ -184,7 +184,7 @@ def test_unit_checks():
     print("\n== validator unit checks ==")
     from fixes.generator import (validate_title_draft, intent_match_check,
                                  brand_suffix_check, validator_extra_checks,
-                                 draft_title)
+                                 draft_title, draft_meta_description)
 
     allok = True
 
@@ -264,6 +264,62 @@ def test_unit_checks():
                    str(draft))
     problems = validator_extra_checks(draft, "test widgets") if draft else ["none"]
     allok &= check("drafted title passes first-half", not problems, str(problems))
+
+    # ---- redundant-repetition guard (live-UI finding) ----
+    # The exact live case: query 'buy complete snowboard' vs product
+    # 'The Complete Snowboard' — the old drafter stacked the phrase:
+    # 'Buy Complete Snowboard: The Complete Snowboard'.
+    rec_high_overlap = {
+        "page_title": "The Complete Snowboard",
+        "primary_keyword": "buy complete snowboard",
+        "intent": "commercial",
+        "site_name": "ActionSEO Dev",
+        "page_type": "product",
+        "body_text": ("The Complete Snowboard is an all-in-one board for "
+                      "riders who want convenience and performance. Canted "
+                      "Footbeds, The Channel, and Pro Tips give you control "
+                      "and confidence."),
+        "competitor_context": {},
+    }
+    draft = draft_title(dict(rec_high_overlap))
+    allok &= check("high-overlap draft produced", draft is not None, str(draft))
+    lowered = (draft or "").lower()
+    allok &= check("drafted title does not stack the product phrase",
+                   lowered is not None and lowered.count("complete snowboard") == 1,
+                   str(draft))
+    problems = validate_title_draft(draft, "buy complete snowboard",
+                                    product_title="The Complete Snowboard",
+                                    intent="commercial",
+                                    site_name="ActionSEO Dev") if draft else ["none"]
+    allok &= check("merged title passes the validator", not problems, str(problems))
+
+    # The old stacked form must now be REJECTED by the validator so neither
+    # an LLM nor a future deterministic path can ever write it.
+    problems = validate_title_draft("Buy Complete Snowboard: The Complete Snowboard",
+                                    "buy complete snowboard",
+                                    product_title="The Complete Snowboard",
+                                    site_name="ActionSEO Dev")
+    allok &= check("stacked title rejected by validator",
+                   any("repeated" in p for p in problems), str(problems))
+
+    # Distinct keyword/product pair still concatenates normally (guard must
+    # not over-trigger).
+    draft_distinct = draft_title({"page_title": "Powder Gold Collector Edition",
+                                  "primary_keyword": "buy snowboard goggles",
+                                  "competitor_context": {}})
+    allok &= check("low-overlap pair still concatenates",
+                   draft_distinct is not None
+                   and "buy snowboard goggles" in draft_distinct.lower()
+                   and "powder gold" in draft_distinct.lower(),
+                   str(draft_distinct))
+
+    # Meta draft for the same high-overlap page: no stacked phrase either.
+    meta = draft_meta_description(dict(rec_high_overlap))
+    allok &= check("meta draft produced", meta is not None, str(meta))
+    meta_lowered = (meta or "").lower()
+    allok &= check("meta draft does not stack the product phrase",
+                   meta_lowered.count("complete snowboard") <= 1,
+                   str(meta))
 
     return allok
 
@@ -404,17 +460,25 @@ def test_duplicate_title(conn):
 
     allok = True
     # Another page already owns the title the draft would produce.
-    # Page title "Test Widget", keyword "test widget <tok>" (missing) ->
-    # deterministic draft = "Test Widget <tok>: Test Widget". Seed an OTHER
-    # page whose title matches exactly that draft. The LLM drafter (when
-    # credentials resolve) may draft differently — pin the deterministic
-    # path so this check tests the DUPLICATE gate, not the drafter.
-    draft_expected = f"Test Widget {RUN_TOKEN}".title() + ": Test Widget"
+    # Page title "Test Widget", keyword "test widget <tok>" -> high token
+    # overlap, so the drafter MERGES to "Test Widget <tok>" (the redundancy
+    # guard; concatenating would stack the phrase). Seed an OTHER page whose
+    # title matches exactly that draft. The LLM drafter (when credentials
+    # resolve) may draft differently — pin the deterministic path so this
+    # check tests the DUPLICATE gate, not the drafter. The merged draft
+    # capitalizes only the first character ("Test widget <tok>").
+    draft_expected = f"Test widget {RUN_TOKEN}"
     original_llm = gen._llm_client
     gen._llm_client = lambda: (_ for _ in ()).throw(
         gen.LlmDraftError("pinned offline for duplicate test"))
     try:
         ids = seed_world(conn, pages_spec=[(draft_expected, "dupe-target")])
+        # Sanity: the deterministic drafter really produces the pinned draft.
+        actual = draft_title({"page_title": "Test Widget",
+                              "primary_keyword": f"test widget {RUN_TOKEN}",
+                              "competitor_context": {}})
+        allok &= check("pinned draft matches drafter", actual == draft_expected,
+                       f"expected {draft_expected!r}, got {actual!r}")
         try:
             generate_fix_for_recommendation(conn, ids["rec_id"])
             allok &= check("duplicate draft rejected", False, "no exception")

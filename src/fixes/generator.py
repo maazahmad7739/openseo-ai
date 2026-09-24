@@ -117,6 +117,14 @@ def build_draft_prompt(rec):
             "no_emoji_no_allcaps_runs_no_spam_punctuation": True,
             "no_double_quotes_in_meta": True,
             "brand_name_at_most_once": True,
+            "no_repeated_phrases": (
+                "Do NOT repeat the product name or the primary keyword phrase "
+                "twice in the title or the meta description. When the keyword "
+                "already contains the product name (e.g. query 'buy complete "
+                "snowboard' for product 'The Complete Snowboard'), write ONE "
+                "natural phrase — never 'Buy Complete Snowboard: The Complete "
+                "Snowboard'. Keep it natural, compelling, and under 60 characters."
+            ),
             "invent_no_facts": ("Every specific claim (materials, warranty, "
                                 "shipping, certifications, specs, numbers) "
                                 "must appear in the page facts."),
@@ -144,6 +152,10 @@ Hard rules:
   never copy competitor wording.
 - Respect the character bounds exactly. Include the primary keyword (start it
   within the first half of titles).
+- Do NOT repeat the product name or key phrases twice in the title tag or meta
+  description. If the primary keyword already contains the product name, write
+  one natural phrase — never concatenate both. Keep it natural, compelling,
+  and under 60 characters.
 - No emoji, no ALL-CAPS shouting, no spam punctuation, no double quotes in
   metas, no banned patterns, brand name at most once.
 - If you cannot produce a candidate that obeys all rules, return fewer
@@ -882,9 +894,12 @@ def _spam_stacks(text):
     return bool(re.search(r"[!$]{4,}", text or ""))
 
 
-def validator_extra_checks(draft, primary_keyword):
+def validator_extra_checks(draft, primary_keyword, product_title=None):
     """plan/21 §2.1 value-constraint additions (denylist IS in v1 validator):
-    ALL-CAPS runs, emoji, spam stacks, keyword-in-first-half."""
+    ALL-CAPS runs, emoji, spam stacks, keyword-in-first-half — plus the
+    redundant-repetition guard: a draft must not stack the product name /
+    keyword phrase twice ('Buy Complete Snowboard: The Complete Snowboard'
+    reads spammy and defeats the CTR fix)."""
     problems = []
     if _caps_runs(draft) >= 3:
         problems.append("ALL-CAPS run (3+ shouted words)")
@@ -899,6 +914,19 @@ def validator_extra_checks(draft, primary_keyword):
         start = draft.lower().find(primary_keyword.lower())
         if start == -1 or start >= half:
             problems.append("primary keyword not in first half")
+    # Redundant repetition: the draft must not contain the primary keyword
+    # (or the product title) twice. One mention is targeting; two is spam.
+    key_tokens = _content_tokens(primary_keyword or "")
+    if len(key_tokens) >= 2:
+        phrase = " ".join(key_tokens)
+        if draft.lower().count(phrase) > 1:
+            problems.append("keyword phrase repeated in title")
+    product_tokens = _content_tokens(product_title or "")
+    if len(product_tokens) >= 2:
+        phrase = " ".join(product_tokens)
+        occurrences = draft.lower().count(phrase)
+        if occurrences > 1:
+            problems.append("product name repeated in title")
     return problems
 
 
@@ -930,7 +958,8 @@ def validate_title_draft(draft, primary_keyword, product_title=None,
         problems.append("draft equals the product title — Shopify stores that "
                         "as null (no-op write)")
     # plan/21 §2.1 additions: caps/emoji/spam + keyword-in-first-half.
-    problems.extend(validator_extra_checks(stripped, primary_keyword))
+    problems.extend(validator_extra_checks(stripped, primary_keyword,
+                                           product_title=product))
     # plan/21 §2.1 check 2: intent contradiction.
     if not intent_match_check(intent, stripped):
         problems.append(f"intent mismatch ({intent} intent contradicted by "
@@ -939,6 +968,94 @@ def validate_title_draft(draft, primary_keyword, product_title=None,
     if not brand_suffix_check(stripped, site_name):
         problems.append("brand name duplicated in title")
     return problems
+
+
+# Title-quality gates (plan/21 §2.1 checks 3 + validator denylist).
+# Redundant-repetition guard (live-UI finding: 'Buy Complete Snowboard: The
+# Complete Snowboard'): when the target query and the product title share
+# more than this fraction of meaningful tokens, the two strings are treated
+# as variants of the same phrase and must be MERGED, never concatenated.
+# Substantive-word floor: overlap is only meaningful once both strings carry
+# at least one content word (tiny strings can't establish redundancy).
+TOKEN_OVERLAP_MAX = 0.5
+_TOKEN_MIN_LEN = 3
+_TOKEN_STOPWORDS = frozenset(
+    "a an the and or for with to of in on at from by".split()
+)
+
+
+def _content_tokens(text):
+    """Substantive words of a phrase, lowercased: stopwords and ultra-short
+    tokens dropped so 'buy'/'the' don't dilute the overlap measure."""
+    return [t for t in re.findall(r"[a-z0-9']+", (text or "").lower())
+            if len(t) >= _TOKEN_MIN_LEN and t not in _TOKEN_STOPWORDS]
+
+
+def _token_overlap(a, b):
+    """|tokens(a) ∩ tokens(b)| / min(|tokens(a)|, |tokens(b)|) — 0..1.
+    min() (not union) so a LONG product title can't dilute a SHORT query's
+    overlap; 0.0 when either side has no content tokens."""
+    ta, tb = _content_tokens(a), _content_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    shared = set(ta) & set(tb)
+    return len(shared) / min(len(ta), len(tb))
+
+
+def _dedupe_repeated_tail(text, source_text):
+    """Drop trailing words of `text` that literally repeat the opening words
+    of `source_text` ('Buy Complete Snowboard: The Complete Snowboard' is
+    assembled from merged parts that may still share a tail; the product
+    name must appear once, not twice)."""
+    text = (text or "").strip()
+    source_words = _content_tokens(source_text)
+    if not source_words or not text:
+        return text
+    words = text.split()
+    while len(words) > 2 and words[-1].lower().strip(".,:;—–-|") in source_words:
+        # only strip when what remains still contains the source lead
+        remaining = " ".join(words[:-1]).lower()
+        if source_words[0] not in remaining:
+            break
+        words = words[:-1]
+    return " ".join(words)
+
+
+def _merge_keyword_product_title(keyword, page_title):
+    """Natural merge for high-overlap keyword/product pairs:
+    'buy complete snowboard' + 'The Complete Snowboard'
+      -> 'Buy Complete Snowboard' (query form wins; product name already
+         inside it — concatenation would repeat the phrase)."""
+    kw_tokens = _content_tokens(keyword)
+    if not kw_tokens:
+        return None
+    merged = " ".join(kw_tokens)
+    return merged[:1].upper() + merged[1:] if merged else None
+
+
+def _front_keyword(text, keyword):
+    """Ensure the keyword leads `text` (its END within the first half) by
+    moving whole words, not re-stacking them."""
+    kw = (keyword or "").strip().lower()
+    if not kw:
+        return text
+    lowered = text.lower()
+    half = max(1, len(text) // 2)
+    start = lowered.find(kw)
+    if start != -1 and start < half:
+        return text
+    kw_first = _content_tokens(keyword)
+    if not kw_first:
+        return text
+    lead = " ".join(kw_first)
+    lead = lead[:1].upper() + lead[1:]
+    rest = text
+    # If `text` begins with the same words the keyword fronting would add,
+    # the fronted result would repeat them — keep the text as-is instead.
+    rest_tokens = _content_tokens(rest)
+    if rest_tokens[:len(kw_first)] == kw_first:
+        return text
+    return f"{lead}: {rest}" if rest else lead
 
 
 def draft_title(rec):
@@ -953,11 +1070,27 @@ def draft_title(rec):
     clear competitor pattern exists, falls back to the naive
     keyword-forward concatenation (prior behavior). The validator still
     gates the result; a failing draft means NO fix row.
+
+    Redundancy guard: when the target query and the product title share
+    >50% content tokens ('buy complete snowboard' vs 'The Complete
+    Snowboard'), concatenation would stack the repeated phrase — the pair
+    is merged into a single natural phrase instead.
     """
     page_title = (rec.get("page_title") or "").strip()
     keyword = (rec.get("primary_keyword") or "").strip()
     if not page_title:
         return None
+
+    # High token overlap: merge, never concatenate (spam stacking guard).
+    if keyword and _token_overlap(keyword, page_title) > TOKEN_OVERLAP_MAX:
+        merged = _merge_keyword_product_title(keyword, page_title)
+        if merged:
+            candidate = _front_keyword(merged, keyword).strip()
+            if len(candidate) > TITLE_MAX_CHARS:
+                candidate = candidate[:TITLE_MAX_CHARS - 1].rstrip() + "…"
+            if len(candidate) >= TITLE_MIN_CHARS:
+                return candidate
+
     candidate = page_title
     needs_fronting = (keyword
                       and (keyword.lower() not in page_title.lower()
@@ -1090,9 +1223,44 @@ def draft_meta_description(rec):
             if len(supporting) >= 2:
                 break
 
-    parts = [page_title]
-    if lead and lead.lower() != page_title.lower():
-        parts.append(lead)
+    # High-overlap guard: when keyword ≈ product title, leading the draft
+    # with BOTH stacks the phrase ('Buy Complete Snowboard: The Complete
+    # Snowboard — ...'). Use the merged phrase as the lead instead.
+    lead_title = page_title
+    if keyword and _token_overlap(keyword, page_title) > TOKEN_OVERLAP_MAX:
+        lead_title = _merge_keyword_product_title(keyword, page_title) or page_title
+
+    parts = [lead_title]
+    if lead and lead.lower() not in (page_title.lower(), lead_title.lower()):
+        # When the lead opens by restating the product name (common: body
+        # copy starts with the product title), strip that restatement and
+        # keep the informative tail — the merged lead already names it.
+        lead_title_tokens = set(_content_tokens(lead_title))
+        lead_stripped = False
+        if lead_title_tokens:
+            lead_lower = lead.lower()
+            last_end = 0
+            for tok in _content_tokens(lead):
+                if tok in lead_title_tokens:
+                    pos = lead_lower.find(tok)
+                    if pos != -1 and pos <= 30:
+                        last_end = max(last_end, pos + len(tok))
+            if last_end > 0:
+                tail = lead[last_end:].lstrip(" ,.:-—–").strip()
+                if len(tail) >= 30:
+                    # capitalize the sentence start (the strip cut mid-sentence)
+                    lead = tail[:1].upper() + tail[1:]
+                    lead_stripped = True
+        if (not lead_stripped and lead_title_tokens):
+            # Un-stripped lead must still be worth keeping: skip it when it
+            # merely restates the lead phrase (no novel facts).
+            lead_tokens = set(_content_tokens(lead))
+            novelty = (len(lead_tokens - lead_title_tokens) / len(lead_tokens)
+                       if lead_tokens else 0.0)
+            if novelty < 0.5 and _token_overlap(lead, lead_title) > TOKEN_OVERLAP_MAX:
+                lead = ""
+        if lead:
+            parts.append(lead)
     for extra in supporting:
         if extra.lower() != lead.lower() and len(" — ".join(parts + [extra])) <= META_MAX_CHARS + 20:
             parts.append(extra)
