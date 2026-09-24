@@ -28,9 +28,10 @@ logger = logging.getLogger("api.queue")
 router = APIRouter(prefix="/queue", tags=["queue"])
 
 # Task text patterns the fix engine can execute end-to-end (generated_fixes
-# rows exist for these sub_types: 'seo.title', 'seo.description', 'redirect').
-# Anything else degrades to 'manual' — theme/Liquid edits, schema code
-# injections, sitemap/content work the operator does by hand.
+# rows exist for these sub_types: 'seo.title', 'seo.description',
+# 'redirect', 'collection_description', 'collection_create'). Anything
+# else degrades to 'manual' — theme/Liquid edits, schema code injections,
+# sitemap work the operator does by hand.
 _AUTOMATED_TASK_PATTERNS = (
     "meta description",
     "meta title",
@@ -38,12 +39,32 @@ _AUTOMATED_TASK_PATTERNS = (
     "title tag",
     "301",
     "redirect",
+    "create a collection",   # plan/25: missing-page creation is executable
+    "create page",
 )
 
 
 def _classify_execution_type(task: str) -> str:
     lowered = (task or "").lower()
     return "automated" if any(p in lowered for p in _AUTOMATED_TASK_PATTERNS) else "manual"
+
+
+def _sub_type_for_task(lowered):
+    """Task text -> fix sub_type (plan/25 §4). The create-page branch is
+    evaluated FIRST: 'Create a collection page at /collections/x … meta
+    description…' mentions description phrases that would otherwise
+    shadow the create semantics."""
+    lowered = lowered or ""
+    if ("create a collection" in lowered
+            or "create page" in lowered
+            or "missing page" in lowered
+            or ("/collections/" in lowered and "create" in lowered)):
+        return "collection_create"
+    if "redirect" in lowered or "301" in lowered:
+        return "redirect"
+    if "meta description" in lowered or "description" in lowered:
+        return "seo.description"
+    return "seo.title"
 
 
 def enrich_work_tasks(work, fix_rows):
@@ -68,15 +89,7 @@ def enrich_work_tasks(work, fix_rows):
         item = dict(task)
         item["execution_type"] = _classify_execution_type(item.get("task") or "")
         if item["execution_type"] == "automated":
-            lowered = (item.get("task") or "").lower()
-            if "redirect" in lowered or "301" in lowered:
-                sub_type = "redirect"
-            elif "meta description" in lowered:
-                sub_type = "seo.description"
-            elif "description" in lowered:
-                sub_type = "seo.description"
-            else:
-                sub_type = "seo.title"
+            sub_type = _sub_type_for_task((item.get("task") or "").lower())
             fix = by_sub_type.get(sub_type)
             if fix:
                 item["fix_id"], item["fix_status"] = str(fix[0]), fix[1]

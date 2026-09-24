@@ -33,7 +33,10 @@ CREATE TABLE IF NOT EXISTS generated_fixes (
     action_type         TEXT NOT NULL,        -- mirrors recommendations.action_type
     sub_type            TEXT,                 -- issue_type | 'title'|'meta'|'content'|'redirect'|'link_insert'|...
     target_url          TEXT NOT NULL,
-    target_entity_ref   TEXT NOT NULL,        -- Shopify GID (gid://shopify/Product/123)
+    -- plan/25: collection_create mints the GID at EXECUTE time (the entity
+    -- does not exist at generation) — NULL until the executor's
+    -- snapshot_patch('collection.created_gid') lands.
+    target_entity_ref   TEXT,                 -- Shopify GID (gid://shopify/Product/123)
 
     -- The fix itself
     payload_json        JSONB NOT NULL,       -- exact GraphQL mutation payload
@@ -96,6 +99,7 @@ FROM site_config sc
 CROSS JOIN (VALUES
     ('seo.title',            'low',       10, true),
     ('seo.description',      'medium',     5, true),
+    ('collection_description', 'medium',   3, true),
     ('content',              'medium',     5, true),
     ('product_publish',      'medium',     5, true),
     ('product_publish_product', 'medium',  5, true),

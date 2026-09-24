@@ -230,6 +230,8 @@ def draft_fixes(recommendation_id, conn=Depends(get_conn)):
     """
     from fixes.generator import (
         generate_fix_for_recommendation, generate_meta_fix_for_recommendation,
+        generate_collection_description_fix_for_recommendation,
+        generate_collection_create_fix_for_recommendation,
         FixGenerationError, FixNotSupported)
     from fixes.policy import PolicyBlocked
 
@@ -248,6 +250,11 @@ def draft_fixes(recommendation_id, conn=Depends(get_conn)):
          {"live_seo_title": _fresh_live_seo_title(conn, recommendation_id)}),
         ("seo.description", generate_meta_fix_for_recommendation,
          {"live_meta_description": _fresh_live_meta_description(conn, recommendation_id)}),
+        ("collection_description",
+         generate_collection_description_fix_for_recommendation,
+         {"live_body_html": _fresh_live_description_html(conn, recommendation_id)}),
+        ("collection_create",
+         generate_collection_create_fix_for_recommendation, {}),
     ):
         try:
             result = fn(conn, recommendation_id, **kwargs_safe(kwargs))
@@ -261,8 +268,15 @@ def draft_fixes(recommendation_id, conn=Depends(get_conn)):
         except FixNotSupported as exc:
             unsupported.append({"sub_type": label, "reason": str(exc)})
         except (PolicyBlocked, FixGenerationError) as exc:
+            # FixGenerationError is the safety net here: a per-field
+            # crash (data anomaly) must degrade to 'unsupported' so the
+            # OTHER fields still draft — never kill the whole endpoint
+            # (the drawer's per-field-failure contract, plan/21 §3).
             reason = getattr(exc, "reason", None) or str(exc)
             unsupported.append({"sub_type": label, "reason": reason})
+        except Exception as exc:  # never let one field 500 the endpoint
+            unsupported.append({"sub_type": label,
+                                "reason": f"{type(exc).__name__}: {exc}"})
     conn.rollback()
     return FixDraftOut(drafts=drafts, unsupported=unsupported)
 
@@ -375,6 +389,121 @@ def _fresh_live_meta_description(conn, recommendation_id):
     except Exception:
         return None
     return None
+
+
+def _fresh_live_description_html(conn, recommendation_id):
+    """plan/24: best-effort live read of the collection's descriptionHtml
+    (gate input); None on anything odd -> gate falls back to
+    pages.body_html. Collections resolve by-handle the same way the
+    product reads do (the /collections/<handle> URL shape)."""
+    import os
+    from connectors.shopify import ShopifyGraphQLClient
+    from jobs.fix_executor import _normalize_shop_domain
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT s.shopify_domain, p.url FROM recommendations r "
+                "JOIN site_config s ON s.site_id = r.site_id "
+                "JOIN pages p ON p.site_id = r.site_id AND p.url = r.target_url "
+                "WHERE r.recommendation_id = %s AND p.page_type = 'collection'",
+                (recommendation_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        shop_domain, target_url = row
+        token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+        if not shop_domain or not token:
+            return None
+        client = ShopifyGraphQLClient(shop_domain=_normalize_shop_domain(shop_domain),
+                                      access_token=token)
+        handle = target_url.rstrip("/").rsplit("/", 1)[-1]
+        query = ("query FixGenCollectionRead($handle: String!) "
+                 "{ collectionByHandle(handle: $handle) "
+                 "{ descriptionHtml } }")
+        result = client.run("collectionByHandle", query, {"handle": handle})
+        if result.get("ok"):
+            collection = ((result.get("data") or {})
+                          .get("collectionByHandle") or {})
+            return collection.get("descriptionHtml")
+    except Exception:
+        return None
+    return None
+
+
+@router.post("/recommendations/{recommendation_id}/collection-description-fix",
+             response_model=FixGenerateOut)
+def generate_collection_description_fix(recommendation_id,
+                                        conn=Depends(get_conn)):
+    """plan/24: turn an approved improve_page recommendation (collection
+    target) into a collection_description fix (status='generated').
+
+    Same gate order as /meta-fix: shared suppressions (protect winners /
+    consolidate) run first; the description quality gate judges the LIVE
+    descriptionHtml when a fresh read resolves, else pages.body_html.
+    Policy is NOT enforced here (generation runs while execution stays
+    disabled; fix_policy 0 semantics)."""
+    from fixes.generator import (
+        generate_collection_description_fix_for_recommendation,
+        FixGenerationError, FixNotSupported)
+    from fixes.policy import PolicyBlocked
+
+    get_recommendation(conn, recommendation_id)  # 404 when unknown
+    live_body = _fresh_live_description_html(conn, recommendation_id)
+    try:
+        result = generate_collection_description_fix_for_recommendation(
+            conn, recommendation_id, live_body_html=live_body)
+    except FixNotSupported as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except PolicyBlocked as exc:
+        raise HTTPException(status_code=409, detail=f"fix conflict: {exc.reason}")
+    except FixGenerationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return FixGenerateOut(
+        fix_id=result["fix_id"],
+        recommendation_id=recommendation_id,
+        status=result["status"],
+        created=result["created"],
+        diff_json=result["diff"],
+    )
+
+
+@router.post("/recommendations/{recommendation_id}/collection-create-fix",
+             response_model=FixGenerateOut)
+def generate_collection_create_fix(recommendation_id,
+                                   conn=Depends(get_conn)):
+    """plan/25: turn an approved create_page recommendation into a
+    collection_create fix (status='generated').
+
+    The only fix path that runs with NO pages row: gates read
+    catalogue_coverage depth + proposed_url staleness + handle
+    collisions; the payload carries title/handle/descriptionHtml/seo/
+    products in ONE collectionCreate mutation. Policy is NOT enforced
+    here (generation runs while execution stays disabled; fix_policy
+    0 semantics)."""
+    from fixes.generator import (
+        generate_collection_create_fix_for_recommendation,
+        FixGenerationError, FixNotSupported)
+    from fixes.policy import PolicyBlocked
+
+    get_recommendation(conn, recommendation_id)  # 404 when unknown
+    try:
+        result = generate_collection_create_fix_for_recommendation(
+            conn, recommendation_id)
+    except FixNotSupported as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except PolicyBlocked as exc:
+        raise HTTPException(status_code=409, detail=f"fix conflict: {exc.reason}")
+    except FixGenerationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return FixGenerateOut(
+        fix_id=result["fix_id"],
+        recommendation_id=recommendation_id,
+        status=result["status"],
+        created=result["created"],
+        diff_json=result["diff"],
+    )
 
 
 @router.get("/recommendations/{recommendation_id}/fix", response_model=list[FixOut])

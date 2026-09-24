@@ -633,16 +633,71 @@ def load_decision_inputs(conn, recommendation_id):
         "cluster_id": str(row[5]) if row[5] else None,
         "status": row[6],
     }
-    if rec["action_type"] not in ("improve_page", "consolidate", "technical_fix"):
+    if rec["action_type"] not in ("improve_page", "consolidate",
+                                  "technical_fix", "create_page"):
         raise FixNotSupported(
-            f"fix generation covers improve_page/consolidate/technical_fix "
-            f"(got {rec['action_type']!r})")
-    if not rec["target_url"]:
-        raise FixNotSupported(f"{rec['action_type']} row has no target_url")
+            f"fix generation covers improve_page/consolidate/technical_fix/"
+            f"create_page (got {rec['action_type']!r})")
     if rec["status"] not in ("approved", "in_progress"):
         raise FixGenerationError(
             f"fix generation requires an approved recommendation "
             f"(current status: {rec['status']!r})")
+
+    # create_page (plan/25): the ONLY path that runs with NO pages row —
+    # a missing collection has no target_url, only proposed_url. The
+    # proposed_url becomes target_url for the rest of the pipeline
+    # (conflict guard + uq_fixes_active_per_target stay uniform).
+    if rec["action_type"] == "create_page":
+        if not rec.get("proposed_url"):
+            raise FixNotSupported(
+                "create_page row has no proposed_url — a missing-page "
+                "fix cannot target a guessed URL")
+        rec["target_url"] = rec["proposed_url"]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT r.evidence_json, "
+                "k.primary_keyword, k.intent, "
+                "cc.matching_product_ids, cc.matching_product_count, "
+                "cc.in_stock_product_count, cc.existing_collection_url, "
+                "s.domain "
+                "FROM recommendations r "
+                "LEFT JOIN keyword_clusters k ON k.cluster_id = r.cluster_id "
+                "LEFT JOIN catalogue_coverage cc "
+                "  ON cc.site_id = r.site_id AND cc.cluster_id = r.cluster_id "
+                "LEFT JOIN site_config s ON s.site_id = r.site_id "
+                "WHERE r.recommendation_id = %s",
+                (recommendation_id,),
+            )
+            crow = cur.fetchone()
+        if not crow:
+            raise FixGenerationError(
+                f"recommendation {recommendation_id} vanished mid-load")
+        try:
+            # psycopg2 auto-converts jsonb to dict; json.loads only for str.
+            rec["evidence"] = (crow[0] if isinstance(crow[0], dict)
+                               else json.loads(crow[0]) if crow[0] else {})
+        except (TypeError, ValueError):
+            rec["evidence"] = {}
+        rec["primary_keyword"] = crow[1]
+        rec["intent"] = crow[2]
+        rec["matching_product_ids"] = list(crow[3]) if crow[3] else []
+        rec["matching_product_count"] = int(crow[4] or 0)
+        rec["in_stock_product_count"] = int(crow[5] or 0)
+        rec["existing_collection_url"] = crow[6]
+        rec["domain"] = crow[7]
+        # No pages row by definition: the GID is minted by Shopify at
+        # execute time and persisted via snapshot_patch (plan/25 §2).
+        rec["shopify_gid"] = None
+        rec["page_title"] = rec["primary_keyword"]  # cluster-framed title input
+        rec["page_type"] = "collection"
+        rec["body_html"] = None
+        rec["body_text"] = ""
+        rec["competitor_context"] = load_competitor_context(
+            conn, rec["site_id"], rec["cluster_id"], rec["target_url"])
+        return rec
+
+    if not rec["target_url"]:
+        raise FixNotSupported(f"{rec['action_type']} row has no target_url")
 
     # technical_fix (Phase 3): the issue_type rides in primary_keyword
     # (plan/03 reuse); the page row supplies the write-target GID. The
@@ -931,8 +986,16 @@ def validator_extra_checks(draft, primary_keyword, product_title=None):
 
 
 def validate_title_draft(draft, primary_keyword, product_title=None,
-                         intent=None, site_name=None):
-    """Deterministic validator gate (plan/21 §2.1 hard constraints)."""
+                         intent=None, site_name=None,
+                         inherit_null_rule=True):
+    """Deterministic validator gate (plan/21 §2.1 hard constraints).
+
+    inherit_null_rule: the 'draft equals the product title' rejection
+    exists because Shopify stores product seo.title == product.title as
+    NULL (no-op write whose read-back reads null — Phase 1.5 live
+    finding). CollectionInput.seo has NO such inherit semantics, so the
+    collection_create path passes False (an seo title equal to the
+    collection title is a valid, verifiable write there)."""
     problems = []
     if not isinstance(draft, str) or not draft.strip():
         problems.append("draft is empty")
@@ -954,7 +1017,7 @@ def validate_title_draft(draft, primary_keyword, product_title=None,
     # product title') — a no-op whose read-back reads null. Phase 1.5 live
     # finding; such a draft can never pass the read-back verify.
     product = (product_title or "").strip()
-    if product and stripped == product:
+    if inherit_null_rule and product and stripped == product:
         problems.append("draft equals the product title — Shopify stores that "
                         "as null (no-op write)")
     # plan/21 §2.1 additions: caps/emoji/spam + keyword-in-first-half.
@@ -1370,7 +1433,14 @@ def generate_meta_fix_for_recommendation(conn, recommendation_id,
     body_text = rec.get("body_text")
 
     gate_meta = (live_meta_description if live_meta_description is not None
-                 else rec["page_meta_description"])
+                 else rec.get("page_meta_description"))
+    if gate_meta is None and rec.get("body_html") is None \
+            and not rec.get("page_title"):
+        # No page row at all (missing-page rec): the meta path targets an
+        # EXISTING entity — the collection_create path covers this rec.
+        raise FixNotSupported(
+            "target page has no pages row — meta fix cannot gate on a "
+            "live value (the collection_create path covers missing pages)")
     checks = meta_quality_checks(gate_meta, rec["primary_keyword"])
     if not checks["quality_failed"]:
         raise FixNotSupported(
@@ -2387,3 +2457,892 @@ def generate_status_failure_redirect_fix(conn, rec,
     # the consolidate path exactly.
     return generate_redirect_fix_for_recommendation(
         conn, redirect_rec, generation_source=generation_source)
+
+
+# ------------------------------------------------------------
+# collection_description (plan/24): collection body-copy rewrite path
+# ------------------------------------------------------------
+#
+# Target: pages.page_type='collection' whose ingested description
+# (pages.body_html — sync.py:295) is missing / thin / keyword-empty /
+# near-duplicated site-wide. Write: collectionUpdate(input: CollectionInput!)
+# field descriptionHtml (plan/21 §2.6 VERIFIED; scope write_products).
+
+COLLECTION_DESC_MIN_WORDS = 150
+COLLECTION_DESC_MAX_WORDS = 1000
+# Hallucination tripwire (plan/24 §3.2): the draft's content-token set must
+# overlap the grounding corpus (own body text + member-product titles +
+# cluster keyword) by at least this much — a draft full of vocabulary the
+# corpus cannot confirm is refused, never guessed.
+COLLECTION_DESC_OVERLAP_MIN = 0.35
+
+COLLECTION_UPDATE_DOC_URL = (
+    "https://shopify.dev/docs/api/admin-graphql/2026-01/mutations/collectionUpdate"
+)
+
+# Simple block HTML the sanitizer permits (plan/24 §3.2). Everything else
+# (script/style/event handlers/inline styles) is stripped deterministically;
+# un-parseable drafts are rejected, never guessed around.
+_ALLOWED_DESC_TAGS = frozenset(
+    {"p", "ul", "ol", "li", "strong", "em", "b", "i", "br", "h2", "h3"}
+)
+_DESC_SCRIPT_RE = re.compile(
+    r"<\s*(script|style|iframe|object|embed)[^>]*>.*?<\s*/\s*\1\s*>",
+    re.I | re.S)
+_DESC_DANGEROUS_ATTR_RE = re.compile(
+    r"""\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.I)
+_DESC_STYLE_ATTR_RE = re.compile(
+    r"""\sstyle\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.I)
+_DESC_TAG_RE = re.compile(r"<\s*(/?)([a-zA-Z][a-zA-Z0-9]*)[^>]*>")
+
+
+def _strip_desc_html(html):
+    """Sanitize collection-description HTML: keep allowed tags, drop
+    everything else. Returns the sanitized HTML string."""
+    html = _DESC_SCRIPT_RE.sub(" ", html or "")
+    html = _DESC_DANGEROUS_ATTR_RE.sub("", html)
+    html = _DESC_STYLE_ATTR_RE.sub("", html)
+
+    def _keep(match):
+        slash, name = match.group(1), match.group(2).lower()
+        if name in _ALLOWED_DESC_TAGS:
+            return f"<{slash}{name}>"
+        return " "
+
+    return _DESC_TAG_RE.sub(_keep, html)
+
+
+def _desc_word_count(text):
+    """Whitespace-split token count on stripped text (plan/24 §3.2)."""
+    return len((text or "").split())
+
+
+def collection_description_quality_checks(current_body_html,
+                                          primary_keyword):
+    """plan/24 §3.1: collection description missing / thin / keyword-empty /
+    near-duplicated (body_text_hash). A fix is generated only when at least
+    one check FAILS (only-fix-what's-broken)."""
+    text = _body_to_text(current_body_html)
+    words = _desc_word_count(text)
+    checks = {
+        "is_missing": not bool(text),
+        "thin_content": bool(text) and words < COLLECTION_DESC_MIN_WORDS,
+        "has_primary_kw": (bool(text) and bool(primary_keyword)
+                           and primary_keyword.lower() in text.lower()),
+    }
+    checks["quality_failed"] = (checks["is_missing"]
+                                or checks["thin_content"]
+                                or not checks["has_primary_kw"])
+    return checks
+
+
+def _grounding_corpus_text(conn, rec):
+    """The ONLY facts a collection draft may draw from: the collection's own
+    current body text + member-product titles and their OWN body sentences
+    (catalogue_coverage join, plan/24 §1). Competitor data never enters the
+    fact base. Returns (corpus_text, members) — members = list of
+    {"title", "text"} dicts feeding the drafter's tail guarantee; both stay
+    corpus-owned."""
+    parts = [(rec.get("page_title") or ""),
+             (rec.get("body_text") or "")]
+    members = []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.title, p.body_html
+            FROM catalogue_coverage cc
+            JOIN pages p ON p.site_id = cc.site_id
+              AND p.page_type = 'product'
+              AND p.shopify_gid = ANY (
+                  SELECT 'gid://shopify/Product/'
+                         || unnest(cc.matching_product_ids))
+            WHERE cc.site_id = %s AND cc.cluster_id = %s
+            LIMIT 20
+            """,
+            (rec["site_id"], rec["cluster_id"]),
+        )
+        for title, body in cur.fetchall():
+            text = _body_to_text(body)
+            if title:
+                members.append({"title": title, "text": text})
+            parts.append(title or "")
+            parts.append(text or "")
+    corpus = " ".join(parts)
+    if rec.get("primary_keyword"):
+        corpus = f"{rec['primary_keyword']} {corpus}"
+    return re.sub(r"\s+", " ", corpus).lower(), members
+
+
+def _duplicate_body_check(conn, site_id, draft_text, exclude_url):
+    """plan/24 §3.2: the draft's stripped text must not equal another
+    collection/product body site-wide (body_text_hash semantic)."""
+    normalized = re.sub(r"\s+", " ", (draft_text or "").strip()).lower()
+    if not normalized:
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*) FROM pages
+            WHERE site_id = %s
+              AND url <> %s
+              AND btrim(lower(regexp_replace(
+                    COALESCE(regexp_replace(body_html, '<[^>]+>', ' ', 'g'),
+                             ''), '\\s+', ' ', 'g'))) = %s
+            """,
+            (site_id, exclude_url, normalized),
+        )
+        return cur.fetchone()[0] > 0
+
+
+def sanitize_collection_html(draft_html):
+    """Sanitize + structure-check a draft collection description (plan/24
+    §3.2). Returns (clean_html, problems). Un-parseable or wholly non-block
+    drafts are rejected (deterministic, never guessed around)."""
+    problems = []
+    if not isinstance(draft_html, str) or not draft_html.strip():
+        return None, ["draft is empty"]
+    clean = _strip_desc_html(draft_html).strip()
+    if not clean:
+        return None, ["draft is empty after sanitization"]
+    text = _body_to_text(clean)
+    if not text:
+        return None, ["draft carries no visible text"]
+    words = _desc_word_count(text)
+    if words < COLLECTION_DESC_MIN_WORDS:
+        problems.append(f"too short ({words} words < "
+                        f"{COLLECTION_DESC_MIN_WORDS})")
+    if words > COLLECTION_DESC_MAX_WORDS:
+        problems.append(f"too long ({words} words > "
+                        f"{COLLECTION_DESC_MAX_WORDS})")
+    # Every tag that survived must be an allowed block tag (the strip
+    # already removed others; a malformed leftover means un-parseable).
+    for match in _DESC_TAG_RE.finditer(clean):
+        if match.group(2).lower() not in _ALLOWED_DESC_TAGS:
+            problems.append(f"disallowed tag <{match.group(2).lower()}>")
+            break
+    return clean, problems
+
+
+def _is_boilerplate_tail(sentence):
+    """True for the drafter's FIXED page-type tail lines (plan/24): the
+    sentence matches one of the exact boilerplate strings the deterministic
+    drafter may append. Exempting these from the overlap tripwire is safe —
+    they are page-type phrasing, not claims; anything with real specifics
+    (specs, numbers, materials) can never match verbatim."""
+    lowered = (sentence or "").strip().lower().rstrip(".")
+    return lowered in _BOILERPLATE_TAIL_SENTENCES
+
+
+# Exact tail lines the deterministic drafters may append (draft_meta_
+# description generator.py:1273-1282 + draft_collection_description tail
+# bits). Kept in one place so a new tail line must register here or the
+# validator will (correctly) judge it against the corpus.
+_BOILERPLATE_TAIL_SENTENCES = frozenset({
+    "compare models side by side and find your fit",
+    "browse the full range in one place",
+    "learn what makes it worth it",
+    "fast, free delivery and easy returns",
+    "shop now with fast delivery and easy returns",
+})
+
+
+def validate_collection_draft(draft_html, grounding_corpus,
+                              primary_keyword, intent=None):
+    """Deterministic collection-description validator (plan/24 §3.2).
+
+    Runs on the STRIPPED text of the draft HTML: length floor/ceiling in
+    WORDS, keyword presence, denylist/emoji/caps/spam, intent framing, and
+    the inverse token-overlap hallucination tripwire against the grounding
+    corpus. Returns a list of problems (empty = pass).
+    """
+    problems = []
+    clean, html_problems = sanitize_collection_html(draft_html)
+    problems.extend(html_problems)
+    if html_problems:
+        return problems
+    text = _body_to_text(clean)
+    if primary_keyword and primary_keyword.lower() not in text.lower():
+        problems.append("primary keyword missing")
+    problems.extend(_meta_denylint(text.lower()))
+    if _has_emoji(text):
+        problems.append("emoji in collection description")
+    if _caps_runs(text) >= 3:
+        problems.append("ALL-CAPS run (3+ shouted words)")
+    if re.search(r"(\W)\1{2,}", text):
+        problems.append("spam punctuation stack")
+    if intent in ("informational",):
+        commercial = any(cue in text.lower()
+                         for cue in INTENT_TRANSACTIONAL_CUES)
+        if commercial and not any(cue in text.lower()
+                                  for cue in INTENT_INFORMATIONAL_CUES):
+            problems.append(
+                f"intent mismatch ({intent} intent contradicted by "
+                "description framing)")
+    # Hallucination tripwire: the draft's content tokens must overlap the
+    # grounding corpus. Below the floor, the corpus cannot confirm the
+    # draft's vocabulary -> no fix (plan/24 §3.2). The measure runs on
+    # SENTENCES: a sentence whose tokens are (nearly) fully corpus-backed
+    # is grounded; the boilerplate page-type tail lines (plan/24 drafter's
+    # "Browse the full range…" / "Learn what makes it worth it." — fixed
+    # page-type phrasing, not claims) are EXEMPT so generic connective
+    # vocabulary can't sink an otherwise grounded draft. A sentence
+    # carrying REAL claims (specs, numbers, materials) can never pass on
+    # boilerplate exemption — its tokens are claim-specific.
+    draft_tokens = _content_tokens(text)
+    corpus_tokens = _content_tokens(grounding_corpus)
+    if not draft_tokens or not corpus_tokens:
+        problems.append("grounding corpus too thin to confirm the draft")
+        return problems
+    corpus_set = set(corpus_tokens)
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    ungrounded = []
+    for sentence in sentences:
+        sent_tokens = set(_content_tokens(sentence))
+        if not sent_tokens:
+            continue
+        overlap = len(sent_tokens & corpus_set) / len(sent_tokens)
+        if overlap >= COLLECTION_DESC_OVERLAP_MIN:
+            continue
+        if _is_boilerplate_tail(sentence):
+            continue
+        ungrounded.append(sentence[:60])
+    if ungrounded:
+        problems.append(
+            f"unsupported facts (sentences below the "
+            f"{COLLECTION_DESC_OVERLAP_MIN} grounding floor: "
+            f"{ungrounded[:3]})")
+    return problems
+
+
+def draft_collection_description(rec, members=None):
+    """Deterministic v0 collection-description draft (plan/24 §1.1).
+
+    FACTS strictly page-and-catalogue-owned: the collection's own current
+    body text + member-product titles and their OWN body sentences + the
+    cluster keyword. The SERP grounds ORDERING only (competitor hooks order
+    the page's OWN sentences, never supplying wording). Output is simple
+    block HTML: a lead <p>, grounded supporting sentences, then corpus-owned
+    catalogue lines until the 150-word floor is reachable. The validator
+    still gates the result; a failing draft means NO fix row.
+    """
+    page_title = (rec.get("page_title") or "").strip()
+    keyword = (rec.get("primary_keyword") or "").strip()
+    page_type = (rec.get("page_type") or "").strip()
+    body_text = (rec.get("body_text") or "").strip()
+    members = [
+        m for m in (members or [])
+        if isinstance(m, dict) and (m.get("title") or "").strip()]
+    if not page_title:
+        return None
+
+    competitor_leads = _competitor_snippet_leads(rec)
+
+    # Lead paragraph: the page's own first usable sentence, keyword-forward.
+    lead = ""
+    if body_text:
+        for sep in (". ", "! ", "? "):
+            idx = body_text.find(sep)
+            if idx != -1 and idx >= 20:
+                lead = body_text[:idx + 1].strip()
+                break
+        if not lead and len(body_text) >= 40:
+            lead = body_text[:200].strip()
+
+    lead_title = page_title
+    if keyword and _token_overlap(keyword, page_title) > TOKEN_OVERLAP_MAX:
+        lead_title = _merge_keyword_product_title(keyword, page_title) \
+            or page_title
+
+    lead_parts = [lead_title]
+    if lead and lead.lower() not in (page_title.lower(), lead_title.lower()):
+        lead_tokens = set(_content_tokens(lead_title))
+        novelty = 1.0
+        if lead_tokens:
+            lead_word_tokens = [w for w in _content_tokens(lead)]
+            novel = len(set(lead_word_tokens) - lead_tokens) \
+                / len(set(lead_word_tokens)) if lead_word_tokens else 1.0
+            novelty = novel
+        if novelty >= 0.5:
+            lead_parts.append(lead)
+
+    # Middle: grounded supporting sentences — the page's OWN body sentences
+    # matching the dominant competitor hook cues surface first (the FACT
+    # stays ours; the ORDER is competitor-informed).
+    supporting = []
+    if body_text:
+        for sentence in [s.strip() for s in body_text.split(". ")
+                         if s.strip()]:
+            sentence_full = sentence if sentence.endswith(".") \
+                else sentence + "."
+            for hook in competitor_leads:
+                if hook in sentence_full.lower():
+                    supporting.append(sentence_full)
+                    break
+            if len(supporting) >= 4:
+                break
+
+    paragraphs = ["<p>" + " — ".join(lead_parts) + "</p>"]
+    for sentence in supporting:
+        paragraphs.append(f"<p>{sentence}</p>")
+
+    # Tail guarantee: grounded catalogue lines complete the draft when the
+    # lead alone is thin (member-product titles + their OWN body sentences,
+    # corpus-owned — never competitor wording). Lines are added until the
+    # 150-word floor is reachable; the validator still gates the result.
+    draft_text = _body_to_text("".join(paragraphs))
+    if _desc_word_count(draft_text) < COLLECTION_DESC_MIN_WORDS:
+        for member in members:
+            title = (member.get("title") or "").strip()
+            text = (member.get("text") or "").strip()
+            if not title:
+                continue
+            line = f"{title}"
+            if text and text.lower() != title.lower():
+                line = f"{line} — {text}"
+            paragraphs.append(f"<p>{line}.</p>")
+            draft_text = _body_to_text("".join(paragraphs))
+            if _desc_word_count(draft_text) >= COLLECTION_DESC_MIN_WORDS:
+                break
+    if _desc_word_count(draft_text) < COLLECTION_DESC_MIN_WORDS:
+        tail_bits = []
+        titles = [(m.get("title") or "").strip() for m in members]
+        titles = [t for t in titles if t]
+        if titles:
+            tail_bits.append(
+                "<p>In this range: " + ", ".join(titles[:6]) + ".</p>")
+        if page_type == "collection":
+            tail_bits.append(
+                "<p>" + ("Compare models side by side and find your fit."
+                         if "compare" in competitor_leads
+                         else "Browse the full range in one place.") +
+                "</p>")
+        else:
+            tail_bits.append("<p>Learn what makes it worth it.</p>")
+        paragraphs.extend(tail_bits)
+
+    draft = "".join(paragraphs)
+    if keyword and keyword.lower() not in _body_to_text(draft).lower():
+        kw_title = keyword.title() if keyword.islower() else keyword
+        draft = f"<p>{kw_title}</p>{draft}"
+    return draft
+
+
+def build_collection_description_payload(gid, new_description_html):
+    """plan/24 §2.3: collectionUpdate(input: {id, descriptionHtml})."""
+    return {
+        "mutation": "collectionUpdate",
+        "variables": {"collection": {"id": gid,
+                                     "descriptionHtml": new_description_html}},
+        "scope_required": "write_products",
+        "doc_url": COLLECTION_UPDATE_DOC_URL,
+    }
+
+
+def generate_collection_description_fix_for_recommendation(
+        conn, recommendation_id, generation_source="deterministic",
+        live_body_html=None):
+    """Approved improve_page recommendation (collection target) ->
+    sub_type='collection_description' fix row (plan/24).
+
+    Same contract as generate_meta_fix_for_recommendation (idempotent,
+    conflict guard via uq_fixes_active_per_target, policy NOT enforced
+    here):
+      1. protect winners + consolidate suppression (shared guards)
+      2. description quality checks on the LIVE body_html when a fresh
+         read resolves, else pages.body_html — all-pass -> no fix
+      3. grounding corpus build -> deterministic draft (LLM candidates
+         re-routed here later) -> validator gate -> duplicate-body guard
+      4. INSERT generated_fixes (sub_type='collection_description',
+         risk 'medium')
+    """
+    rec = load_decision_inputs(conn, recommendation_id)
+
+    # Shared suppression gates (identical rationale to the title/meta path).
+    if protect_winner_check(conn, rec["site_id"], rec["target_url"]):
+        raise FixNotSupported(
+            "protect-winner rule: position ≤2 with rising CTR — "
+            "description rewrite suppressed (never rewrite what works)")
+    if rec.get("cluster_id"):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT recommendation_id FROM recommendations
+                WHERE site_id = %s AND cluster_id = %s
+                  AND action_type = 'consolidate'
+                  AND status IN ('raw', 'proposed', 'approved', 'in_progress')
+                  AND recommendation_id <> %s
+                LIMIT 1
+                """,
+                (rec["site_id"], rec["cluster_id"], rec["recommendation_id"]),
+            )
+            active_consolidate = cur.fetchone()
+        if active_consolidate:
+            raise FixNotSupported(
+                "consolidate suppression: an active consolidate "
+                "recommendation exists on this cluster — collection "
+                f"description fix suppressed (consolidating rec "
+                f"{active_consolidate[0]})")
+
+    if rec.get("page_type") != "collection":
+        raise FixNotSupported(
+            f"collection_description targets collection pages only "
+            f"(got page_type={rec.get('page_type')!r})")
+
+    site_name = None
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT site_name FROM site_config WHERE site_id = %s",
+            (rec["site_id"],),
+        )
+        srow = cur.fetchone()
+    site_name = srow[0] if srow else None
+    rec["site_name"] = site_name
+
+    gate_body = (live_body_html if live_body_html is not None
+                 else rec.get("body_html"))
+    checks = collection_description_quality_checks(gate_body,
+                                                   rec["primary_keyword"])
+    if not checks["quality_failed"]:
+        raise FixNotSupported(
+            "collection description passes all quality checks — no fix "
+            f"warranted (checks={checks})")
+
+    # Grounding corpus (plan/24 §1): own body + member products + keyword.
+    corpus, members = _grounding_corpus_text(conn, rec)
+
+    # LLM-first drafting with fact-check + validator gates and a
+    # deterministic fallback (soft-fail pipeline, never throws). The meta
+    # LLM path is char-bounded to snippet scale and can never satisfy a
+    # 150-word body floor, so the collection draft comes from the
+    # deterministic corpus-grounded drafter (plan/24 §1.1); LLM candidates
+    # re-route here only after a body-scale prompt lands.
+    drafted = draft_candidates_with_fallback(rec)
+    new_html = draft_collection_description(rec, members=members)
+    draft_source = "deterministic"
+    if drafted["rejected"]:
+        grounding_llm_rejected = [
+            r for r in drafted["rejected"] if r["field"] == "meta"]
+    else:
+        grounding_llm_rejected = []
+    if new_html is None:
+        raise FixNotSupported(
+            "collection description draft failed validation constraints "
+            "— no fix row")
+    problems = validate_collection_draft(new_html, corpus,
+                                         rec["primary_keyword"],
+                                         intent=rec.get("intent"))
+    if problems:
+        raise FixNotSupported(
+            f"collection draft rejected by validator: {problems}")
+
+    # plan/24 §3.2: no duplicate bodies site-wide.
+    if _duplicate_body_check(conn, rec["site_id"],
+                             _body_to_text(new_html),
+                             rec["target_url"]):
+        raise FixNotSupported(
+            "duplicate collection body: another page on this site already "
+            "uses the proposed description — draft rejected (plan/24 §3.2)")
+
+    gid = rec.get("shopify_gid")
+    if not gid:
+        raise FixNotSupported(
+            "target page has no shopify_gid — collection description fix "
+            "cannot target Shopify GraphQL")
+
+    conflict = check_conflict(conn, rec["site_id"], rec["target_url"],
+                              "collection_description")
+    if conflict:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT recommendation_id, fix_id, status, diff_json "
+                "FROM generated_fixes WHERE fix_id = %s", (conflict,))
+            row = cur.fetchone()
+        if row and str(row[0]) == str(rec["recommendation_id"]):
+            diff = row[3] if not isinstance(row[3], str) \
+                else json.loads(row[3])
+            return {"fix_id": str(row[1]), "status": row[2],
+                    "created": False, "diff": diff}
+        raise PolicyBlocked("active_fix_conflict",
+                            {"conflicting_fix_id": conflict})
+
+    payload = build_collection_description_payload(gid, new_html)
+    diff = [{"field": "collection.description_html",
+             "old_value": _body_to_text(gate_body),
+             "new_value": _body_to_text(new_html)}]
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT matching_product_count FROM catalogue_coverage "
+            "WHERE site_id = %s AND cluster_id = %s",
+            (rec["site_id"], rec["cluster_id"]),
+        )
+        coverage_row = cur.fetchone()
+    grounding = {
+        "member_products_considered":
+            int(coverage_row[0]) if coverage_row else 0,
+        "draft_source": draft_source,
+        "llm_candidates_rejected": grounding_llm_rejected,
+        "grounding_corpus_chars": len(corpus)}
+    payload["grounding"] = grounding
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO generated_fixes
+                    (recommendation_id, site_id, action_type, sub_type,
+                     target_url, target_entity_ref, payload_json, diff_json,
+                     generation_source, status, risk_tier)
+                VALUES (%s, %s, %s, 'collection_description', %s, %s,
+                        %s::jsonb, %s::jsonb, %s, 'generated', 'medium')
+                ON CONFLICT (site_id, target_url, COALESCE(sub_type, ''))
+                    WHERE status IN ('generated','approved','queued')
+                    DO NOTHING
+                RETURNING fix_id, status
+                """,
+                (rec["recommendation_id"], rec["site_id"],
+                 rec["action_type"], rec["target_url"], gid,
+                 json.dumps(payload), json.dumps(diff), generation_source),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if row:
+        return {"fix_id": str(row[0]), "status": row[1], "created": True,
+                "diff": diff, "payload": payload}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT fix_id, status FROM generated_fixes "
+            "WHERE recommendation_id = %s "
+            "AND sub_type = 'collection_description' "
+            "AND status IN ('generated','approved','queued') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (rec["recommendation_id"],),
+        )
+        existing = cur.fetchone()
+    if not existing:
+        raise FixGenerationError(
+            "insert conflicted but no active collection fix found")
+    return {"fix_id": str(existing[0]), "status": existing[1],
+            "created": False, "diff": diff, "payload": payload}
+
+
+# ------------------------------------------------------------
+# collection_create (plan/25): missing-collection-page creation path
+# ------------------------------------------------------------
+#
+# The FIRST fix path that runs with NO existing entity: an approved
+# create_page recommendation (generator 'missing_page', target_url NULL,
+# proposed_url='/collections/<slug>') mints ONE collectionCreate payload
+# carrying title, handle, descriptionHtml, seo {title, description}, and
+# the member product GIDs — then publishablePublish at execute time.
+# Revert is strictly publishableUnpublish (never delete, plan/25 §3.5).
+
+COLLECTION_CREATE_MIN_PRODUCTS = 10   # plan/06:90 depth floor
+COLLECTION_CREATE_MAX_PRODUCTS = 50   # per-call hygiene cap (grounding note when truncated)
+
+CREATE_COLLECTION_DOC_URL = (
+    "https://shopify.dev/docs/api/admin-graphql/2026-01/mutations/collectionCreate"
+)
+
+_HANDLE_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _slugify_handle(keyword):
+    """The EXACT slug rule plan/01:131 used to mint proposed_url — the
+    handle and the proposed URL agree by construction."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (keyword or "").lower().strip())
+    return slug.strip("-") or None
+
+
+def collection_create_gates(conn, rec):
+    """plan/25 §1.2 deterministic gates. Returns list of problems
+    (empty = all pass); each gate failure is a typed refusal reason."""
+    problems = []
+    if rec.get("matching_product_count", 0) < COLLECTION_CREATE_MIN_PRODUCTS:
+        problems.append(
+            f"insufficient catalogue depth "
+            f"({rec.get('matching_product_count', 0)} matching products < "
+            f"{COLLECTION_CREATE_MIN_PRODUCTS})")
+    if rec.get("existing_collection_url"):
+        problems.append(
+            "cluster already has a collection "
+            f"({rec['existing_collection_url']}) — improve_page covers it")
+    handle = _slugify_handle(rec.get("primary_keyword"))
+    if not handle or not _HANDLE_RE.match(handle) or len(handle) > 255:
+        problems.append(f"handle not slug-safe: {handle!r}")
+        return problems, handle
+    with conn.cursor() as cur:
+        # Still-missing gate: a pages row at the proposed URL means the
+        # rec is stale (the improve_page path covers existing pages).
+        cur.execute(
+            "SELECT count(*) FROM pages "
+            "WHERE site_id = %s AND url = %s",
+            (rec["site_id"], rec["target_url"]),
+        )
+        if cur.fetchone()[0] > 0:
+            problems.append(
+                "page already exists at the proposed URL — improve_page "
+                "path covers it")
+        # Handle collision: never auto-variant (plan/25 §1.2 #4).
+        cur.execute(
+            "SELECT count(*) FROM pages "
+            "WHERE site_id = %s AND url = %s",
+            (rec["site_id"],
+             f"https://{rec.get('domain')}/collections/{handle}"),
+        )
+        if cur.fetchone()[0] > 0:
+            problems.append(f"handle collision: /collections/{handle} "
+                            "already exists")
+        # Cannibalization: an indexable page already targeting the
+        # cluster's primary keyword.
+        kw = (rec.get("primary_keyword") or "").lower()
+        if kw:
+            cur.execute(
+                "SELECT count(*) FROM pages "
+                "WHERE site_id = %s AND indexable AND "
+                "position(%s in lower(title)) > 0",
+                (rec["site_id"], kw),
+            )
+            if cur.fetchone()[0] > 0:
+                problems.append(
+                    "an indexable page already targets the cluster's "
+                    "primary keyword — creating a collection would "
+                    "cannibalize it")
+    return problems, handle
+
+
+def build_collection_create_payload(title, handle, description_html,
+                                    seo_title, seo_description,
+                                    product_gids):
+    """plan/25 §2: ONE collectionCreate payload, all four surfaces."""
+    return {
+        "mutation": "collectionCreate",
+        "variables": {"collection": {
+            "title": title,
+            "handle": handle,
+            "descriptionHtml": description_html,
+            "seo": {"title": seo_title, "description": seo_description},
+            "products": list(product_gids),
+        }},
+        "scope_required": "write_products",
+        "doc_url": CREATE_COLLECTION_DOC_URL,
+    }
+
+
+def generate_collection_create_fix_for_recommendation(
+        conn, recommendation_id, generation_source="deterministic"):
+    """Approved create_page recommendation -> sub_type='collection_create'
+    fix row (plan/25). The only generator that runs with NO pages row.
+
+    Contract identical to the other generators (idempotent, conflict
+    guard via uq_fixes_active_per_target, policy NOT enforced here):
+      1. load via the create_page branch (no pages row; catalogue-
+         coverage grounding)
+      2. deterministic gates: depth / existing / handle collision /
+         cannibalization / consolidate suppression
+      3. draft title + handle + descriptionHtml + seo fields via the
+         EXISTING plan/24 drafters and validators
+      4. INSERT generated_fixes (sub_type='collection_create',
+         risk 'high', target_entity_ref NULL — GID minted at execute)
+    """
+    rec = load_decision_inputs(conn, recommendation_id)
+
+    # Consolidate suppression (shared rule; protect-winner N/A — no page).
+    if rec.get("cluster_id"):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT recommendation_id FROM recommendations
+                WHERE site_id = %s AND cluster_id = %s
+                  AND action_type = 'consolidate'
+                  AND status IN ('raw', 'proposed', 'approved', 'in_progress')
+                  AND recommendation_id <> %s
+                LIMIT 1
+                """,
+                (rec["site_id"], rec["cluster_id"], rec["recommendation_id"]),
+            )
+            active_consolidate = cur.fetchone()
+        if active_consolidate:
+            raise FixNotSupported(
+                "consolidate suppression: an active consolidate "
+                "recommendation exists on this cluster — collection "
+                f"create suppressed (consolidating rec "
+                f"{active_consolidate[0]})")
+
+    problems, handle = collection_create_gates(conn, rec)
+    if problems:
+        raise FixNotSupported(
+            f"collection create refused: {'; '.join(problems)}")
+
+    # Grounding corpus (plan/24 §1 join, unchanged) — member products +
+    # cluster keyword; the collection's own-body leg is empty by design.
+    corpus, members = _grounding_corpus_text(conn, rec)
+
+    # A missing page has NO page title: the cluster keyword IS the
+    # identity (plan/25 §1.1). Grounding page_title on the keyword keeps
+    # the overlap tripwire meaningful — every title token IS corpus-owned.
+    rec = dict(rec)
+    rec["page_title"] = rec.get("primary_keyword")
+
+    # --- title (collection-framed; existing title validators) ---
+    title = draft_title(rec)
+    if title:
+        t_problems = validate_title_draft(
+            title, rec.get("primary_keyword"),
+            product_title=rec.get("page_title"),
+            intent=rec.get("intent"))
+        if t_problems:
+            title = None
+    if not title:
+        raise FixNotSupported(
+            "collection title draft failed validation — no fix row")
+
+    # --- descriptionHtml (plan/24 machinery verbatim) ---
+    new_html = draft_collection_description(rec, members=members)
+    if new_html is None:
+        raise FixNotSupported(
+            "collection description draft failed — no fix row")
+    desc_problems = validate_collection_draft(
+        new_html, corpus, rec.get("primary_keyword"),
+        intent=rec.get("intent"))
+    if desc_problems:
+        raise FixNotSupported(
+            f"collection description rejected by validator: "
+            f"{desc_problems}")
+
+    # --- seo.title + seo.description (existing meta machinery) ---
+    rec_for_meta = dict(rec)
+    rec_for_meta["page_title"] = title
+    # A missing page has no body of its own: the drafted description IS
+    # the body source for the meta drafter (corpus-grounded by the
+    # validator above, so the meta inherits only confirmed facts).
+    rec_for_meta["body_text"] = _body_to_text(new_html)
+    seo_title = draft_title(rec_for_meta)
+    # inherit_null_rule=False: CollectionInput.seo has no product-style
+    # inherit-null semantics (plan/25 §1.4) — an seo title equal to the
+    # collection title is a valid, verifiable write on collections.
+    seo_problems = validate_title_draft(
+        seo_title, rec.get("primary_keyword"),
+        product_title=title, intent=rec.get("intent"),
+        inherit_null_rule=False) if seo_title else ["empty"]
+    if seo_problems:
+        raise FixNotSupported(
+            f"collection seo.title rejected by validator: {seo_problems}")
+    seo_description = draft_meta_description(rec_for_meta)
+    if seo_description:
+        seo_desc_problems = validate_meta_draft(
+            seo_description, rec.get("primary_keyword"),
+            intent=rec.get("intent"))
+        if seo_desc_problems:
+            seo_description = None
+    if not seo_description:
+        raise FixNotSupported(
+            "collection seo.description draft failed validation — "
+            "no fix row")
+    if duplicate_meta_check(conn, rec["site_id"], seo_description,
+                            exclude_url=rec["target_url"]):
+        raise FixNotSupported(
+            "duplicate meta description: another page on this site "
+            "already uses the proposed description — draft rejected")
+
+    # Cross-field grounding invariant (plan/25 §1.4.1): the cluster
+    # keyword must appear in title AND meta AND stripped body.
+    kw = (rec.get("primary_keyword") or "").lower()
+    stripped = _body_to_text(new_html).lower()
+    if kw and (kw not in title.lower() or kw not in seo_description.lower()
+               or kw not in stripped):
+        raise FixNotSupported(
+            "primary keyword missing from one of title/meta/body — "
+            "draft rejected")
+
+    handle = _slugify_handle(rec["primary_keyword"])
+    # Member GIDs: catalogue ids are raw Shopify product ids; the pages
+    # join in _grounding_corpus_text already proved the GID mapping for
+    # ingested members — reuse those rows so ids are always real GIDs.
+    product_gids = [
+        f"gid://shopify/Product/{pid}" for pid in rec["matching_product_ids"]
+    ][:COLLECTION_CREATE_MAX_PRODUCTS]
+
+    payload = build_collection_create_payload(
+        title, handle, new_html, seo_title, seo_description, product_gids)
+    payload["grounding"] = {
+        "member_products_attached": len(product_gids),
+        "member_products_total": rec["matching_product_count"],
+        "products_truncated":
+            rec["matching_product_count"] > len(product_gids),
+        "draft_source": "deterministic",
+        "grounding_corpus_chars": len(corpus)}
+    diff = [
+        {"field": "collection.title", "old_value": None,
+         "new_value": title},
+        {"field": "collection.handle", "old_value": None,
+         "new_value": handle},
+        {"field": "collection.seo_title", "old_value": None,
+         "new_value": seo_title},
+        {"field": "collection.seo_description", "old_value": None,
+         "new_value": seo_description},
+        {"field": "collection.description_html", "old_value": None,
+         "new_value": _body_to_text(new_html)},
+        {"field": "collection.products", "old_value": None,
+         "new_value": f"{len(product_gids)} member products attached"},
+    ]
+
+    conflict = check_conflict(conn, rec["site_id"], rec["target_url"],
+                              "collection_create")
+    if conflict:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT recommendation_id, fix_id, status, diff_json "
+                "FROM generated_fixes WHERE fix_id = %s", (conflict,))
+            row = cur.fetchone()
+        if row and str(row[0]) == str(rec["recommendation_id"]):
+            old_diff = row[3] if not isinstance(row[3], str) \
+                else json.loads(row[3])
+            return {"fix_id": str(row[1]), "status": row[2],
+                    "created": False, "diff": old_diff}
+        raise PolicyBlocked("active_fix_conflict",
+                            {"conflicting_fix_id": conflict})
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO generated_fixes
+                    (recommendation_id, site_id, action_type, sub_type,
+                     target_url, target_entity_ref, payload_json, diff_json,
+                     generation_source, status, risk_tier)
+                VALUES (%s, %s, %s, 'collection_create', %s, NULL,
+                        %s::jsonb, %s::jsonb, %s, 'generated', 'high')
+                ON CONFLICT (site_id, target_url, COALESCE(sub_type, ''))
+                    WHERE status IN ('generated','approved','queued')
+                    DO NOTHING
+                RETURNING fix_id, status
+                """,
+                (rec["recommendation_id"], rec["site_id"],
+                 rec["action_type"], rec["target_url"],
+                 json.dumps(payload), json.dumps(diff), generation_source),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if row:
+        return {"fix_id": str(row[0]), "status": row[1], "created": True,
+                "diff": diff, "payload": payload}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT fix_id, status FROM generated_fixes "
+            "WHERE recommendation_id = %s "
+            "AND sub_type = 'collection_create' "
+            "AND status IN ('generated','approved','queued') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (rec["recommendation_id"],),
+        )
+        existing = cur.fetchone()
+    if not existing:
+        raise FixGenerationError(
+            "insert conflicted but no active collection_create fix found")
+    return {"fix_id": str(existing[0]), "status": existing[1],
+            "created": False, "diff": diff, "payload": payload}

@@ -698,6 +698,7 @@ def required_scopes_for_sub_types(sub_types):
         "seo.title": ["productUpdate"],
         "seo.description": ["productUpdate"],
         "content": ["productUpdate", "collectionUpdate"],
+        "collection_description": ["collectionUpdate"],  # plan/24: descriptionHtml only
         "product_publish": ["productUpdate", "publishablePublish"],  # products OR collections (union)
         "product_publish_product": ["productUpdate"],  # products only: status write
         "collection_publish": ["publishablePublish"],  # collections only
@@ -705,7 +706,7 @@ def required_scopes_for_sub_types(sub_types):
         "collection_unpublish": ["publishableUnpublish"],  # collections only
         "article_body_link": ["articleUpdate"],
         "redirect": ["urlRedirectCreate", "urlRedirectUpdate", "urlRedirectDelete"],
-        "collection_create": ["collectionCreate"],
+        "collection_create": ["collectionCreate", "publishablePublish"],  # plan/25: create + publish (union)
         "product_create": ["productCreate"],
         "page_create": ["pageCreate"],
     }

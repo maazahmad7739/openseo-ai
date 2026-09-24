@@ -78,6 +78,11 @@ const FIELD_LABELS: Record<string, string> = {
   "seo.title": "Title tag",
   "seo.description": "Meta description",
   "collection.description_html": "Collection description",
+  "collection.title": "Collection title",
+  "collection.handle": "URL handle",
+  "collection.seo_title": "SEO title",
+  "collection.seo_description": "SEO description",
+  "collection.products": "Member products",
 };
 
 /**
@@ -134,6 +139,17 @@ function DiffPreviewText({ value }: { value?: string }) {
   );
 }
 
+// plan/25: create-type fields have no previous value by design — the
+// placeholder reads "creates it" rather than "no previous description".
+const EMPTY_OLD_LABELS: Record<string, string> = {
+  "collection.title": "nothing yet — this fix creates the collection",
+  "collection.handle": "nothing yet — this fix creates the URL",
+  "collection.seo_title": "nothing yet — this fix creates the SEO title",
+  "collection.seo_description": "nothing yet — this fix creates the SEO description",
+  "collection.description_html": "nothing yet — this fix creates the description",
+  "collection.products": "no products attached yet",
+};
+
 function DiffRow({ field, oldValue, newValue }: {
   field: string;
   oldValue?: string;
@@ -165,7 +181,9 @@ function DiffRow({ field, oldValue, newValue }: {
             <span className="shrink-0 rounded bg-error/10 px-1 font-mono text-[10px] font-bold text-error/50">
               −
             </span>
-            <span className="italic text-base-content/35">no previous description</span>
+            <span className="italic text-base-content/35">
+              {EMPTY_OLD_LABELS[field] ?? "no previous value"}
+            </span>
           </p>
         )}
         {hasNew ? (

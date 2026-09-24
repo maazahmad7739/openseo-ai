@@ -12,6 +12,7 @@ into adapter_response verbatim (never credentials).
 """
 
 import json
+import re
 
 import connectors.shopify as shopify_connector
 
@@ -1539,5 +1540,567 @@ ADAPTERS.update({
         "execute": collection_unpublish_execute,
         "restore": collection_unpublish_restore,
         "snapshot": collection_unpublish_snapshot,
+    },
+})
+
+
+# ------------------------------------------------------------
+# collection_description (sub_type 'collection_description') —
+# collectionUpdate(input: {id, descriptionHtml}) write path (plan/24 §2;
+# VERIFIED 2026-01: CollectionInput.descriptionHtml; scope write_products;
+# registry row exists in MUTATION_REGISTRY). Smart (rule-set) collections
+# answer the mutation with an async job — the verify path treats an
+# eventually-consistent read as verify_pending, NEVER as a failed write.
+# ------------------------------------------------------------
+
+COLLECTION_DESCRIPTION_READ_QUERY = """
+query FixCollectionDescriptionRead($id: ID!) {
+  collection(id: $id) { id descriptionHtml }
+}
+"""
+
+COLLECTION_DESCRIPTION_UPDATE_MUTATION = """
+mutation FixCollectionDescriptionUpdate($collection: CollectionInput!) {
+  collectionUpdate(collection: $collection) {
+    collection { id descriptionHtml }
+    job { id done }
+    userErrors { field message }
+  }
+}
+"""
+
+ADAPTER_COLLECTION_DESCRIPTION = "collection_description"
+
+# Smart-collection writes settle asynchronously: bounded read-back backoff
+# (plan/24 §2.1) before declaring the verify outcome. A still-stale read
+# after the window is verify_pending (no auto-revert on an eventually-
+# consistent read) — only a DEFINITIVE value mismatch after the window
+# is verify_failed (which the executor auto-reverts per plan/21 §5.3).
+_DESC_VERIFY_ATTEMPTS = 3
+_DESC_VERIFY_BACKOFF_SECONDS = 2.0
+
+
+def _collection_description_payload_for(payload_json):
+    """payload_json = {mutation, variables, scope_required, doc_url}.
+
+    Strict single-field discipline (plan/24 §2.2): ONLY {id,
+    descriptionHtml} may ride the CollectionInput — any title/ruleSet/
+    published key is a drift vector into surfaces this fix must never
+    touch (rule-set edits are an async job surface with different risk).
+    """
+    if not isinstance(payload_json, dict):
+        raise WriteAdapterError("payload_json is not an object")
+    mutation = payload_json.get("mutation")
+    if mutation != "collectionUpdate":
+        raise WriteAdapterError(
+            f"unsupported mutation for collection_description adapter: "
+            f"{mutation!r}")
+    variables = (payload_json.get("variables") or {}).get("collection") or {}
+    description = variables.get("descriptionHtml")
+    if not variables.get("id") or not isinstance(description, str):
+        raise WriteAdapterError(
+            "collectionUpdate payload must carry collection.id and "
+            "collection.descriptionHtml")
+    extra = set(variables.keys()) - {"id", "descriptionHtml"}
+    if extra:
+        raise WriteAdapterError(
+            "collection_description adapter writes ONLY descriptionHtml "
+            f"(no title/ruleSet drift through this path): {sorted(extra)}")
+    return variables
+
+
+def _collection_description_read(client, gid):
+    """Publication-free collection description read -> read envelope."""
+    return client.run("collection", COLLECTION_DESCRIPTION_READ_QUERY,
+                      {"id": gid})
+
+
+def _live_description(read):
+    collection = ((read.get("data") or {}).get("collection") or {})
+    return collection.get("descriptionHtml")
+
+
+def collection_description_execute(conn, fix_row, config, dry_run=False,
+                                   client=None):
+    """Apply one collection_description fix: write -> read-back verify.
+
+    Smart collections settle via an async job: a bounded backoff re-reads
+    the description before declaring verify_pending (still-stale) vs
+    verified (settled) vs verify_failed (definitive mismatch).
+    """
+    if client is None:
+        try:
+            client = _client_from_config(config)
+        except Exception as exc:
+            return {"ok": False, "outcome": "no_credentials",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+    gid = fix_row["target_entity_ref"]
+    try:
+        variables = _collection_description_payload_for(
+            fix_row["payload_json"])
+    except WriteAdapterError as exc:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": str(exc),
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+
+    new_html = variables["descriptionHtml"]
+    if dry_run:
+        return {"ok": True, "outcome": "dry_run",
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION,
+                "detail": {"mutation": "collectionUpdate", "gid": gid,
+                           "variables": variables}}
+
+    try:
+        write = client.run("collectionUpdate",
+                           COLLECTION_DESCRIPTION_UPDATE_MUTATION,
+                           {"collection": {"id": gid,
+                                           "descriptionHtml": new_html}})
+    except Exception as exc:
+        return {"ok": False, "outcome": "no_credentials", "detail": str(exc),
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+    if not write.get("ok"):
+        return {"ok": False,
+                "outcome": write.get("outcome", "provider_error"),
+                "userErrors": write.get("userErrors") or [],
+                "errors": write.get("errors") or [],
+                "detail": write.get("detail"),
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+
+    import time
+    live_html = None
+    verified = False
+    settled = False
+    # Smart (rule-set) collections answer with an async job: while the job
+    # is unsettled (job.done=false, plan/21:407), a stale read is
+    # verify_pending — NEVER verify_failed — so the executor does not
+    # auto-revert a write that likely landed. Only a mismatch on a
+    # synchronous write (no job / job.done=true) after the window is a
+    # definitive verify_failed.
+    job = ((write.get("data") or {}).get("collectionUpdate") or {}).get("job")
+    job_done = bool(job.get("done")) if isinstance(job, dict) else None
+    for attempt in range(_DESC_VERIFY_ATTEMPTS):
+        if attempt:
+            time.sleep(_DESC_VERIFY_BACKOFF_SECONDS)
+        verify = _collection_description_read(client, gid)
+        if not verify.get("ok"):
+            continue
+        live_html = _live_description(verify)
+        if live_html == new_html:
+            verified = True
+            settled = True
+            break
+        if isinstance(live_html, str) and live_html != new_html:
+            # A DIFFERENT value: definitive only on a synchronous write —
+            # an unsettled async job stays verify_pending (plan/24 §2.1).
+            settled = (job_done is not False
+                       and attempt == _DESC_VERIFY_ATTEMPTS - 1)
+    return {
+        "ok": True,
+        "outcome": "ok",
+        "verified": verified,
+        "verification_status": ("verified" if verified
+                                else "verify_pending" if not settled
+                                else "verify_failed"),
+        "live_value": live_html,
+        "adapter": ADAPTER_COLLECTION_DESCRIPTION,
+        "adapter_response": {"write": _safe_response(write)},
+    }
+
+
+def collection_description_snapshot(conn, fix_row, config, client=None):
+    """FRESH READ pre-state at pickup: the collection's live
+    descriptionHtml (plan/24 §2.4). A failed read returns ok=False and
+    the executor fails the fix (snapshot_failed) — generation-time
+    old_values are never trusted for the restore path."""
+    if client is None:
+        try:
+            client = _client_from_config(config)
+        except Exception as exc:
+            return {"ok": False, "outcome": "no_credentials",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+    gid = fix_row["target_entity_ref"]
+    read = _collection_description_read(client, gid)
+    if not read.get("ok"):
+        return {"ok": False, "outcome": read.get("outcome", "provider_error"),
+                "userErrors": read.get("userErrors") or [],
+                "errors": read.get("errors") or [],
+                "detail": read.get("detail"),
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+    collection = (read.get("data") or {}).get("collection") or {}
+    if not collection.get("id"):
+        return {"ok": False, "outcome": "not_found",
+                "detail": "collection read returned no collection object",
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+    return {"ok": True, "outcome": "ok",
+            "snapshot": {
+                "description_html": collection.get("descriptionHtml"),
+                "title": collection.get("title"),
+                "read_at_api_version": read.get("api_version"),
+            },
+            "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+
+
+def collection_description_restore(conn, fix_row, config, client=None):
+    """Rollback: write the pickup snapshot's descriptionHtml back.
+
+    A missing snapshot refuses (typed no_snapshot) — never a guessed
+    restore value (plan/24 §2.4)."""
+    if client is None:
+        try:
+            client = _client_from_config(config)
+        except Exception as exc:
+            return {"ok": False, "outcome": "no_credentials",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+    snapshot = fix_row.get("snapshot_json") or {}
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError):
+            snapshot = {}
+    old_html = (snapshot.get("description_html")
+                if isinstance(snapshot, dict) else None)
+    if not isinstance(old_html, str):
+        return {"ok": False, "outcome": "no_snapshot",
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION,
+                "detail": "snapshot_json missing description_html — "
+                          "refusing to guess a restore value"}
+    gid = fix_row["target_entity_ref"]
+    try:
+        write = client.run(
+            "collectionUpdate", COLLECTION_DESCRIPTION_UPDATE_MUTATION,
+            {"collection": {"id": gid, "descriptionHtml": old_html}})
+    except Exception as exc:
+        return {"ok": False, "outcome": "no_credentials", "detail": str(exc),
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+    if not write.get("ok"):
+        return {"ok": False, "outcome": write.get("outcome", "provider_error"),
+                "userErrors": write.get("userErrors") or [],
+                "errors": write.get("errors") or [],
+                "detail": write.get("detail"),
+                "adapter": ADAPTER_COLLECTION_DESCRIPTION}
+    verify = _collection_description_read(client, gid)
+    live_html = _live_description(verify) if verify.get("ok") else None
+    restored = bool(verify.get("ok")) and live_html == old_html
+    return {"ok": True, "outcome": "ok", "restored": restored,
+            "live_value": live_html,
+            "adapter": ADAPTER_COLLECTION_DESCRIPTION,
+            "adapter_response": {"write": _safe_response(write),
+                                 "verify": _safe_response(verify)}}
+
+
+ADAPTERS.update({
+    "collection_description": {
+        "execute": collection_description_execute,
+        "restore": collection_description_restore,
+        "snapshot": collection_description_snapshot,
+    },
+})
+
+
+# ------------------------------------------------------------
+# collection_create (sub_type 'collection_create') — the FIRST write path
+# with NO pre-existing entity (plan/25 §3). Sequence: collectionCreate ->
+# snapshot_patch(created_gid) -> publishablePublish -> read-back verify.
+# Revert is STRICTLY publishableUnpublish — never collectionDelete (the
+# operator may have enriched the collection between apply and revert;
+# unpublish restores the exact pre-fix public state: no public page).
+# ------------------------------------------------------------
+
+COLLECTION_CREATE_MUTATION = """
+mutation FixCollectionCreate($collection: CollectionInput!) {
+  collectionCreate(collection: $collection) {
+    collection { id title handle descriptionHtml seo { title description } }
+    userErrors { field message }
+  }
+}
+"""
+
+ADAPTER_COLLECTION_CREATE = "collection_create"
+
+_CREATE_ALLOWED_FIELDS = frozenset(
+    {"title", "handle", "descriptionHtml", "seo", "products"})
+_CREATE_ALLOWED_SEO = frozenset({"title", "description"})
+# Real stores can carry non-numeric Shopify ids (hex/legacy forms seen in
+# fixtures and older shops) — require the GID SHAPE, not decimal digits.
+_PRODUCT_GID_RE = re.compile(r"^gid://shopify/Product/[0-9a-zA-Z]+$")
+
+
+def _collection_create_payload_for(payload_json):
+    """Strict allowlist (plan/25 §3.2): exactly {title, handle,
+    descriptionHtml, seo, products}; seo limited to {title, description};
+    product ids must be real GIDs. Anything else (ruleSet, templateSuffix,
+    redirectNewHandle, image, metafields, publications) is a drift vector
+    -> payload_invalid BEFORE any network call."""
+    if not isinstance(payload_json, dict):
+        raise WriteAdapterError("payload_json is not an object")
+    mutation = payload_json.get("mutation")
+    if mutation != "collectionCreate":
+        raise WriteAdapterError(
+            f"unsupported mutation for collection_create adapter: "
+            f"{mutation!r}")
+    variables = (payload_json.get("variables") or {}).get("collection") or {}
+    extra = set(variables.keys()) - _CREATE_ALLOWED_FIELDS
+    if extra:
+        raise WriteAdapterError(
+            "collection_create payload carries disallowed fields "
+            f"(no ruleSet/templateSuffix drift): {sorted(extra)}")
+    missing = {"title", "handle"} - set(variables.keys())
+    if missing:
+        raise WriteAdapterError(
+            f"collectionCreate payload missing required fields: "
+            f"{sorted(missing)}")
+    seo = variables.get("seo") or {}
+    if seo and set(seo.keys()) - _CREATE_ALLOWED_SEO:
+        raise WriteAdapterError(
+            "collectionCreate seo limited to {title, description}")
+    products = variables.get("products") or []
+    if not isinstance(products, list) or not products:
+        raise WriteAdapterError(
+            "collectionCreate must attach at least one member product")
+    for gid in products:
+        if not isinstance(gid, str) or not _PRODUCT_GID_RE.match(gid):
+            raise WriteAdapterError(
+                f"collectionCreate products carry a non-GID member: "
+                f"{gid!r}")
+    return variables
+
+
+def _collection_by_handle_read(client, handle):
+    query = """
+query FixCollectionByHandle($handle: String!) {
+  collectionByHandle(handle: $handle) {
+    id
+    title
+    handle
+    descriptionHtml
+    seo { title description }
+  }
+}
+"""
+    return client.run("collectionByHandle", query, {"handle": handle})
+
+
+def collection_create_snapshot(conn, fix_row, config, client=None):
+    """FRESH READ pre-state at pickup — the ONE special case where
+    "entity does not exist" is a VALID pre-state (plan/25 §3.4):
+      * collectionByHandle -> null  => {"exists": False} (proceed)
+      * collectionByHandle -> found => {"exists": True} (the executor's
+        stale-diff guard fails the fix BEFORE the create fires — the
+        only sub_type where the stale guard runs in the positive
+        direction)."""
+    if client is None:
+        try:
+            client = _client_from_config(config)
+        except Exception as exc:
+            return {"ok": False, "outcome": "no_credentials",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "adapter": ADAPTER_COLLECTION_CREATE}
+    payload_json = fix_row.get("payload_json") or {}
+    if isinstance(payload_json, str):
+        try:
+            payload_json = json.loads(payload_json)
+        except (TypeError, ValueError):
+            payload_json = {}
+    variables = ((payload_json.get("variables") or {})
+                 .get("collection") or {}) if isinstance(payload_json, dict) else {}
+    handle = variables.get("handle")
+    if not handle:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": "collection_create payload carries no handle",
+                "adapter": ADAPTER_COLLECTION_CREATE}
+    read = _collection_by_handle_read(client, handle)
+    if not read.get("ok"):
+        return {"ok": False, "outcome": read.get("outcome", "provider_error"),
+                "userErrors": read.get("userErrors") or [],
+                "errors": read.get("errors") or [],
+                "detail": read.get("detail"),
+                "adapter": ADAPTER_COLLECTION_CREATE}
+    existing = (read.get("data") or {}).get("collectionByHandle")
+    return {"ok": True, "outcome": "ok",
+            "snapshot": {
+                "exists": bool(existing),
+                "handle": handle,
+                "existing_gid": (existing or {}).get("id"),
+                "read_at_api_version": read.get("api_version"),
+            },
+            "adapter": ADAPTER_COLLECTION_CREATE}
+
+
+def collection_create_execute(conn, fix_row, config, dry_run=False,
+                              client=None):
+    """Create -> snapshot_patch(created_gid) -> publish -> verify.
+
+    Typed outcomes:
+      ok/verified            — created + published + read-back matched
+      create_publish_failed  — collection EXISTS (created_gid in detail)
+                               but publish failed; NOT auto-undone: the
+                               entity is operator-visible, a human
+                               decides (publish by hand or delete).
+      provider_error         — create itself failed; nothing to revert.
+    """
+    if client is None:
+        try:
+            client = _client_from_config(config)
+        except Exception as exc:
+            return {"ok": False, "outcome": "no_credentials",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "adapter": ADAPTER_COLLECTION_CREATE}
+    try:
+        variables = _collection_create_payload_for(
+            fix_row["payload_json"])
+    except WriteAdapterError as exc:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": str(exc),
+                "adapter": ADAPTER_COLLECTION_CREATE}
+    handle = variables["handle"]
+
+    if dry_run:
+        return {"ok": True, "outcome": "dry_run",
+                "adapter": ADAPTER_COLLECTION_CREATE,
+                "detail": {"mutation": "collectionCreate",
+                           "handle": handle,
+                           "variables": variables}}
+
+    try:
+        write = client.run("collectionCreate", COLLECTION_CREATE_MUTATION,
+                           {"collection": variables})
+    except Exception as exc:
+        return {"ok": False, "outcome": "no_credentials", "detail": str(exc),
+                "adapter": ADAPTER_COLLECTION_CREATE}
+    if not write.get("ok"):
+        return {"ok": False,
+                "outcome": write.get("outcome", "provider_error"),
+                "userErrors": write.get("userErrors") or [],
+                "errors": write.get("errors") or [],
+                "detail": write.get("detail"),
+                "adapter": ADAPTER_COLLECTION_CREATE}
+    created = ((write.get("data") or {}).get("collectionCreate") or {})
+    user_errors = created.get("userErrors") or []
+    collection = created.get("collection") or {}
+    if user_errors or not collection.get("id"):
+        return {"ok": False, "outcome": "provider_error",
+                "userErrors": user_errors,
+                "errors": [],
+                "detail": f"collectionCreate userErrors: {user_errors}",
+                "adapter": ADAPTER_COLLECTION_CREATE}
+    created_gid = collection["id"]
+
+    # Publish step (cached publication id — same path as collection_publish).
+    publication_id = _publication_id_from_config(conn, config)
+    if not publication_id:
+        return {"ok": False, "outcome": "create_publish_failed",
+                "detail": f"collection created ({created_gid}) but no "
+                          "publication id cached — publish by hand or "
+                          "retry; NOT auto-undone",
+                "adapter": ADAPTER_COLLECTION_CREATE,
+                "snapshot_patch": {"collection.created_gid": created_gid},
+                "adapter_response": {"create": _safe_response(write)}}
+    try:
+        publish = client.run(
+            "publishablePublish", COLLECTION_PUBLISH_MUTATION,
+            {"id": created_gid,
+             "input": [{"publicationId": publication_id}],
+             "publicationId": publication_id})
+    except Exception as exc:
+        return {"ok": False, "outcome": "create_publish_failed",
+                "detail": f"collection created ({created_gid}) but "
+                          f"publish raised: {exc} — NOT auto-undone",
+                "adapter": ADAPTER_COLLECTION_CREATE,
+                "snapshot_patch": {"collection.created_gid": created_gid},
+                "adapter_response": {"create": _safe_response(write)}}
+    if not publish.get("ok"):
+        return {"ok": False, "outcome": "create_publish_failed",
+                "userErrors": publish.get("userErrors") or [],
+                "errors": publish.get("errors") or [],
+                "detail": f"collection created ({created_gid}) but "
+                          "publish failed — NOT auto-undone",
+                "adapter": ADAPTER_COLLECTION_CREATE,
+                "snapshot_patch": {"collection.created_gid": created_gid},
+                "adapter_response": {"create": _safe_response(write),
+                                     "publish": _safe_response(publish)}}
+
+    verify = _collection_by_handle_read(client, handle)
+    live = ((verify.get("data") or {}).get("collectionByHandle") or {})
+    verified = (bool(verify.get("ok")) and live.get("id") == created_gid
+                and live.get("title") == variables["title"])
+    return {
+        "ok": True,
+        "outcome": "ok",
+        "verified": verified,
+        "verification_status": "verified" if verified else "verify_failed",
+        "live_value": live.get("title"),
+        "adapter": ADAPTER_COLLECTION_CREATE,
+        "snapshot_patch": {"collection.created_gid": created_gid},
+        "adapter_response": {"create": _safe_response(write),
+                             "publish": _safe_response(publish),
+                             "verify": _safe_response(verify)},
+    }
+
+
+def collection_create_restore(conn, fix_row, config, client=None):
+    """Rollback: STRICTLY publishableUnpublish of the created collection
+    (plan/25 §3.5). NEVER collectionDelete — the operator may have
+    enriched the entity between apply and revert; unpublish returns the
+    storefront to the exact pre-fix public state (no public page)."""
+    if client is None:
+        try:
+            client = _client_from_config(config)
+        except Exception as exc:
+            return {"ok": False, "outcome": "no_credentials",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "adapter": ADAPTER_COLLECTION_CREATE}
+    snapshot = fix_row.get("snapshot_json") or {}
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError):
+            snapshot = {}
+    created_gid = (snapshot.get("collection.created_gid")
+                   if isinstance(snapshot, dict) else None)
+    if not created_gid:
+        return {"ok": False, "outcome": "no_snapshot",
+                "adapter": ADAPTER_COLLECTION_CREATE,
+                "detail": "snapshot_json missing collection.created_gid — "
+                          "refusing to guess what to unpublish"}
+    publication_id = _publication_id_from_config(conn, config)
+    if not publication_id:
+        return {"ok": False, "outcome": "no_publication_id",
+                "adapter": ADAPTER_COLLECTION_CREATE,
+                "detail": "no cached publication id — cannot unpublish"}
+    try:
+        write = client.run(
+            "publishableUnpublish", COLLECTION_UNPUBLISH_MUTATION,
+            {"id": created_gid,
+             "input": [{"publicationId": publication_id}],
+             "publicationId": publication_id})
+    except Exception as exc:
+        return {"ok": False, "outcome": "no_credentials", "detail": str(exc),
+                "adapter": ADAPTER_COLLECTION_CREATE}
+    if not write.get("ok"):
+        return {"ok": False, "outcome": write.get("outcome", "provider_error"),
+                "userErrors": write.get("userErrors") or [],
+                "errors": write.get("errors") or [],
+                "detail": write.get("detail"),
+                "adapter": ADAPTER_COLLECTION_CREATE}
+    verify = client.run("collection", PUBLISHABLE_READ_QUERY,
+                        _publication_read_variables(created_gid,
+                                                    publication_id))
+    _, live_published = _extract_publishable_state(verify)
+    restored = bool(verify.get("ok")) and live_published is False
+    return {"ok": True, "outcome": "ok", "restored": restored,
+            "live_value": live_published,
+            "adapter": ADAPTER_COLLECTION_CREATE,
+            "adapter_response": {"unpublish": _safe_response(write),
+                                 "verify": _safe_response(verify)}}
+
+
+ADAPTERS.update({
+    "collection_create": {
+        "execute": collection_create_execute,
+        "restore": collection_create_restore,
+        "snapshot": collection_create_snapshot,
     },
 })

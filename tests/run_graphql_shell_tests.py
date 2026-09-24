@@ -165,8 +165,10 @@ def test_scope_gate():
           required_scopes_for_sub_types(["redirect"]) == ["write_online_store_navigation"])
     check("page_create maps to write_content (registry-derived)",
           required_scopes_for_sub_types(["page_create"]) == ["write_content"])
-    check("collection_create maps to write_products (registry-derived, verified)",
-          required_scopes_for_sub_types(["collection_create"]) == ["write_products"])
+    check("collection_create maps to the create+publish union (plan/25: "
+          "collectionCreate + publishablePublish)",
+          required_scopes_for_sub_types(["collection_create"]) ==
+          ["write_products", "write_publications"])
     check("gate set covers all five scopes",
           set(REQUIRED_WRITE_SCOPES) >= {"write_products", "write_publications",
                                          "write_online_store_navigation", "write_content"})
