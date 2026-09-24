@@ -27,6 +27,21 @@ router = APIRouter(tags=["measurements"])
 # UPDATE so the transition and the due date can never diverge. The column is a
 # display projection; the measurement clock computes its own due condition from
 # implemented_at + window + GSC_SETTLE_DAYS and never reads this column.
+def _approve_if_proposed(cur, recommendation_id):
+    """3-stage kanban: implementing a 'proposed' row implies approval.
+
+    The operator can only act on rows the pipeline view shows — and those
+    land in APPROVED as 'proposed' (agent-validated). Rather than force a
+    separate approve round-trip, record approved_at and move on. Idempotent:
+    a no-op for rows already 'approved'.
+    """
+    cur.execute(
+        "UPDATE recommendations SET status = 'approved', approved_at = now() "
+        "WHERE recommendation_id = %s AND status = 'proposed'",
+        (recommendation_id,),
+    )
+
+
 def _transition_to_in_progress(cur, recommendation_id, implemented_at, assigned_to):
     """Transition UPDATE that also recomputes measurement_due_at (single statement)."""
     cur.execute(
@@ -64,13 +79,15 @@ def _load_json(value):
 @router.post("/recommendations/{recommendation_id}/implement", response_model=ImplementOut)
 def implement(recommendation_id, body: ImplementRequest, conn=Depends(get_conn)):
     rec = get_recommendation(conn, recommendation_id)
-    if rec["status"] != "approved":
+    if rec["status"] not in ("approved", "proposed"):
         raise HTTPException(
             status_code=409,
-            detail=f"implement requires status 'approved' (current: '{rec['status']}')",
+            detail=f"implement requires status 'approved' or 'proposed' "
+                   f"(current: '{rec['status']}')",
         )
     implemented_at = body.implemented_at
     with conn.cursor() as cur:
+        _approve_if_proposed(cur, recommendation_id)
         _transition_to_in_progress(cur, recommendation_id, implemented_at, body.assigned_to)
     if rec["action_type"] == "create_page":
         from measurement.baseline import store_cluster_baseline
@@ -99,13 +116,15 @@ def implement_safe(recommendation_id, body: ImplementRequest, conn=Depends(get_c
     what was degraded so the operator/UI can see it honestly.
     """
     rec = get_recommendation(conn, recommendation_id)
-    if rec["status"] != "approved":
+    if rec["status"] not in ("approved", "proposed"):
         raise HTTPException(
             status_code=409,
-            detail=f"implement requires status 'approved' (current: '{rec['status']}')",
+            detail=f"implement requires status 'approved' or 'proposed' "
+                   f"(current: '{rec['status']}')",
         )
     implemented_at = body.implemented_at
     with conn.cursor() as cur:
+        _approve_if_proposed(cur, recommendation_id)
         _transition_to_in_progress(cur, recommendation_id, implemented_at, body.assigned_to)
     if rec["action_type"] == "create_page":
         from measurement.baseline import store_cluster_baseline
@@ -119,6 +138,7 @@ def implement_safe(recommendation_id, body: ImplementRequest, conn=Depends(get_c
     except Exception as exc:  # never-crash policy: transition wins
         conn.rollback()
         with conn.cursor() as cur:
+            _approve_if_proposed(cur, recommendation_id)
             _transition_to_in_progress(cur, recommendation_id, implemented_at, body.assigned_to)
         baseline_info = {
             "degraded": f"baseline skipped: {type(exc).__name__}",

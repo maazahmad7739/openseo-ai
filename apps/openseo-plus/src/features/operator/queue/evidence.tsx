@@ -1,6 +1,7 @@
 import { CheckCircle2, ScrollText, Wrench } from "lucide-react";
 import type { EvidenceItem, WorkRequiredItem } from "../data/types";
 import { Chip } from "../components/Badge";
+import { ExecutionTypeBadge } from "../components/WorkTaskList";
 
 /** Badge for the source of an evidence finding (GSC / catalogue / SERP / crawl). */
 export function SourceBadge({ source }: { source: EvidenceItem["source"] }) {
@@ -68,7 +69,8 @@ export function WorkRequiredList({
           <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-base-content/30" />
           <div className="min-w-0 leading-relaxed">
             <p className="text-base-content/85">
-              <span className="font-medium">{item.task}</span>
+              <ExecutionTypeBadge executionType={item.execution_type} />
+              <span className="ml-2 font-medium">{item.task}</span>
             </p>
             <p className="text-xs text-base-content/50">
               <span className="font-medium text-base-content/60">{item.owner}</span>

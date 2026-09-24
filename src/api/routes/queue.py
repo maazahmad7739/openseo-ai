@@ -26,6 +26,72 @@ logger = logging.getLogger("api.queue")
 
 router = APIRouter(prefix="/queue", tags=["queue"])
 
+# Task text patterns the fix engine can execute end-to-end (generated_fixes
+# rows exist for these sub_types: 'seo.title', 'seo.description', 'redirect').
+# Anything else degrades to 'manual' — theme/Liquid edits, schema code
+# injections, sitemap/content work the operator does by hand.
+_AUTOMATED_TASK_PATTERNS = (
+    "meta description",
+    "meta title",
+    "page title",
+    "title tag",
+    "301",
+    "redirect",
+)
+
+
+def _classify_execution_type(task: str) -> str:
+    lowered = (task or "").lower()
+    return "automated" if any(p in lowered for p in _AUTOMATED_TASK_PATTERNS) else "manual"
+
+
+def enrich_work_tasks(work, fix_rows):
+    """Attach execution_type + fix linkage to work_required_json tasks.
+
+    fix_rows: (fix_id, sub_type, status) tuples of this recommendation's
+    generated_fixes rows. A task classified 'automated' links to the row by
+    sub_type (title task -> seo.title, description task -> seo.description,
+    redirect task -> redirect); unmatched automated tasks stay fix-less and
+    the UI shows Drafted as the implicit default.
+    """
+    if not isinstance(work, list):
+        return work
+    by_sub_type = {}
+    for fix_id, sub_type, status in fix_rows or []:
+        by_sub_type.setdefault(sub_type, (fix_id, status))
+    enriched = []
+    for task in work:
+        if not isinstance(task, dict):
+            enriched.append(task)
+            continue
+        item = dict(task)
+        item["execution_type"] = _classify_execution_type(item.get("task") or "")
+        if item["execution_type"] == "automated":
+            lowered = (item.get("task") or "").lower()
+            if "redirect" in lowered or "301" in lowered:
+                sub_type = "redirect"
+            elif "meta description" in lowered:
+                sub_type = "seo.description"
+            elif "description" in lowered:
+                sub_type = "seo.description"
+            else:
+                sub_type = "seo.title"
+            fix = by_sub_type.get(sub_type)
+            if fix:
+                item["fix_id"], item["fix_status"] = str(fix[0]), fix[1]
+        enriched.append(item)
+    return enriched
+
+
+def _load_fix_rows(conn, recommendation_id):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT fix_id, sub_type, status FROM generated_fixes "
+            "WHERE recommendation_id = %s ORDER BY created_at",
+            (recommendation_id,),
+        )
+        return cur.fetchall()
+
 # Active-pipeline router: operator visibility for approved + in_progress rows
 # (ActionQueue renders only 'proposed', Results only 'measured' — and the
 # states in between were previously invisible; see bugfix brief).
@@ -366,6 +432,11 @@ def get_queue_detail(recommendation_id, conn=Depends(get_conn)):
             rec["recommendation_id"],
         )
 
+    # Execution split (automated vs manual) + fix linkage per task: the UI
+    # renders Auto-fix badges / fix statuses for engine-supported tasks and a
+    # manual checklist for the rest. Cheap sub_type lookup on generated_fixes.
+    parsed_work = enrich_work_tasks(parsed_work, _load_fix_rows(conn, rec["recommendation_id"]))
+
     conn.rollback()
     return QueueDetailOut(
         recommendation_id=rec["recommendation_id"],
@@ -377,7 +448,7 @@ def get_queue_detail(recommendation_id, conn=Depends(get_conn)):
         cluster_id=rec["cluster_id"],
         diagnosis=rec["diagnosis"],
         evidence_json=_parse_jsonb(rec["evidence_json"]),
-        work_required_json=_parse_jsonb(rec["work_required_json"]),
+        work_required_json=parsed_work,
         impact=rec["impact"],
         confidence=rec["confidence"],
         effort=rec["effort"],
@@ -406,11 +477,13 @@ def get_pipeline(
     site_id,
     conn=Depends(get_conn),
 ):
-    """Active pipeline: approved + in_progress rows the operator needs visibility on.
+    """Active pipeline (3-stage kanban): approved, in_progress, measured-pending.
 
-    ActionQueue only renders 'proposed' rows; ResultsDashboard only renders
-    'measured' rows.  This endpoint surfaces the states in between so
-    nothing drops from the operator's view.
+    Stage mapping: agent-enriched 'proposed' rows land directly in the
+    APPROVED column (the pipeline view maps them to status='approved' —
+    ready to implement). 'approved' + 'in_progress' rows render natively.
+    ActionQueue still renders raw DB 'proposed' rows for rejection flow;
+    the pipeline no longer surfaces a separate PROPOSED stage.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -418,17 +491,18 @@ def get_pipeline(
             SELECT r.recommendation_id, r.site_id, r.generator, r.action_type,
                    r.target_url, r.proposed_url, r.diagnosis, r.impact, r.status,
                    r.approved_at, r.implemented_at, r.assigned_to,
-                   r.measurement_due_at, mwl.measurement_window_days,
+                   r.measurement_due_at, r.work_required_json,
+                   mwl.measurement_window_days,
                    COALESCE((kc.search_volume)::int, 0) AS search_volume,
                    kc.primary_keyword
             FROM recommendations r
             LEFT JOIN measurement_window_lookup mwl ON mwl.action_type = r.action_type
             LEFT JOIN keyword_clusters kc ON kc.cluster_id = r.cluster_id
             WHERE r.site_id = %s
-              AND r.status IN ('approved', 'in_progress')
+              AND r.status IN ('proposed', 'approved', 'in_progress')
             ORDER BY
-                CASE r.status WHEN 'approved' THEN 1 ELSE 2 END,
-                COALESCE(r.implemented_at, r.approved_at) DESC NULLS LAST
+                CASE r.status WHEN 'approved' THEN 1 WHEN 'proposed' THEN 1 ELSE 2 END,
+                COALESCE(r.implemented_at, r.approved_at, r.created_at) DESC NULLS LAST
             """,
             (site_id,),
         )
@@ -439,10 +513,14 @@ def get_pipeline(
     today = request.scope.get("today", date.today())
     items: list[PipelineItemOut] = []
     for r in rows:
+        # 3-stage kanban mapping: agent-validated 'proposed' rows ARE the
+        # APPROVED column (land ready-to-implement); raw DB status is
+        # unchanged so ActionQueue/reject flow keeps its contract.
+        stage = "approved" if r["status"] == "proposed" else r["status"]
         window = r["measurement_window_days"]
         imp = r["implemented_at"]
         days_remaining = None
-        if r["status"] == "in_progress" and window and imp:
+        if stage == "in_progress" and window and imp:
             imp_date = imp.date() if hasattr(imp, "date") else imp
             due = imp_date + timedelta(days=window)
             days_remaining = max(int((due - today).days), 0)
@@ -455,7 +533,7 @@ def get_pipeline(
             proposed_url=r["proposed_url"],
             diagnosis=r["diagnosis"],
             impact=r["impact"],
-            status=r["status"],
+            status=stage,
             approved_at=r["approved_at"],
             implemented_at=r["implemented_at"],
             assigned_to=r["assigned_to"],
@@ -464,6 +542,10 @@ def get_pipeline(
             measurement_due_at=r.get("measurement_due_at"),
             search_volume=r["search_volume"] if r["search_volume"] else None,
             primary_keyword=r["primary_keyword"],
+            work_tasks=enrich_work_tasks(
+                _parse_jsonb_queue(r.get("work_required_json")),
+                _load_fix_rows(conn, r["recommendation_id"]),
+            ),
         ))
 
     return PipelineOut(

@@ -1,5 +1,9 @@
 """Measurement clock (brief §2.1): measure + classify for `live` rows past window.
 
+3-stage kanban: rows live out their observation window in IN PROGRESS
+(status 'in_progress' or 'live') and move to MEASURED automatically when
+the window closes — no operator "mark live" step in the happy path.
+
 Scheduler-agnostic; cron or manual. All dates injectable — no now() hidden
 inputs. Idempotent: a job re-run produces no duplicate snapshots (delete-before
 rewrite for the same rec) and no re-classification drift (persist is a pure
@@ -22,7 +26,8 @@ from measurement.thresholds import GSC_SETTLE_DAYS  # noqa: E402
 
 
 def run_measurement_sweep(conn, reference_date=None, site_id=None):
-    """For every recommendation in 'live' past its window: measure + classify.
+    """For every recommendation in 'in_progress'/'live' past its window:
+    measure + classify (3-stage kanban MEASURED landing).
 
     Window check: implemented_at + measurement_window_lookup[action_type] days
     + GSC_SETTLE_DAYS <= reference_date (default: today UTC — visible parameter
@@ -38,10 +43,11 @@ def run_measurement_sweep(conn, reference_date=None, site_id=None):
         reference_date = date.today()
     with conn.cursor() as cur:
         sql = (
-            "SELECT r.recommendation_id, r.action_type, r.implemented_at "
+            "SELECT r.recommendation_id, r.action_type, r.implemented_at, r.status "
             "FROM recommendations r "
             "JOIN measurement_window_lookup mwl ON mwl.action_type = r.action_type "
-            "WHERE r.status = 'live' AND r.implemented_at IS NOT NULL "
+            "WHERE r.status IN ('in_progress', 'live') "
+            "AND r.implemented_at IS NOT NULL "
             "AND r.implemented_at::date + mwl.measurement_window_days "
             "    + %s::int <= %s::date"
         )
@@ -53,7 +59,16 @@ def run_measurement_sweep(conn, reference_date=None, site_id=None):
         due = cur.fetchall()
 
     measured, pending, skipped = [], [], []
-    for rec_id, action_type, implemented_at in due:
+    for rec_id, action_type, implemented_at, rec_status in due:
+        # 3-stage kanban: sweep handles 'in_progress' rows directly — the
+        # operator no longer needs a mark-live click before MEASURED.
+        if rec_status == "in_progress":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE recommendations SET status = 'live' "
+                    "WHERE recommendation_id = %s AND status = 'in_progress'",
+                    (rec_id,),
+                )
         window = resolve_window_days(conn, action_type)
         # Post-window anchor: implementation date + window, NOT including the
         # settle days — settle shifts WHEN the sweep fires, not WHAT the post

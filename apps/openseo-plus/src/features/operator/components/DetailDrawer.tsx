@@ -32,6 +32,7 @@ import {
   StatusBadge,
 } from "./Badge";
 import { actionTypeMeta } from "./meta";
+import { WorkTaskList } from "./WorkTaskList";
 
 /** Raw detail payload from GET /queue/{recommendation_id}. */
 export interface RecommendationDetail {
@@ -43,7 +44,14 @@ export interface RecommendationDetail {
   proposed_url: string | null;
   diagnosis: string;
   evidence_json: Array<{ source: string; finding: string; value?: string }> | null;
-  work_required_json: Array<{ owner: string; task: string; acceptance_criteria: string }> | null;
+  work_required_json: Array<{
+    owner: string;
+    task: string;
+    acceptance_criteria: string;
+    execution_type?: "automated" | "manual";
+    fix_id?: string;
+    fix_status?: string;
+  }> | null;
   impact: ImpactLevel;
   confidence: ConfidenceLevel;
   effort: EffortLevel;
@@ -105,9 +113,11 @@ export function useRecommendationDetail(id: string | null) {
 export function DetailDrawer({
   recommendationId,
   onClose,
+  projectId,
 }: {
   recommendationId: string | null;
   onClose: () => void;
+  projectId?: string;
 }) {
   const detail = useRecommendationDetail(recommendationId);
 
@@ -134,7 +144,7 @@ export function DetailDrawer({
           recommendationId ? "translate-x-0" : "translate-x-full"
         }`}
       >
-        <DrawerBody detail={detail} onClose={onClose} />
+        <DrawerBody detail={detail} onClose={onClose} projectId={projectId} />
       </aside>
     </div>
   );
@@ -143,9 +153,11 @@ export function DetailDrawer({
 function DrawerBody({
   detail,
   onClose,
+  projectId,
 }: {
   detail: ReturnType<typeof useRecommendationDetail>;
   onClose: () => void;
+  projectId?: string;
 }) {
   return (
     <>
@@ -188,7 +200,7 @@ function DrawerBody({
         ) : (
           <div className="flex flex-col gap-5 pb-8">
             <WhyItMatters detail={detail.data} />
-            <WorkRequired detail={detail.data} />
+            <WorkRequired detail={detail.data} projectId={projectId} />
             <EvidenceBlock detail={detail.data} />
             <SerpComparison detail={detail.data} />
             <CatalogueBlock detail={detail.data} />
@@ -262,37 +274,22 @@ function WhyItMatters({ detail }: { detail: RecommendationDetail }) {
   );
 }
 
-function WorkRequired({ detail }: { detail: RecommendationDetail }) {
+function WorkRequired({
+  detail,
+  projectId,
+}: {
+  detail: RecommendationDetail;
+  projectId?: string;
+}) {
   const work = detail.work_required_json ?? [];
   if (work.length === 0) return null;
   return (
     <SectionCard title="Exact work required" icon={<FileText />}>
-      <div className="flex flex-col gap-3">
-        {work.map((item, i) => (
-          <div key={i} className="rounded-lg border border-base-200 p-3">
-            <div className="flex items-center gap-2">
-              <span className="rounded bg-base-200 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-base-content/60">
-                {item.owner}
-              </span>
-              <span className="text-xs text-base-content/40">task {i + 1}</span>
-            </div>
-            <p className="mt-1.5 text-sm font-medium text-base-content">
-              {item.task}
-            </p>
-            <p className="mt-1 flex items-start gap-1.5 text-xs leading-relaxed text-base-content/55">
-              <span className="mt-0.5 shrink-0 font-semibold text-success">
-                ✓
-              </span>
-              <span>
-                <span className="font-medium text-base-content/60">
-                  Acceptance:
-                </span>{" "}
-                {item.acceptance_criteria}
-              </span>
-            </p>
-          </div>
-        ))}
-      </div>
+      <WorkTaskList
+        work={work as never}
+        recommendationId={detail.recommendation_id}
+        projectId={projectId}
+      />
     </SectionCard>
   );
 }

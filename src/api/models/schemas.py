@@ -201,6 +201,7 @@ class PipelineItemOut(BaseModel):
     observation_window_days: Optional[int] = None
     days_remaining: Optional[int] = None
     measurement_due_at: Optional[datetime] = None
+    work_tasks: Optional[List[dict]] = None
 
 
 class PipelineOut(BaseModel):

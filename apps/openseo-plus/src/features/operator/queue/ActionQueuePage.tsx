@@ -325,6 +325,7 @@ const hasFilters =
       <DetailDrawer
         recommendationId={detailId}
         onClose={() => setDetailId(null)}
+        projectId={projectId}
       />
     </div>
   );

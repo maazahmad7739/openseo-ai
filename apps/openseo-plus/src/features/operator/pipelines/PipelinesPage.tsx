@@ -24,8 +24,8 @@ const RUN_META: Record<
   measurement: { label: "Measurement" },
 };
 
-/** Horizontal kanban of the recommendation lifecycle: proposed → approved →
- * in progress (incl. live) → measured. */
+/** Horizontal kanban of the 3-stage lifecycle: approved (audit-validated,
+ * ready to implement) → in progress (observation window) → measured. */
 export function PipelinesPage({ projectId }: { projectId: string }) {
   const data = useOperatorData(projectId);
   const rows = data.data?.recommendations ?? EMPTY_RECS;
@@ -33,7 +33,6 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
 
   const byStage = useMemo(
     () => ({
-      proposed: rows.filter((r) => r.status === "proposed"),
       approved: rows.filter((r) => r.status === "approved"),
       inProgress: rows.filter(
         (r) => r.status === "in_progress" || r.status === "live",
@@ -87,14 +86,9 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
           tone={inObservation > 0 ? "good" : "neutral"}
         />
         <KpiCard
-          label="Proposed"
-          value={byStage.proposed.length}
-          sub="awaiting operator decision"
-        />
-        <KpiCard
-          label="Approved"
+          label="Ready to implement"
           value={byStage.approved.length}
-          sub="committed to implementation"
+          sub="audit-validated, awaiting action"
         />
         <KpiCard
           label="Measured"
@@ -116,24 +110,6 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
       <div className="app-panel h-[calc(100vh-240px)] min-h-[320px] overflow-hidden">
         <div className="kanban-scroll h-full overflow-x-auto p-4">
           <div className="flex h-full gap-4 pb-1">
-            <PipelineColumn
-              title="Proposed"
-              accentColor="bg-violet-400"
-              count={byStage.proposed.length}
-            >
-              {byStage.proposed.length === 0 ? (
-                <ColumnEmpty text="No proposed recommendations" />
-              ) : (
-                byStage.proposed.map((rec) => (
-                  <PipelineCard
-                    key={rec.recommendation_id}
-                    rec={rec}
-                    onOpenDetail={setDetailId}
-                  />
-                ))
-              )}
-            </PipelineColumn>
-
             <PipelineColumn
               title="Approved"
               accentColor="bg-emerald-500"
@@ -169,10 +145,6 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
                     key={rec.recommendation_id}
                     rec={rec}
                     onOpenDetail={setDetailId}
-                    onMarkLive={(id) => {
-                      data.markLive(id);
-                      toast.success("Marked live — outcome will be measured at window close");
-                    }}
                   />
                 ))
               )}
@@ -202,6 +174,7 @@ export function PipelinesPage({ projectId }: { projectId: string }) {
       <DetailDrawer
         recommendationId={detailId}
         onClose={() => setDetailId(null)}
+        projectId={projectId}
       />
     </div>
   );

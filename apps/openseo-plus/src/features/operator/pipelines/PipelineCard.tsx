@@ -1,8 +1,10 @@
 import {
   CalendarClock,
+  ListChecks,
   TimerReset,
 } from "lucide-react";
 import type { Recommendation } from "../data/types";
+import { taskProgress } from "../data/useOperatorData";
 import {
   ActionTypeBadge,
   GeneratorBadge,
@@ -117,17 +119,16 @@ function fmtVol(volume: number | null | undefined): string | null {
 export function PipelineCard({
   rec,
   onImplement,
-  onMarkLive,
   onOpenDetail,
 }: {
   rec: Recommendation;
   onImplement?: (id: string) => void;
-  onMarkLive?: (id: string) => void;
   onOpenDetail?: (id: string) => void;
 }) {
   const url = rec.target_url ?? rec.proposed_url;
   const { summary } = splitDiagnosis(rec.diagnosis);
   const volume = fmtVol(rec.search_volume);
+  const progress = taskProgress(rec);
 
   return (
     <div
@@ -163,15 +164,30 @@ export function PipelineCard({
         {summary}
       </p>
 
-      {/* Footer: owner, status, observation, stage actions */}
+      {/* Footer: owner, status, observation, task progress, stage actions */}
       <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-base-200 pt-2.5">
         <OwnerBadgeSolid owner={rec.owner} />
-        {rec.status !== "proposed" ? <StatusBadge status={rec.status} /> : null}
+        {rec.status !== "approved" || !onImplement ? (
+          <StatusBadge status={rec.status} />
+        ) : null}
         {rec.status === "in_progress" || rec.status === "live" ? (
           <DueCountdown
             dueAt={rec.measurement_due_at}
             implementedAt={rec.implemented_at}
           />
+        ) : null}
+        {progress.total > 0 ? (
+          <span
+            className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium tabular-nums ring-1 ring-inset ${
+              progress.done === progress.total
+                ? "tag-chip-emerald"
+                : "tag-chip-slate"
+            }`}
+            title={`${progress.done} of ${progress.total} tasks completed (auto-fix tasks count when applied; manual tasks when checked off in detail)`}
+          >
+            <ListChecks className="size-3" />
+            {progress.done}/{progress.total} tasks completed
+          </span>
         ) : null}
         {rec.status === "approved" && onImplement ? (
           <button
@@ -184,19 +200,6 @@ export function PipelineCard({
             title="Mark as implemented: capture baseline, start observation window"
           >
             Implement
-          </button>
-        ) : null}
-        {rec.status === "in_progress" && onMarkLive ? (
-          <button
-            type="button"
-            className="btn btn-xs btn-outline ml-auto"
-            onClick={(e) => {
-              e.stopPropagation();
-              onMarkLive(rec.recommendation_id);
-            }}
-            title="Change is live in production"
-          >
-            Mark live
           </button>
         ) : null}
       </div>

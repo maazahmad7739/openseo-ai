@@ -182,6 +182,10 @@ def main():
                        plan.get("metric"))
         allok &= check("measurement_plan.window matches lookup value 28d",
                        plan.get("window_days") == 28, str(plan))
+        tasks = d.get("work_required_json") or []
+        allok &= check("work tasks carry execution_type",
+                       tasks and tasks[0].get("execution_type") in ("automated", "manual"),
+                       str(tasks))
 
         # --- decision flow on promoted seeds ---
         print("\n== decision flow ==")

@@ -14,6 +14,7 @@ import type {
   RecommendationStats,
   RecommendationStatus,
   ResultClass,
+  WorkRequiredItem,
 } from "./types";
 
 // All API calls must target /api/*. Vercel serves the FastAPI backend at
@@ -77,6 +78,7 @@ interface ApiPipelineItem {
   observation_window_days: number | null;
   days_remaining: number | null;
   measurement_due_at: string | null;
+  work_tasks: WorkRequiredItem[] | null;
 }
 
 interface ApiPipelineOut {
@@ -223,6 +225,64 @@ function mapQueueItem(
   return { rec, stats };
 }
 
+/** Defensive parse of a work_tasks-ish value into typed items.
+ * Returns [] on anything malformed — task lists simply hide, never crash. */
+export function parseWorkTasks(value: unknown): WorkRequiredItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is WorkRequiredItem =>
+      item != null &&
+      typeof item === "object" &&
+      typeof (item as WorkRequiredItem).task === "string",
+  );
+}
+
+/* Manual task completion tracking. Automated tasks derive their status from
+ * generated_fixes; manual tasks are operator-tracked client-side (localStorage
+ * keyed by recommendation + task index). */
+const MANUAL_DONE_KEY = "openseo.manualTaskDone";
+
+export function readManualTaskDone(): Record<string, boolean> {
+  try {
+    return JSON.parse(
+      localStorage.getItem(MANUAL_DONE_KEY) ?? "{}",
+    ) as Record<string, boolean>;
+  } catch {
+    return {};
+  }
+}
+
+export function writeManualTaskDone(key: string, done: boolean) {
+  const current = readManualTaskDone();
+  if (done) current[key] = true;
+  else delete current[key];
+  try {
+    localStorage.setItem(MANUAL_DONE_KEY, JSON.stringify(current));
+  } catch {
+    /* storage unavailable — checkbox is best-effort UI state */
+  }
+}
+
+export function manualTaskKey(recommendationId: string, index: number): string {
+  return `${recommendationId}:${index}`;
+}
+
+/** Count completed tasks for a recommendation: automated tasks count when
+ * their fix reached 'applied', manual tasks when the operator ticked them. */
+export function taskProgress(
+  rec: Pick<Recommendation, "recommendation_id" | "work_required_json">,
+  manualDone: Record<string, boolean> = readManualTaskDone(),
+): { done: number; total: number } {
+  const tasks = rec.work_required_json ?? [];
+  const done = tasks.filter((task, index) => {
+    if (task.execution_type === "automated") {
+      return task.fix_status === "applied";
+    }
+    return manualDone[manualTaskKey(rec.recommendation_id, index)] ?? false;
+  }).length;
+  return { done, total: tasks.length };
+}
+
 /** Defensive parse of an evidence_json-ish value into typed items.
  * Returns [] on anything malformed — chips simply hide, never crash. */
 function parseEvidence(value: unknown): EvidenceItem[] {
@@ -280,7 +340,7 @@ function mapPipelineItem(item: ApiPipelineItem): Recommendation {
     proposed_url: item.proposed_url,
     diagnosis: item.diagnosis,
     evidence_json: [],
-    work_required_json: [],
+    work_required_json: parseWorkTasks(item.work_tasks),
     primary_keyword: item.primary_keyword,
     search_volume: item.search_volume,
     impact: item.impact as ImpactLevel,
@@ -373,15 +433,6 @@ function mapRecentItem(item: ApiRecentItem): MeasuredResult {
     after: [],
     summary: item.diagnosis ?? "",
   };
-}
-
-function mergeById(recommendations: Recommendation[]): Recommendation[] {
-  const seen = new Set<string>();
-  return recommendations.filter((rec) => {
-    if (seen.has(rec.recommendation_id)) return false;
-    seen.add(rec.recommendation_id);
-    return true;
-  });
 }
 
 async function loadQueue(siteId: string) {
@@ -523,11 +574,24 @@ export function useOperatorData(siteId: string) {
 
   const data = useMemo<OperatorData | undefined>(() => {
     if (!queue.data || !pipeline.data || !results.data) return undefined;
+    // 3-stage kanban: the pipeline endpoint owns the board (it maps
+    // agent-validated 'proposed' rows to the approved stage). Queue rows
+    // only fill gaps the pipeline does not already carry, and a queue row
+    // must never overwrite a pipeline stage with the raw 'proposed' status.
+    const seen = new Set<string>();
+    const recommendations: Recommendation[] = [];
+    for (const rec of pipeline.data.recommendations) {
+      if (seen.has(rec.recommendation_id)) continue;
+      seen.add(rec.recommendation_id);
+      recommendations.push(rec);
+    }
+    for (const rec of queue.data.recommendations) {
+      if (seen.has(rec.recommendation_id)) continue;
+      seen.add(rec.recommendation_id);
+      recommendations.push(rec);
+    }
     return {
-      recommendations: mergeById([
-        ...queue.data.recommendations,
-        ...pipeline.data.recommendations,
-      ]),
+      recommendations,
       stats: queue.data.stats,
       measured: results.data.measured,
       runs: EMPTY_RUNS,

@@ -48,10 +48,27 @@ export interface EvidenceItem {
   value?: string;
 }
 
+/** Fix-engine lifecycle status for automated tasks (generated_fixes.status).
+ * 'generated' is rendered as Drafted. */
+export type FixStatus =
+  | "generated"
+  | "approved"
+  | "queued"
+  | "applied"
+  | "failed"
+  | "reverted"
+  | "expired";
+
 export interface WorkRequiredItem {
   owner: Owner;
   task: string;
   acceptance_criteria: string;
+  /** automated = fix engine supports it (title, meta description, 301);
+   * manual = operator does it by hand (Liquid theme, schema injection…). */
+  execution_type?: "automated" | "manual";
+  /** generated_fixes row linked to this task (automated only). */
+  fix_id?: string;
+  fix_status?: FixStatus;
 }
 
 export interface Recommendation {
