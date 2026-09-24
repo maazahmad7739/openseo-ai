@@ -80,8 +80,16 @@ PUB_ID = f"gid://shopify/Publication/{RUN_TOKEN[:6]}"
 
 
 class FakeCreateClient:
+    # resolve_publication_id inspects these (real client attrs) — the fake
+    # carries None so the resolver's credential guard is exercised.
+    shop_domain = "fake.example.com"
+    access_token = "fake"
+
     def run(self, mutation_name, query, variables=None, **kwargs):
         STATE.mutations.append(mutation_name)
+        if mutation_name == "publications":
+            return {"ok": True, "data": {"publications": {"nodes": [
+                {"id": PUB_ID, "title": "Online Store"}]}}}
         if mutation_name == "collectionByHandle":
             handle = (variables or {}).get("handle")
             rec = STATE.created.get(handle)
@@ -547,28 +555,40 @@ def test_adapter(conn):
                            f"unpub={STATE.unpublished_gids} "
                            f"del={STATE.deleted_gids}")
 
-            # missing publication id -> same typed outcome
-            fix_adapters._publication_id_from_config = (
-                lambda conn, config: None)
-            STATE = FakeCreateState()
-            client3 = FakeCreateClient()
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM generated_fixes WHERE fix_id = %s",
-                            (out2["fix_id"],))
-            conn.commit()
-            out3 = generate_collection_create_fix_for_recommendation(
-                conn, ids["rec_id"])
-            result3 = adapter["execute"](conn,
-                                         {"fix_id": out3["fix_id"],
-                                          "target_entity_ref": None,
-                                          "payload_json": out3["payload"],
-                                          "diff_json": out3["diff"],
-                                          "snapshot_json": None},
-                                         config={}, dry_run=False,
-                                         client=client3)
-            allok &= check("no publication id -> create_publish_failed",
-                           result3.get("outcome") == "create_publish_failed",
-                           str(result3)[:160])
+            # unresolvable publication id -> same typed outcome. Both the
+            # config peek AND the resolver must return None (the resolver
+            # now falls back to a live publications query — patch it at
+            # the source module since the adapter imports lazily).
+            import connectors.shopify as shopify_conn
+            real_resolve = shopify_conn.resolve_publication_id
+            shopify_conn.resolve_publication_id = (
+                lambda conn, client: None)
+            try:
+                fix_adapters._publication_id_from_config = (
+                    lambda conn, config: None)
+                STATE = FakeCreateState()
+                client3 = FakeCreateClient()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM generated_fixes WHERE fix_id = %s",
+                        (out2["fix_id"],))
+                conn.commit()
+                out3 = generate_collection_create_fix_for_recommendation(
+                    conn, ids["rec_id"])
+                result3 = adapter["execute"](conn,
+                                             {"fix_id": out3["fix_id"],
+                                              "target_entity_ref": None,
+                                              "payload_json": out3["payload"],
+                                              "diff_json": out3["diff"],
+                                              "snapshot_json": None},
+                                             config={}, dry_run=False,
+                                             client=client3)
+                allok &= check(
+                    "no publication id -> create_publish_failed",
+                    result3.get("outcome") == "create_publish_failed",
+                    str(result3)[:160])
+            finally:
+                shopify_conn.resolve_publication_id = real_resolve
         finally:
             fix_adapters._publication_id_from_config = real_pub
     finally:

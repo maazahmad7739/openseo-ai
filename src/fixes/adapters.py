@@ -1991,12 +1991,19 @@ def collection_create_execute(conn, fix_row, config, dry_run=False,
                 "adapter": ADAPTER_COLLECTION_CREATE}
     created_gid = collection["id"]
 
-    # Publish step (cached publication id — same path as collection_publish).
+    # Publish step: resolve the publication id via the shared resolver
+    # (system_config cache -> one publications query -> cache back). The
+    # bare config-peek alone returns None on stores where nothing has
+    # cached yet — that created the collection and then refused to
+    # publish it (plan/25 typed outcome) on first-ever runs.
     publication_id = _publication_id_from_config(conn, config)
+    if not publication_id:
+        from connectors.shopify import resolve_publication_id
+        publication_id = resolve_publication_id(conn, client)
     if not publication_id:
         return {"ok": False, "outcome": "create_publish_failed",
                 "detail": f"collection created ({created_gid}) but no "
-                          "publication id cached — publish by hand or "
+                          "publication id resolved — publish by hand or "
                           "retry; NOT auto-undone",
                 "adapter": ADAPTER_COLLECTION_CREATE,
                 "snapshot_patch": {"collection.created_gid": created_gid},
@@ -2070,9 +2077,12 @@ def collection_create_restore(conn, fix_row, config, client=None):
                           "refusing to guess what to unpublish"}
     publication_id = _publication_id_from_config(conn, config)
     if not publication_id:
+        from connectors.shopify import resolve_publication_id
+        publication_id = resolve_publication_id(conn, client)
+    if not publication_id:
         return {"ok": False, "outcome": "no_publication_id",
                 "adapter": ADAPTER_COLLECTION_CREATE,
-                "detail": "no cached publication id — cannot unpublish"}
+                "detail": "no publication id resolved — cannot unpublish"}
     try:
         write = client.run(
             "publishableUnpublish", COLLECTION_UNPUBLISH_MUTATION,
