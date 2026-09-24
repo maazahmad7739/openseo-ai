@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.common import get_conn, require_auth, ensure_env_loaded
 from api.models.schemas import HealthOut
-from api.routes import queue, decisions, measurements
+from api.routes import queue, decisions, measurements, fixes, audit
 
 import env as env_loader
 
@@ -91,6 +91,8 @@ _AUTH_PROTECTED_PREFIXES = (
     "/recommendations",
     "/measurements",
     "/results",
+    "/fixes",
+    "/audit",
 )
 
 _API_PREFIX = "/api"
@@ -116,6 +118,8 @@ app.include_router(queue.router)
 app.include_router(queue.pipeline_router)
 app.include_router(decisions.router)
 app.include_router(measurements.router)
+app.include_router(fixes.router)
+app.include_router(audit.router)
 
 # Vercel serves the FastAPI app at /api/* (api/index.py).  The SPA's fetch
 # calls target /api/queue…, /api/pipeline…, etc., so the same routers are
@@ -126,6 +130,8 @@ app.include_router(queue.router, prefix=_API_PREFIX, include_in_schema=False)
 app.include_router(queue.pipeline_router, prefix=_API_PREFIX, include_in_schema=False)
 app.include_router(decisions.router, prefix=_API_PREFIX, include_in_schema=False)
 app.include_router(measurements.router, prefix=_API_PREFIX, include_in_schema=False)
+app.include_router(fixes.router, prefix=_API_PREFIX, include_in_schema=False)
+app.include_router(audit.router, prefix=_API_PREFIX, include_in_schema=False)
 
 # Serve the built operator UI (brief §4.1: one deployable process). The API
 # and the SPA share one origin/port, so the UI's relative fetch('/queue', ...)

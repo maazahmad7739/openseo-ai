@@ -24,6 +24,7 @@ def budget_env_var(service):
         "openseo_competitors": "WEEKLY_BUDGET_OPENSEO",
         "openseo_backlinks": "WEEKLY_BUDGET_OPENSEO",
         "openseo_crawl_audit": "WEEKLY_BUDGET_OPENSEO",
+        "gsc_url_inspection": "WEEKLY_BUDGET_GSC",
         "ollama_chat": "WEEKLY_BUDGET_OLLAMA",
         "*": "WEEKLY_BUDGET_GLOBAL",
     }

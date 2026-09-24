@@ -50,6 +50,8 @@ LOCK_KEYS = {
     "semantic_scoring": "semantic_scoring",
     "stale_approvals": "stale_approvals",
     "cost_report": "cost_report",
+    "fix_executor": "fix_executor",
+    "scheduler": "scheduler",
 }
 
 _LOCK_NAMESPACE = "openseo:job:"

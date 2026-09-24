@@ -1,0 +1,17 @@
+{
+  "inspectionResult": {
+    "inspectionResultLink": "https://search.google.com/search-console/inspect?resource_id=sc-domain%3Aexample.com&id=https%3A%2F%2Fexample.com%2Fproducts%2Faurora-pro-wireless-noise-cancelling-headphones",
+    "indexStatusResult": {
+      "sitemap": ["https://example.com/sitemap.xml"],
+      "verdict": "PASS",
+      "coverageState": "Submitted and indexed",
+      "robotsTxtState": "ALLOWED",
+      "indexingState": "INDEXING_STATE_ALLOWED",
+      "lastCrawlTime": "2026-09-19T04:12:33Z",
+      "pageFetchState": "SUCCESSFUL",
+      "googleCanonical": "https://example.com/products/aurora-pro-wireless-noise-cancelling-headphones",
+      "userCanonical": "https://example.com/products/aurora-pro-wireless-noise-cancelling-headphones",
+      "crawledAs": "DESKTOP"
+    }
+  }
+}

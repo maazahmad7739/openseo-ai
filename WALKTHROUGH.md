@@ -246,10 +246,13 @@ All `python -m jobs.<name>`, each with `--site_id` / `--reference_date`, each op
 | `stale_approvals.py` | `python -m jobs.stale_approvals` | Surface approved-but-unimplemented | Daily/weekly |
 | `cost_report.py` | `python -m jobs.cost_report` | Weekly spend by service + budget status | Weekly |
 | `measurements.py` | `python -m jobs.measurements` | Measurement sweep wrapper (batch variant) | On demand |
+| `fix_executor.py` | `python -m jobs.fix_executor [--dry-run]` | queued fixes → applied: policy gate + weekly caps at pickup, fresh-read snapshot, stale-diff expiry, read-back verify, auto-revert, `rollback_reference` audit (plan/21) | Daily 03:00 UTC |
 
 **`run_multi.py`** (helper, not a job): `run_across_sites()` — per-site failure isolation, bounded concurrency (`JOB_MAX_WORKERS`, default **1** = strictly sequential, safe for DataForSEO rate limits), optional `JOB_TIMEOUT_SECONDS` per-site wall-clock cap. Contract: each worker opens its **own** DB connection (psycopg2 is single-threaded). Notifications via `jobs/notify.py` → Slack-compatible `NOTIFICATION_WEBHOOK_URL` (unconfigured = silently skipped, never a crash).
 
-**No scheduler is wired in the repo** (no `.github/workflows`, no Vercel crons). Jobs are CLI-only and cannot run inside Vercel's 60s serverless window — an external runner (GitHub Actions schedule, cron, or worker host) is required. This is unchanged.
+**`jobs/scheduler.py`** (Stage 2 Phase 1.5 hookup): one long-running loop that fires the jobs above on their designed cadences — daily: `daily_sync` 01:00, `measurements` 02:00, `fix_executor` 03:00, `stale_approvals` 05:00 UTC; weekly: `weekly_candidates`/`weekly_agent`/`weekly_crawl`/`semantic_scoring` Sat 04:00–07:00, `cost_report` Sun 08:00. Due-evaluation is deterministic (`SCHEDULE` registry + last-run state in `system_config` `scheduler.lastrun.*`, survives restarts), a scheduler-level advisory lock makes overlapping processes harmless, one job's failure never stops the loop, and `--once` gives external runners a stateless evaluate-and-exit mode (`--due-now` for manual smoke runs; `--dry-run` passes through to `fix_executor`). **fix_executor writes only what `fix_policy` allows**: every sub_type `enabled=false` (ship state) = a typed no-op sweep; nothing publishes until the operator flips the policy.
+
+**No hosted cron is wired in the repo** (no `.github/workflows`, no Vercel crons). Two run modes: `python -m jobs.scheduler` (long loop on the ops host) or an external runner invoking `python -m jobs.scheduler --once` on a cron tick (e.g. hourly — the due-evaluation decides what actually runs; overlapping ticks are lock-guarded). Jobs cannot run inside Vercel's 60s serverless window — this is unchanged.
 
 ---
 
@@ -373,3 +376,20 @@ In priority order:
 **Security rules:** never log/echo credential values; `.env` and `.env.vercel-prod` are git-ignored and must never be committed; mock-mode entry points load `.env` with `include_secrets=False` so live keys never enter a mock process; DataForSEO secrets resolve via one facade path (`get_openseo_adapter`), config references secrets (`plan/12` secret-ref pattern), never values.
 
 **Production status:** full loop runs end-to-end on fixture data (mock mode) against the live deployment; DataForSEO is live-verified (auth, normalization, cost capture, budget enforcement); real-store cutover is configuration + credentials, not code.
+
+---
+
+## 15. Last-mile execution layer (added 2026-09-23)
+
+Closes the "analytical engine works but the last pipes are missing" gap:
+
+1. **`pages.shopify_gid` is now ingested** (`connectors/sync.py` `sync_pages_from_shopify`): REST ids minted to `gid://shopify/Product|Collection/<id>` at upsert (`_shopify_gid`). Title/meta fix generation no longer fails with the gid-less `FixNotSupported` — the Shopify write path (T2/O2) is unblocked end to end.
+2. **Shopify 301 redirect execution** (`fixes/adapters.py` `redirect` adapter): `urlRedirectCreate(urlRedirect:{path,target})` → read-back `urlRedirect(id)` verify; rollback deletes via `urlRedirectDelete` using the created id persisted into the snapshot (`snapshot_patch` merged by `jobs/fix_executor.py`). `fixes/generator.py` routes approved `consolidate` rows to `generate_redirect_fix_for_recommendation` (survivor-must-exist-and-be-indexable gate, no-op-loop guard, idempotent regeneration, 409 conflict guard). Policy seed: `redirect` = high risk, cap 2/week, still `enabled=false` until the owner scope check.
+3. **GSC URL Inspection** (`connectors/gsc.py` `url_inspection` capability + `gsc_url_inspection.json` fixture): `POST urlInspection/index:inspect`, normalizer extracts `verdict/coverageState/robotsTxtState/googleCanonical/sitemap membership`. Sync hook `sync_url_inspection` (priority: indexable=false w/ clicks first; 7-day TTL; 2,000/day property quota enforced via api_costs counting) → `pages.gsc_*` columns. Migration: `plan/24-gsc-inspection-and-redirects.sql`.
+4. **Competitor heading grounding** (`audit/competitor_headings.py` + `audit/page_fetch.fetch_heading_outline`): top-3 non-self SERP URLs fetched through the SSRF/robots-guarded seam, H1–H3 outlines mapped to the SAME section archetypes as the snippet path; `content_outline_gaps_with_headings` merges both sources and degrades gracefully to snippet-only. Fix payloads record `grounding` = `competitor_headings+snippet_hooks`.
+5. **Verified robots.txt + sitemap.xml** (`site_fetch.py`, hooked into `jobs/weekly_crawl.py`): robots group parse (disallow-all + declared `Sitemap:` lines, re-homed onto the fetch origin), bounded sitemap-index→child flattening (5k entries, depth 2), path-keyed membership → `pages.in_sitemap` (NULL = unfetchable/unknown, never fabricated) + `pages.robots_allowed`. Replaces the `sitemap_index_mismatch` proxy with real facts.
+6. **On-demand audit HTTP route** (`api/routes/audit.py`, mounted bare + `/api`): `POST /audit/live-url` (rate-limited, budget-gated, 24h cache), `GET /audit/{session_id}`, `POST /audit/{session_id}/to-store` connected bridge. Typed §4.1 error contract; read-only with respect to pipeline tables.
+
+**Credential aliases resolved** (canonical names still honored): Shopify `SHOPIFY_STORE_DOMAIN`/`SHOPIFY_ADMIN_ACCESS_TOKEN`; GSC `GOOGLE_APPLICATION_CREDENTIALS`/`GSC_SERVICE_ACCOUNT_KEY` (inline JSON); DataForSEO `DATAFORSEO_LOGIN`+`DATAFORSEO_PASSWORD` (pairwise, fails loudly when only one is set) plus `DATAFORSEO_API_KEY`; GSC inspection quota `gsc.url_inspection_daily_limit` in system_config. Env documentation updated in `.env.example`.
+
+**Test coverage:** `tests/run_last_mile_tests.py` (38 checks across all six tasks, zero external network — loopback HTTP server for Task 5). `tests/run_api_tests.py` seed query gained `DISTINCT` (duplicate fixture URLs across sandbox sites made the un-scoped pages SELECT insert colliding rows — pre-existing bug exposed by sandbox data).

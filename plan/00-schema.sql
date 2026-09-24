@@ -234,6 +234,14 @@ CREATE TABLE openseo_serp_snapshots (
     result_domain   TEXT NOT NULL,
     position        INT NOT NULL,
     is_self         BOOLEAN DEFAULT false,           -- true when result_url is on our own domain
+    -- Competitor SERP copy (Phase 2 grounding, plan/21 §2.1/§2.2): persisted
+    -- verbatim from the connector's organic items; NULL when the provider
+    -- omitted the field. Drafters read these for framing/positioning only —
+    -- never copy competitor text verbatim into a draft (validator + dedupe
+    -- guards enforce that).
+    result_title    TEXT,
+    result_snippet  TEXT,
+    url_pattern     TEXT,                            -- URL archetype: /collections/|/products/|/blog/|/guides/...
     snapshot_date   DATE NOT NULL,
     created_at      TIMESTAMPTZ DEFAULT now(),
 

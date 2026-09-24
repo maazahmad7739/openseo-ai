@@ -13,22 +13,33 @@ SITE_URL_ENV = "GSC_SITE_URL"
 ACCESS_TOKEN_ENV = "GSC_ACCESS_TOKEN"
 SERVICE_ACCOUNT_KEY_FILE_ENV = "GSC_SERVICE_ACCOUNT_KEY_FILE"
 SERVICE_ACCOUNT_KEY_JSON_ENV = "GSC_SERVICE_ACCOUNT_KEY_JSON"
+SERVICE_ACCOUNT_KEY_JSON_ALIAS = "GSC_SERVICE_ACCOUNT_KEY"
+GOOGLE_CREDENTIALS_ALIAS = "GOOGLE_APPLICATION_CREDENTIALS"
 GSC_OAUTH_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
 
 ENDPOINTS = {
     "sites": "sites",
     "search_analytics": "sites/{site_url}/searchAnalytics/query",
+    "url_inspection": "urlInspection/index:inspect",
 }
 
 MOCK_FIXTURES = {
     "sites": "gsc_sites.json",
     "search_analytics": "gsc_search_analytics.json",
+    "url_inspection": "gsc_url_inspection.json",
 }
 
 HTTP_TIMEOUT_SECONDS = 60
 
+# URL Inspection API documented quotas (2,000 queries/day/property;
+# 600 queries/minute): the sync self-throttles with a per-run cap so a
+# large catalogue can never blow the daily bucket on its own.
+URL_INSPECTION_DAILY_QUOTA = 2000
+URL_INSPECTION_DEFAULT_DAILY_LIMIT = 400
+URL_INSPECTION_MIN_INTERVAL_SECONDS = 0.12
+
 DEFAULT_DIMENSIONS = ["date", "query", "page", "country", "device"]
-DEFAULT_CAPABILITIES = ["sites", "search_analytics"]
+DEFAULT_CAPABILITIES = ["sites", "search_analytics", "url_inspection"]
 
 
 class GscError(Exception):
@@ -155,6 +166,8 @@ class GscRestAdapter:
             return self._load_mock_fixture(capability)
         if capability == "search_analytics":
             return self._query_search_analytics(params)
+        if capability == "url_inspection":
+            return self._query_url_inspection(params)
         return self._get(capability)
 
     def _load_mock_fixture(self, capability):
@@ -233,14 +246,67 @@ class GscRestAdapter:
     def _get(self, capability):
         return self._request("GET", f"{self.base_url}/{ENDPOINTS[capability]}")
 
+    def _query_url_inspection(self, params):
+        """POST urlInspection/index:inspect for one URL.
+
+        Body contract (Search Console URL Inspection API): inspectionKey
+        = the absolute URL; siteUrl = the property. languageCode optional.
+        Throttled to the documented 600 QPM via the min-interval spacer and
+        hard-capped per call so a sync run can never exhaust the property's
+        2,000/day quota by itself.
+        """
+        inspection_url = (params.get("inspection_url") or params.get("url")
+                          or params.get("inspectionKey"))
+        if not inspection_url:
+            raise GscError("url_inspection requires inspection_url")
+        site_url = params.get("site_url") or self.site_url
+        if not site_url:
+            raise GscError("no site_url configured for url_inspection")
+        body = {
+            "inspectionUrl": inspection_url,
+            "siteUrl": site_url,
+            "languageCode": params.get("language_code") or "en-US",
+        }
+        return self._request("POST", f"{self.base_url}/{ENDPOINTS['url_inspection']}",
+                             payload=body)
+
     def _normalize(self, capability, raw, params):
         if capability == "sites":
             data = self._normalize_sites(raw)
         elif capability == "search_analytics":
             data = self._normalize_search_analytics(raw, params)
+        elif capability == "url_inspection":
+            data = [self._normalize_url_inspection(raw)]
         else:
             raise GscUnsupportedCapability(capability)
         return {"ok": True, "data": data}
+
+    def _normalize_url_inspection(self, raw):
+        """inspectionResult -> flat row keyed for the pages-table upsert.
+
+        Extracts the indexed-verdict core (indexStatusResult.verdict,
+        coverageState, robotsTxtState) plus the sitemap and canonical
+        surfaces Google reports. Never fabricates: absent fields stay None.
+        """
+        result = raw.get("inspectionResult") or {}
+        index_status = result.get("indexStatusResult") or {}
+        sitemap_entries = index_status.get("sitemap") or []
+        if isinstance(sitemap_entries, str):
+            sitemap_entries = [sitemap_entries]
+        return {
+            "inspection_url": result.get("inspectionResultLink") or None,
+            "verdict": index_status.get("verdict"),
+            "coverage_state": index_status.get("coverageState"),
+            "robots_txt_state": index_status.get("robotsTxtState"),
+            "indexing_state": index_status.get("indexingState"),
+            "last_crawl_time": index_status.get("lastCrawlTime"),
+            "google_canonical": index_status.get("googleCanonical"),
+            "user_canonical": index_status.get("userCanonical"),
+            "submitted_url": None,
+            "in_sitemap": bool(sitemap_entries),
+            "crawled_as": index_status.get("crawledAs"),
+            "page_fetch_state": index_status.get("pageFetchState"),
+        }
 
     def _normalize_sites(self, raw):
         normalized = []
@@ -295,6 +361,11 @@ def get_gsc_adapter(config=None):
     key_file = cfg.get("gsc.service_account_key_file") or _env(SERVICE_ACCOUNT_KEY_FILE_ENV)
     key_json = cfg.get("gsc.service_account_key_json") or _env(SERVICE_ACCOUNT_KEY_JSON_ENV)
     static_token = cfg.get("gsc.access_token") or _env(ACCESS_TOKEN_ENV)
+    if not (key_file or key_json):
+        # Canonical alias first (GOOGLE_APPLICATION_CREDENTIALS), then the
+        # inline-JSON alias — both resolve to the same token source below.
+        key_file = key_file or _env("GOOGLE_APPLICATION_CREDENTIALS")
+        key_json = key_json or _env("GSC_SERVICE_ACCOUNT_KEY")
 
     token_source = None
     access_token = None
@@ -310,8 +381,9 @@ def get_gsc_adapter(config=None):
             access_token = static_token
         else:
             raise GscConfigError(
-                f"no GSC credential resolved: set {SERVICE_ACCOUNT_KEY_FILE_ENV} or "
-                f"{SERVICE_ACCOUNT_KEY_JSON_ENV} (service-account JSON key), or "
+                f"no GSC credential resolved: set {SERVICE_ACCOUNT_KEY_FILE_ENV} / "
+                f"GOOGLE_APPLICATION_CREDENTIALS, or {SERVICE_ACCOUNT_KEY_JSON_ENV} / "
+                f"{SERVICE_ACCOUNT_KEY_JSON_ALIAS} (service-account JSON key), or "
                 f"{ACCESS_TOKEN_ENV} for a static dev token. Run in mock mode "
                 f"(set {MOCK_MODE_ENV}=1) to test without credentials."
             )

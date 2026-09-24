@@ -12,6 +12,28 @@ DEFAULT_SECRET_REF = "openseo/company/credential"
 DEFAULT_FIXTURES_DIR = "tests/fixtures"
 
 
+def _login_password_credential():
+    """Basic-auth credential from the documented login/password pair.
+
+    DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD are the standard DataForSEO
+    authentication surface; when both are present they are combined into
+    the `login:password` string the adapter Base64-encodes. Any other
+    outcome (only one of the two set) is an explicit configuration error
+    naming both keys — never a silent half-credential.
+    """
+    login = os.environ.get("DATAFORSEO_LOGIN")
+    password = os.environ.get("DATAFORSEO_PASSWORD")
+    if login and password:
+        return f"{login}:{password}"
+    if login or password:
+        raise OpenseoConfigError(
+            "incomplete DataForSEO login/password pair: set BOTH "
+            "DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD (or DATAFORSEO_API_KEY / "
+            f"{OPENSEO_SECRET_VALUE_ENV} for the pre-combined key)."
+        )
+    return None
+
+
 class OpenseoConfigError(Exception):
     pass
 
@@ -77,8 +99,16 @@ def _resolve_credential(secret_ref, secret_value=None):
     value = _env(OPENSEO_SECRET_VALUE_ENV)
     if value:
         return value
+    value = _env("DATAFORSEO_API_KEY")
+    if value:
+        return value
+    value = _login_password_credential()
+    if value:
+        return value
     raise OpenseoConfigError(
-        f"openseo.secret_ref '{secret_ref}' could not be resolved: no secrets "
-        f"manager configured and {OPENSEO_SECRET_VALUE_ENV} is not set. "
-        f"Run in mock mode (set {MOCK_MODE_ENV}=1) to test without a real credential."
+        f"openseo.secret_ref '{secret_ref}' could not be resolved: set "
+        f"{OPENSEO_SECRET_VALUE_ENV} / DATAFORSEO_API_KEY, or the "
+        "DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD pair, or configure a secrets "
+        "manager. Run in mock mode (set OPENSEO_MOCK_MODE=1) to test "
+        "without a real credential."
     )

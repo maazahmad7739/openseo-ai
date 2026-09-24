@@ -130,6 +130,12 @@ def _existing_opportunity_row(r, impact_threshold=None):
 
 
 def _technical_fix_row(r, impact_threshold=None):
+    evidence = r.get("evidence")
+    if isinstance(evidence, dict) and "issue_type" not in evidence:
+        # issue_type rides in the SQL's primary_keyword slot (plan/03);
+        # persist it explicitly so fix generation can route deterministically.
+        evidence = dict(evidence)
+        evidence["issue_type"] = r.get("primary_keyword")
     return {
         "generator": "technical_fix",
         "action_type": r.get("action_type") or "technical_fix",
@@ -137,7 +143,7 @@ def _technical_fix_row(r, impact_threshold=None):
         "cluster_id": None,
         "diagnosis": f"{r.get('primary_keyword')}: {r.get('page_type')} page issue "
                      f"(HTTP {r.get('status_code')})",
-        "evidence_json": _to_jsonb(r.get("evidence")),
+        "evidence_json": _to_jsonb(evidence),
         "work_required_json": _to_jsonb(r.get("work_required")),
         "impact": r.get("impact") or "medium",
         "confidence": "high",

@@ -5,7 +5,9 @@
       "title": "Wireless Noise Cancelling Headphones",
       "handle": "wireless-noise-cancelling-headphones",
       "published_at": "2025-11-04T09:12:00Z",
-      "published_scope": "web"
+      "published_scope": "web",
+      "meta_description": "Shop all wireless ANC headphones with free 30-day returns.",
+      "body_html": "<p>Curated wireless active-noise-cancelling picks, from flagship to budget.</p>"
     },
     {
       "id": 4421001002,
@@ -35,6 +37,7 @@
       "title": "All Headphones",
       "handle": "all-headphones",
       "published_at": "2025-09-30T08:00:00Z",
+      "body_html": "<p>Every Aurora headphone in one place.</p>",
       "rules": [
         {
           "column": "type",

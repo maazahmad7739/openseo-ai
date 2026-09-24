@@ -111,11 +111,13 @@ def main():
         allok &= print_capability(
             "shopify.products", shopify, "products", {},
             {"product_id", "title", "handle", "product_type", "status", "tags",
+             "meta_description", "body_html",
              "total_inventory", "in_stock", "variants"},
         )
         allok &= print_capability(
             "shopify.collections", shopify, "collections", {},
-            {"collection_id", "title", "handle", "collection_type", "published", "url", "rules"},
+            {"collection_id", "title", "handle", "collection_type", "published", "url",
+             "meta_description", "body_html", "rules"},
         )
 
         ga4 = get_ga4_adapter(config={"ga4.mode": "mock", "ga4.mock_fixtures_dir": FIXTURES_DIR})

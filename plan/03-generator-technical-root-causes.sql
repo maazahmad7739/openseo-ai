@@ -19,6 +19,7 @@ important_pages AS (
            p.internal_links_in, p.internal_links_out,
            p.product_count, p.is_orphan, p.has_structured_data,
            p.render_status, p.raw_html_hash, p.rendered_html_hash,
+           p.robots_allowed, p.in_sitemap,
            p.last_crawled_at,
 
            -- A page is "important" if it has organic traffic or commercial products
@@ -70,8 +71,24 @@ not_indexable AS (
             'current_status', ip.status_code,
             'indexable', ip.indexable,
             'canonical', ip.canonical_url,
+            'robots_allowed', ip.robots_allowed,
+            'in_sitemap', ip.in_sitemap,
             'organic_sessions_28d', ip.organic_sessions_28d,
-            'gsc_clicks_28d', ip.gsc_clicks_28d
+            'gsc_clicks_28d', ip.gsc_clicks_28d,
+            -- plan/21 §2.3 generator depth-upgrade: the canonical-vs-robots-vs-
+            -- status root-cause chain (plan/16) is derivable from columns this
+            -- query already joins — emit the hypothesis deterministically so
+            -- Phase 3 fix routing never re-derives it from raw fields.
+            'mechanism_hypothesis', CASE
+                WHEN ip.canonical_url IS NOT NULL
+                     AND ip.canonical_url <> ip.url
+                    THEN 'canonical_block'
+                WHEN COALESCE(ip.robots_allowed, true) = false
+                    THEN 'robots_block'
+                WHEN ip.status_code <> 200
+                    THEN 'status_block'
+                ELSE 'publish_state'
+            END
         ) AS evidence,
 
         jsonb_build_array(
@@ -287,7 +304,18 @@ sitemap_index_mismatch AS (
         jsonb_build_object(
             'issue', 'Page is not indexable but should be (has organic visibility)',
             'indexable', ip.indexable,
-            'gsc_clicks_28d', ip.gsc_clicks_28d
+            'canonical', ip.canonical_url,
+            'robots_allowed', ip.robots_allowed,
+            'in_sitemap', ip.in_sitemap,
+            'gsc_clicks_28d', ip.gsc_clicks_28d,
+            'mechanism_hypothesis', CASE
+                WHEN ip.canonical_url IS NOT NULL
+                     AND ip.canonical_url <> ip.url
+                    THEN 'canonical_block'
+                WHEN COALESCE(ip.robots_allowed, true) = false
+                    THEN 'robots_block'
+                ELSE 'publish_state'
+            END
         ) AS evidence,
 
         jsonb_build_array(

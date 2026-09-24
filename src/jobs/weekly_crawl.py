@@ -36,6 +36,20 @@ def run(site_id=None, reference_date=None):
                     continue
                 out[str(sid)] = sync_crawl_audit(conn, adapter, sid, domain)
         conn.commit()
+
+        # Task 5: verified robots.txt + sitemap.xml membership pass —
+        # typed-skip semantics (an unfetchable sitemap never crashes the
+        # job; pages.in_sitemap is set to NULL/unknown instead).
+        try:
+            from site_fetch import sync_sitemap_membership
+            sitemap_summary = {}
+            for sid, domain in sites:
+                sitemap_summary[str(sid)] = sync_sitemap_membership(conn, sid, domain)
+            conn.commit()
+            out["sitemap_verification"] = sitemap_summary
+        except Exception as exc:
+            conn.rollback()
+            out["sitemap_summary"] = {"skipped": f"{type(exc).__name__}: {exc}"}
         return {"crawled": out}
     finally:
         conn.close()

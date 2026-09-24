@@ -20,7 +20,9 @@
           "price": "249.00",
           "inventory_quantity": 38
         }
-      ]
+      ],
+      "meta_description": "Premium wireless noise cancelling with 40h battery.",
+      "body_html": "<p>Flagship ANC with 40-hour battery life and adaptive EQ.</p>"
     },
     {
       "id": 7812300452,
@@ -36,7 +38,9 @@
           "price": "79.00",
           "inventory_quantity": 210
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300453,
@@ -52,7 +56,9 @@
           "price": "29.00",
           "inventory_quantity": 0
         }
-      ]
+      ],
+      "meta_description": "Hard-shell travel case for Aurora headphones.",
+      "body_html": "<p>Rugged EVA shell, mesh accessory pocket, 5-year warranty.</p>"
     },
     {
       "id": 7812300454,
@@ -68,7 +74,9 @@
           "price": "19.00",
           "inventory_quantity": 480
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300455,
@@ -84,7 +92,9 @@
           "price": "129.00",
           "inventory_quantity": 12
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300456,
@@ -100,7 +110,9 @@
           "price": "99.00",
           "inventory_quantity": 75
         }
-      ]
+      ],
+      "meta_description": "Volume-limited noise cancelling headphones built for kids.",
+      "body_html": null
     },
     {
       "id": 7812300457,
@@ -116,7 +128,9 @@
           "price": "119.00",
           "inventory_quantity": 64
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300458,
@@ -132,7 +146,9 @@
           "price": "109.00",
           "inventory_quantity": 41
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300459,
@@ -154,7 +170,9 @@
           "price": "199.00",
           "inventory_quantity": 22
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300460,
@@ -170,7 +188,9 @@
           "price": "129.00",
           "inventory_quantity": 88
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300461,
@@ -186,7 +206,9 @@
           "price": "149.00",
           "inventory_quantity": 37
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300462,
@@ -202,7 +224,9 @@
           "price": "99.00",
           "inventory_quantity": 51
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     },
     {
       "id": 7812300463,
@@ -218,7 +242,9 @@
           "price": "179.00",
           "inventory_quantity": 26
         }
-      ]
+      ],
+      "meta_description": null,
+      "body_html": null
     }
   ]
 }

@@ -16,12 +16,17 @@ upserts, so re-running the sync is safe.
 import os
 import sys
 import json
+import html
+import re
 from datetime import date, timedelta
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from connectors.openseo import get_openseo_adapter, OpenseoConfigError  # noqa: E402
-from connectors.gsc import get_gsc_adapter, GscConfigError  # noqa: E402
+from connectors.gsc import (  # noqa: E402
+    get_gsc_adapter, GscConfigError, URL_INSPECTION_DAILY_QUOTA,
+)
 from connectors.shopify import get_shopify_adapter, ShopifyError  # noqa: E402
 from connectors.ga4 import get_ga4_adapter, Ga4Error  # noqa: E402
 from connectors.url_normalize import canonicalize_url  # noqa: E402
@@ -286,6 +291,13 @@ def sync_pages_from_shopify(conn, shopify, site_id, domain="example.com"):
             "page_type": "collection",
             "title": c["title"],
             "indexable": bool(c["published"]),
+            "meta_description": c.get("meta_description"),
+            "body_html": c.get("body_html"),
+            # GraphQL writes (productUpdate/collectionUpdate) key on the
+            # GID, not the REST numeric id (plan/22 §3). The connector
+            # normalization carries the raw REST id; the GID is minted
+            # here so generated fixes always have a write target.
+            "shopify_gid": _shopify_gid("Collection", c.get("collection_id")),
         })
     product_urls = []
     for p in products["data"]:
@@ -297,20 +309,68 @@ def sync_pages_from_shopify(conn, shopify, site_id, domain="example.com"):
             "title": p["title"],
             "indexable": p["status"] == "active",
             "product_count": 1,
+            "meta_description": p.get("meta_description"),
+            "body_html": p.get("body_html"),
+            "shopify_gid": _shopify_gid("Product", p.get("product_id")),
         })
 
     inserted = 0
     for row in rows:
+        body_text_hash = _body_text_hash(row.get("body_html"))
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO pages (site_id, url, page_type, title, indexable) "
-                "VALUES (%s, %s, %s, %s, %s) "
-                "ON CONFLICT (site_id, url_hash) DO UPDATE SET "
-                "title = EXCLUDED.title, indexable = EXCLUDED.indexable",
-                (site_id, row["url"], row["page_type"], row["title"], row["indexable"]),
+                """
+                INSERT INTO pages (site_id, url, page_type, title, indexable,
+                                   meta_description, body_html, body_text_hash,
+                                   shopify_gid)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (site_id, url_hash) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    indexable = EXCLUDED.indexable,
+                    meta_description = COALESCE(EXCLUDED.meta_description, pages.meta_description),
+                    body_html = COALESCE(EXCLUDED.body_html, pages.body_html),
+                    body_text_hash = COALESCE(EXCLUDED.body_text_hash, pages.body_text_hash),
+                    shopify_gid = COALESCE(EXCLUDED.shopify_gid, pages.shopify_gid)
+                """,
+                (site_id, row["url"], row["page_type"], row["title"], row["indexable"],
+                 row.get("meta_description"), row.get("body_html"), body_text_hash,
+                 row.get("shopify_gid")),
             )
             inserted += 1
     return inserted
+
+
+def _shopify_gid(resource, raw_id):
+    """REST numeric id -> GraphQL GID ('gid://shopify/Product/123').
+
+    The REST admin API returns numeric ids; GraphQL mutations require the
+    gid:// form (plan/21 §4). Tolerates inputs that are already GIDs, int
+    or str. Returns None when the id is missing/blank (a row without a GID
+    is simply not fix-targetable — never fabricated).
+    """
+    if raw_id is None:
+        return None
+    raw = str(raw_id).strip()
+    if not raw:
+        return None
+    if raw.startswith("gid://"):
+        return raw
+    digits = raw.split("?")[0].split("/")[-1]
+    if not digits.isdigit():
+        return None
+    return f"gid://shopify/{resource}/{digits}"
+
+
+def _body_text_hash(body_html):
+    """Phase 2 near-duplicate key (plan/21 §2.2): normalized visible text,
+    hashed md5. Empty/None body -> NULL (a null never equals a null)."""
+    if not body_html:
+        return None
+    text = re.sub(r"<[^>]+>", " ", body_html)
+    text = re.sub(r"\s+", " ", html.unescape(text)).strip().lower()
+    if not text:
+        return None
+    return database.md5_hash(text)
 
 
 def sync_page_business_performance(conn, ga4, site_id, domain="example.com", window=None):
@@ -447,7 +507,9 @@ def sync_keyword_clusters(conn, openseo, site_id, queries):
 
 
 def sync_serp_snapshots(conn, openseo, site_id, queries, skip=False, reference_date=None, live=False):
-    """Map SERP snapshot rows into openseo_serp_snapshots (is_self flag from domain)."""
+    """Map SERP snapshot rows into openseo_serp_snapshots (is_self flag from
+    domain). Competitor title/snippet persist verbatim (Phase 2 grounding,
+    plan/21 §2.1/§2.2); url_pattern = the URL's archetype segment."""
     if skip:
         return 0
     if not queries or not queries[0].get("ok"):
@@ -476,15 +538,31 @@ def sync_serp_snapshots(conn, openseo, site_id, queries, skip=False, reference_d
             is_self = domain in url
             cur.execute(
                 "INSERT INTO openseo_serp_snapshots "
-                "(site_id, cluster_id, query, result_url, result_domain, position, is_self, snapshot_date) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "(site_id, cluster_id, query, result_url, result_domain, position, "
+                "is_self, result_title, result_snippet, url_pattern, snapshot_date) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (site_id, query, result_url, snapshot_date) DO NOTHING",
                 (site_id, cluster_id, r.get("query"), url,
                  url.split("/")[2] if "://" in url else None,
-                 r.get("position"), is_self, snapshot_date),
+                 r.get("position"), is_self,
+                 r.get("title"), r.get("snippet"),
+                 _url_pattern(url), snapshot_date),
             )
             inserted += 1
     return inserted
+
+
+def _url_pattern(url):
+    """URL archetype segment (plan/21 §2.4 inference reuse): the first path
+    segment of the URL, lowercase. '/collections/x' -> '/collections/'.
+    Uses urlparse so query strings/fragments never leak into the pattern."""
+    if not url or "://" not in url:
+        return None
+    path = urlparse(url).path or ""
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return "/"
+    return "/" + segments[0].lower() + "/"
 
 
 def sync_crawl_audit(conn, openseo, site_id, domain):
@@ -528,6 +606,120 @@ def sync_crawl_audit(conn, openseo, site_id, domain):
                 )
             updated += 1
     return updated
+
+
+# ────────────────────────────────────────────
+# GSC URL Inspection (Task 3)
+# ────────────────────────────────────────────
+
+INSPECTION_TTL_DAYS = 7
+INSPECTION_DEFAULT_RUN_LIMIT = 400
+INSPECTION_SERVICE = "gsc_url_inspection"
+
+
+def _inspection_targets(conn, site_id, limit):
+    """Inspection candidates in priority order (2,000/day is the budget):
+      1. indexable=false pages (the not-indexed-but-earns-clicks set first,
+         ordered by residual GSC clicks DESC)
+      2. stale/never-inspected pages (oldest last_inspected_at first)
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.url
+            FROM pages p
+            LEFT JOIN (
+                SELECT page_url_hash, SUM(clicks) AS clicks_28d
+                FROM search_performance
+                WHERE date >= CURRENT_DATE - INTERVAL '28 days'
+                GROUP BY page_url_hash
+            ) sp ON sp.page_url_hash = p.url_hash
+            WHERE p.site_id = %s
+              AND (p.indexable = false
+                   OR p.gsc_inspected_at IS NULL
+                   OR p.gsc_inspected_at < now() - INTERVAL '%s days')
+            ORDER BY p.indexable ASC NULLS LAST,
+                     COALESCE(sp.clicks_28d, 0) DESC,
+                     COALESCE(p.gsc_inspected_at, 'epoch') ASC
+            LIMIT %s
+            """,
+            (site_id, INSPECTION_TTL_DAYS, limit),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def _inspection_quota_remaining(conn):
+    """Calls remaining under the property's documented 2,000/day quota.
+
+    Counted from api_costs rows logged for gsc_url_inspection since UTC
+    midnight. The quota is external truth, so this caps even when no
+    budget_config row exists.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(calls), 0) FROM api_costs
+            WHERE service = %s AND timestamp >= date_trunc('day', now())
+            """,
+            (INSPECTION_SERVICE,),
+        )
+        used = int(cur.fetchone()[0] or 0)
+    return max(0, URL_INSPECTION_DAILY_QUOTA - used)
+
+
+def apply_inspection_result(conn, site_id, url, row):
+    """One inspection row -> pages update (verdict + coverage + sitemap)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE pages SET
+                gsc_verdict = %s,
+                gsc_coverage_state = %s,
+                gsc_robots_txt_state = %s,
+                gsc_google_canonical = %s,
+                gsc_in_sitemap = %s,
+                gsc_inspected_at = now()
+            WHERE site_id = %s AND url = %s
+            """,
+            (row.get("verdict"), row.get("coverage_state"),
+             row.get("robots_txt_state"), row.get("google_canonical"),
+             row.get("in_sitemap"), site_id, url),
+        )
+
+
+def sync_url_inspection(conn, gsc, site_id, limit=None):
+    """GSC URL Inspection pull -> pages.* Google-verdict columns.
+
+    Quota respected via the per-run limit + a shared count against the
+    api_costs rows logged for gsc_url_inspection today (UTC). Every
+    failure is a typed skip (never-raise adapter contract; never a crash).
+    """
+    run_limit = limit or INSPECTION_DEFAULT_RUN_LIMIT
+    inspected = 0
+    for url in _inspection_targets(conn, site_id, run_limit):
+        if inspected >= run_limit:
+            break
+        remaining = _inspection_quota_remaining(conn)
+        if remaining <= 0:
+            print("[sync] url_inspection: daily property quota reached — "
+                  "remaining URLs deferred to the next run", flush=True)
+            break
+        result = gsc.fetch("url_inspection", {"inspection_url": url})
+        if not result.get("ok"):
+            print(f"[sync] gsc.url_inspection skipped for {url}: "
+                  f"{result.get('error')}")
+            continue
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO api_costs (site_id, service, call_type, calls, cost) "
+                "VALUES (%s, %s, 'url_inspection', 1, 0)",
+                (site_id, INSPECTION_SERVICE),
+            )
+        conn.commit()
+        row = (result.get("data") or [{}])[0]
+        apply_inspection_result(conn, site_id, url, row)
+        inspected += 1
+    return inspected
 
 
 def sync_catalogue_coverage(conn, site_id, domain, shopify=None):
@@ -778,6 +970,7 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, referenc
             )
 
         counts["crawl_audit_updated"] = sync_crawl_audit(conn, openseo, site_id, site["domain"])
+        counts["url_inspection_updated"] = sync_url_inspection(conn, gsc, site_id)
         counts["catalogue_coverage"] = sync_catalogue_coverage(conn, site_id, site["domain"], shopify)
         # Scoped recompute: only clusters whose coverage/keyword data changed in
         # THIS sync (their catalogue_coverage was rewritten) get a fresh match

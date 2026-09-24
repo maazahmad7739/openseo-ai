@@ -35,7 +35,7 @@ def seed_raw_candidates(conn, site_id, n=6):
     ids = []
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT url FROM pages p WHERE NOT EXISTS "
+            "SELECT DISTINCT url FROM pages p WHERE NOT EXISTS "
             "  (SELECT 1 FROM recommendations r WHERE r.target_url = p.url) "
             "ORDER BY url LIMIT %s", (n,))
         urls = [r[0] for r in cur.fetchall()]
