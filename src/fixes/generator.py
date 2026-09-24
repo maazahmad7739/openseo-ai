@@ -627,7 +627,7 @@ def load_decision_inputs(conn, recommendation_id):
             f"(got {rec['action_type']!r})")
     if not rec["target_url"]:
         raise FixNotSupported(f"{rec['action_type']} row has no target_url")
-    if rec["status"] not in ("approved", "proposed"):
+    if rec["status"] not in ("approved", "in_progress"):
         raise FixGenerationError(
             f"fix generation requires an approved recommendation "
             f"(current status: {rec['status']!r})")
