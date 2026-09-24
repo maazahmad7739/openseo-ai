@@ -13,6 +13,7 @@ import json
 import logging
 from datetime import date, timedelta
 
+import psycopg2
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
@@ -84,13 +85,23 @@ def enrich_work_tasks(work, fix_rows):
 
 
 def _load_fix_rows(conn, recommendation_id):
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT fix_id, sub_type, status FROM generated_fixes "
-            "WHERE recommendation_id = %s ORDER BY created_at",
-            (recommendation_id,),
-        )
-        return cur.fetchall()
+    """(fix_id, sub_type, status) rows for a recommendation.
+
+    Degrades to [] when the stage-2 schema (generated_fixes) has not been
+    applied to the database — task enrichment then renders tasks without
+    fix linkage instead of failing the whole endpoint.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT fix_id, sub_type, status FROM generated_fixes "
+                "WHERE recommendation_id = %s ORDER BY created_at",
+                (recommendation_id,),
+            )
+            return cur.fetchall()
+    except psycopg2.errors.UndefinedTable:
+        conn.rollback()
+        return []
 
 # Active-pipeline router: operator visibility for approved + in_progress rows
 # (ActionQueue renders only 'proposed', Results only 'measured' — and the
