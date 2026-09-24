@@ -77,6 +77,7 @@ interface FixDto {
 const FIELD_LABELS: Record<string, string> = {
   "seo.title": "Title tag",
   "seo.description": "Meta description",
+  "collection.description_html": "Collection description",
 };
 
 /**
@@ -93,6 +94,44 @@ export function scopeTaskText(task: string, automated: boolean): string {
   if (!automated) return task;
   const scoped = task.replace(AUTOMATED_OUT_OF_SCOPE_CLAUSE, "").trim();
   return scoped.length >= 10 ? scoped : task;
+}
+
+/** Strip provider HTML (collection descriptionHtml diffs, plan/24 §4.2)
+ * to plain text for the drawer: tag-strip + whitespace-collapse. Never
+ * dangerouslySetInnerHTML on provider-adjacent copy. */
+function stripHtml(value: string): string {
+  return value
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const DIFF_PREVIEW_CHAR_CAP = 400;
+
+function DiffPreviewText({ value }: { value?: string }) {
+  const [expanded, setExpanded] = useState(false);
+  // HTML-valued diffs (collection.description_html) arrive pre-stripped by
+  // the generator's diff builder; strip defensively anyway so a raw-HTML
+  // row can never render markup into the drawer.
+  const text = stripHtml(value ?? "");
+  const truncated = !expanded && text.length > DIFF_PREVIEW_CHAR_CAP;
+  return (
+    <>
+      <span>
+        {truncated ? text.slice(0, DIFF_PREVIEW_CHAR_CAP) : text}
+        {truncated ? "…" : ""}
+      </span>
+      {text.length > DIFF_PREVIEW_CHAR_CAP ? (
+        <button
+          type="button"
+          className="ml-1 text-[10px] font-semibold text-primary/70 underline underline-offset-2"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded ? "show less" : "show full"}
+        </button>
+      ) : null}
+    </>
+  );
 }
 
 function DiffRow({ field, oldValue, newValue }: {
@@ -117,7 +156,9 @@ function DiffRow({ field, oldValue, newValue }: {
             <span className="shrink-0 rounded bg-error/10 px-1 font-mono text-[10px] font-bold text-error">
               −
             </span>
-            <span className="text-base-content/50 line-through">{oldValue}</span>
+            <span className="text-base-content/50 line-through">
+              <DiffPreviewText value={oldValue} />
+            </span>
           </p>
         ) : (
           <p className="flex items-start gap-1.5">
@@ -132,7 +173,9 @@ function DiffRow({ field, oldValue, newValue }: {
             <span className="shrink-0 rounded bg-success/10 px-1 font-mono text-[10px] font-bold text-success">
               +
             </span>
-            <span className="font-medium text-base-content">{newValue}</span>
+            <span className="font-medium text-base-content">
+              <DiffPreviewText value={newValue} />
+            </span>
           </p>
         ) : null}
       </div>
@@ -202,12 +245,22 @@ function FixDiffPreview({
     );
   }
 
-  const act = async (fix: FixDto, action: "approve" | "reject") => {
+  const act = async (fix: FixDto, action: "approve" | "reject" | "apply") => {
     setBusy(true);
     try {
       if (action === "approve") {
         await api(`/fixes/${fix.fix_id}/approve`, { method: "POST" });
         toast.success("Fix approved and queued for execution");
+      } else if (action === "apply") {
+        const res = await api<{ status?: string; verified?: boolean; verification_status?: string }>(
+          `/fixes/${fix.fix_id}/execute`,
+          { method: "POST" },
+        );
+        toast.success(
+          res?.verified || res?.verification_status === "verified"
+            ? "Applied to your store — verified by read-back"
+            : "Apply requested — check status in a moment",
+        );
       } else {
         await api(`/fixes/${fix.fix_id}/reject`, {
           method: "POST",
@@ -332,13 +385,24 @@ function FixDiffPreview({
                     Reject
                   </button>
                 </>
+              ) : fix.status === "queued" ? (
+                <button
+                  type="button"
+                  className="btn btn-xs btn-primary"
+                  disabled={busy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void act(fix, "apply");
+                  }}
+                >
+                  {busy ? <Loader2 className="size-3 animate-spin" /> : null}
+                  Apply now
+                </button>
               ) : (
                 <span className="text-[11px] text-base-content/40">
-                  {fix.status === "queued"
-                    ? "Queued — the executor will apply this change"
-                    : fix.status === "applied"
-                      ? "Applied to the store"
-                      : "Reviewed"}
+                  {fix.status === "applied"
+                    ? "Applied to the store"
+                    : "Reviewed"}
                 </span>
               )}
             </div>
