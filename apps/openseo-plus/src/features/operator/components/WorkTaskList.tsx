@@ -79,26 +79,55 @@ const FIELD_LABELS: Record<string, string> = {
   "seo.description": "Meta description",
 };
 
+/**
+ * Scope task text to what the engine actually does. The agent's
+ * work_required copy sometimes bundles extra asks ("…; add structured data
+ * (Product schema)", "…; set up analytics") the auto-fix engine does NOT
+ * execute (it only writes seo.title / seo.description). On automated tasks,
+ * drop trailing semicolon-piped clauses that promise schema/structured-data
+ * work so the UI never over-promises.
+ */
+const AUTOMATED_OUT_OF_SCOPE_CLAUSE = /;\s*[^;]*(structured data|schema markup|product schema|json-ld)[^;]*/gi;
+
+export function scopeTaskText(task: string, automated: boolean): string {
+  if (!automated) return task;
+  const scoped = task.replace(AUTOMATED_OUT_OF_SCOPE_CLAUSE, "").trim();
+  return scoped.length >= 10 ? scoped : task;
+}
+
 function DiffRow({ field, oldValue, newValue }: {
   field: string;
   oldValue?: string;
   newValue?: string;
 }) {
+  // An empty/absent old value is still worth showing explicitly — the
+  // −/+ contrast (old vs new) must read the same on every field, so a
+  // missing previous description renders as a muted placeholder line
+  // instead of silently hiding the row.
+  const hasOld = oldValue != null && oldValue.trim() !== "";
+  const hasNew = newValue != null && newValue.trim() !== "";
   return (
     <div className="rounded-lg border border-base-200 bg-base-200/30 p-2.5">
       <p className="text-[10px] font-semibold uppercase tracking-wider text-base-content/45">
         {FIELD_LABELS[field] ?? field}
       </p>
       <div className="mt-1.5 space-y-1.5 text-xs leading-relaxed">
-        {oldValue != null ? (
+        {hasOld ? (
           <p className="flex items-start gap-1.5">
             <span className="shrink-0 rounded bg-error/10 px-1 font-mono text-[10px] font-bold text-error">
               −
             </span>
             <span className="text-base-content/50 line-through">{oldValue}</span>
           </p>
-        ) : null}
-        {newValue != null ? (
+        ) : (
+          <p className="flex items-start gap-1.5">
+            <span className="shrink-0 rounded bg-error/10 px-1 font-mono text-[10px] font-bold text-error/50">
+              −
+            </span>
+            <span className="italic text-base-content/35">no previous description</span>
+          </p>
+        )}
+        {hasNew ? (
           <p className="flex items-start gap-1.5">
             <span className="shrink-0 rounded bg-success/10 px-1 font-mono text-[10px] font-bold text-success">
               +
@@ -401,7 +430,7 @@ export function WorkTaskList({
                     done ? "text-base-content/50 line-through" : "text-base-content"
                   }`}
                 >
-                  {item.task}
+                  {scopeTaskText(item.task, automated)}
                 </p>
                 <p className="mt-1 flex items-start gap-1.5 text-xs leading-relaxed text-base-content/55">
                   <span className="mt-0.5 shrink-0 font-semibold text-success">
