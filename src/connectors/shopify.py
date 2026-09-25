@@ -630,7 +630,7 @@ PUBLICATION_ID_CONFIG_KEY = "shopify.publication_id"
 PUBLICATIONS_QUERY = """
 query FixPublications {
   publications(first: 10) {
-    nodes { id title }
+    nodes { id name }
   }
 }
 """
@@ -664,8 +664,11 @@ def resolve_publication_id(conn, client):
     if not result.get("ok"):
         return None
     nodes = ((result.get("data") or {}).get("publications") or {}).get("nodes") or []
+    # LIVE-VERIFIED (2026-09-24, action-seo-test 2026-01): Publication has
+    # NO `title` field — the channel name is `name` (undefinedfield on the
+    # earlier title-based query).
     online_store = next((n for n in nodes
-                         if (n.get("title") or "").lower() in
+                         if (n.get("name") or "").lower() in
                          ("online store", "web", "web sales channel")), None)
     picked = online_store or (nodes[0] if nodes else None)
     publication_id = (picked or {}).get("id")
