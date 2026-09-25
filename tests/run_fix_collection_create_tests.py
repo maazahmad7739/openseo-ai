@@ -510,6 +510,37 @@ def test_adapter(conn):
             allok &= check("no delete mutation ever fired",
                            STATE.deleted_gids == [], str(STATE.deleted_gids))
 
+            # SELF-HEAL (plan/25 idempotent routing): the collection
+            # handle already exists (a prior run created it, publish
+            # failed) -> execute skips create, publishes the EXISTING gid.
+            STATE = FakeCreateState()
+            client_sh = FakeCreateClient()
+            STATE.created[HANDLE] = {"gid": "gid://shopify/Collection/518958383402",
+                                     "title": "Pre-existing From Failed Run"}
+            result_sh = adapter["execute"](conn,
+                                           {"fix_id": out["fix_id"],
+                                            "target_entity_ref": None,
+                                            "payload_json": out["payload"],
+                                            "diff_json": out["diff"],
+                                            "snapshot_json": None},
+                                           config={}, dry_run=False,
+                                           client=client_sh)
+            allok &= check("self-heal: existing handle -> published",
+                           result_sh.get("ok") and result_sh.get("verified"),
+                           str(result_sh)[:200])
+            allok &= check("self-heal routes to the EXISTING gid",
+                           (result_sh.get("snapshot_patch") or {})
+                           .get("collection.created_gid") ==
+                           "gid://shopify/Collection/518958383402",
+                           str(result_sh.get("snapshot_patch")))
+            allok &= check("self-heal skips collectionCreate",
+                           STATE.mutations.count("collectionCreate") == 0,
+                           str(STATE.mutations))
+            allok &= check("self-heal notes the skip in detail",
+                           "already existed" in (result_sh.get("detail")
+                                                 or ""),
+                           str(result_sh.get("detail")))
+
             # restore: unpublish ONLY (the created gid from the patch)
             created_gid = result["snapshot_patch"]["collection.created_gid"]
             restore = adapter["restore"](conn,

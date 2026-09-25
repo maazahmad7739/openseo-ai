@@ -1964,6 +1964,29 @@ def collection_create_execute(conn, fix_row, config, dry_run=False,
                            "handle": handle,
                            "variables": variables}}
 
+    # IDEMPOTENT ROUTING (plan/25 §3.3 self-healing): a previous run may
+    # have created the collection but failed the publish step (the
+    # typed create_publish_failed path records created_gid but never
+    # auto-undoes). Resolve the handle FIRST — if it exists, skip the
+    # create entirely and route straight to publish-only with the
+    # resolved GID.
+    existing_gid = None
+    try:
+        pre = _collection_by_handle_read(client, handle)
+        if pre.get("ok"):
+            existing_gid = ((pre.get("data") or {})
+                            .get("collectionByHandle") or {}).get("id")
+    except Exception:
+        existing_gid = None  # network hiccup: fall through to create
+
+    if existing_gid:
+        # Already exists — the create half of this fix is a NO-OP.
+        # Publish the existing entity (self-heal the interrupted run).
+        return _collection_create_publish_only(
+            conn, client, config, gid=existing_gid, handle=handle,
+            expected_title=None,  # don't fail on a title the operator edited
+            existing=True)
+
     try:
         # LIVE-VERIFIED (2026-09-24, action-seo-test 2026-01): the pinned
         # schema requires `input:` — the `collection:` arg seen in newer
@@ -1991,63 +2014,82 @@ def collection_create_execute(conn, fix_row, config, dry_run=False,
                 "adapter": ADAPTER_COLLECTION_CREATE}
     created_gid = collection["id"]
 
-    # Publish step: resolve the publication id via the shared resolver
-    # (system_config cache -> one publications query -> cache back). The
-    # bare config-peek alone returns None on stores where nothing has
-    # cached yet — that created the collection and then refused to
-    # publish it (plan/25 typed outcome) on first-ever runs.
+    return _collection_create_publish_only(
+        conn, client, config, gid=created_gid, handle=handle,
+        expected_title=variables["title"], existing=False,
+        create_response=write)
+
+
+def _collection_create_publish_only(conn, client, config, gid, handle,
+                                    expected_title, existing,
+                                    create_response=None):
+    """Shared publish->verify tail of collection_create_execute: resolves
+    the publication id (cache -> resolver), publishes, reads back.
+    Idempotent: called with the EXISTING gid on self-heal runs, or the
+    freshly created GID on first runs."""
     publication_id = _publication_id_from_config(conn, config)
     if not publication_id:
         from connectors.shopify import resolve_publication_id
         publication_id = resolve_publication_id(conn, client)
     if not publication_id:
         return {"ok": False, "outcome": "create_publish_failed",
-                "detail": f"collection created ({created_gid}) but no "
-                          "publication id resolved — publish by hand or "
-                          "retry; NOT auto-undone",
+                "detail": f"collection {'found' if existing else 'created'} "
+                          f"({gid}) but no publication id resolved — "
+                          "publish by hand or retry; NOT auto-undone",
                 "adapter": ADAPTER_COLLECTION_CREATE,
-                "snapshot_patch": {"collection.created_gid": created_gid},
-                "adapter_response": {"create": _safe_response(write)}}
+                "snapshot_patch": {"collection.created_gid": gid},
+                "adapter_response": {"create": _safe_response(create_response)
+                                     if create_response else {}}}
     try:
         publish = client.run(
             "publishablePublish", COLLECTION_PUBLISH_MUTATION,
-            {"id": created_gid,
+            {"id": gid,
              "input": [{"publicationId": publication_id}],
              "publicationId": publication_id})
     except Exception as exc:
         return {"ok": False, "outcome": "create_publish_failed",
-                "detail": f"collection created ({created_gid}) but "
-                          f"publish raised: {exc} — NOT auto-undone",
+                "detail": f"collection {'found' if existing else 'created'} "
+                          f"({gid}) but publish raised: {exc} — "
+                          "NOT auto-undone",
                 "adapter": ADAPTER_COLLECTION_CREATE,
-                "snapshot_patch": {"collection.created_gid": created_gid},
-                "adapter_response": {"create": _safe_response(write)}}
+                "snapshot_patch": {"collection.created_gid": gid},
+                "adapter_response": {"create": _safe_response(create_response)
+                                     if create_response else {}}}
     if not publish.get("ok"):
         return {"ok": False, "outcome": "create_publish_failed",
                 "userErrors": publish.get("userErrors") or [],
                 "errors": publish.get("errors") or [],
-                "detail": f"collection created ({created_gid}) but "
-                          "publish failed — NOT auto-undone",
+                "detail": f"collection {'found' if existing else 'created'} "
+                          f"({gid}) but publish failed — NOT auto-undone",
                 "adapter": ADAPTER_COLLECTION_CREATE,
-                "snapshot_patch": {"collection.created_gid": created_gid},
-                "adapter_response": {"create": _safe_response(write),
+                "snapshot_patch": {"collection.created_gid": gid},
+                "adapter_response": {"create": _safe_response(create_response)
+                                     if create_response else {},
                                      "publish": _safe_response(publish)}}
 
     verify = _collection_by_handle_read(client, handle)
     live = ((verify.get("data") or {}).get("collectionByHandle") or {})
-    verified = (bool(verify.get("ok")) and live.get("id") == created_gid
-                and live.get("title") == variables["title"])
-    return {
-        "ok": True,
-        "outcome": "ok",
-        "verified": verified,
-        "verification_status": "verified" if verified else "verify_failed",
-        "live_value": live.get("title"),
-        "adapter": ADAPTER_COLLECTION_CREATE,
-        "snapshot_patch": {"collection.created_gid": created_gid},
-        "adapter_response": {"create": _safe_response(write),
-                             "publish": _safe_response(publish),
-                             "verify": _safe_response(verify)},
-    }
+    verified = (bool(verify.get("ok")) and live.get("id") == gid
+                and (expected_title is None
+                     or live.get("title") == expected_title))
+    response = {"ok": True,
+                "outcome": "ok",
+                "verified": verified,
+                "verification_status": "verified" if verified
+                else "verify_failed",
+                "live_value": live.get("title"),
+                "adapter": ADAPTER_COLLECTION_CREATE,
+                "snapshot_patch": {"collection.created_gid": gid},
+                "adapter_response": {"publish": _safe_response(publish),
+                                     "verify": _safe_response(verify)}}
+    if create_response is not None:
+        response["adapter_response"]["create"] = _safe_response(
+            create_response)
+    if existing:
+        response["detail"] = (f"collection already existed ({gid}) — "
+                              "skipped create, published existing entity "
+                              "(self-heal)")
+    return response
 
 
 def collection_create_restore(conn, fix_row, config, client=None):
