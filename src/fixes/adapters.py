@@ -462,10 +462,14 @@ mutation FixProductPublish($product: ProductUpdateInput!) {
 }
 """
 
+# LIVE-VERIFIED (2026-09-25, action-seo-test 2026-01): Publishable has NO
+# `id` field on the read-back (undefinedfield) and the read-back is only
+# meaningful when $publicationId is DECLARED — hence the explicit
+# $publicationId variable in the mutation signature.
 COLLECTION_PUBLISH_MUTATION = """
-mutation FixCollectionPublish($id: ID!, $input: [PublicationInput!]!) {
+mutation FixCollectionPublish($id: ID!, $input: [PublicationInput!]!, $publicationId: ID!) {
   publishablePublish(id: $id, input: $input) {
-    publishable { id publishedOnPublication(publicationId: $publicationId) }
+    publishable { publishedOnPublication(publicationId: $publicationId) }
     userErrors { field message }
   }
 }
@@ -550,16 +554,17 @@ def _publication_read_variables(gid, publication_id):
 def _extract_publishable_state(read_result):
     """Read-back envelope -> (status, published_on_publication).
 
-    Tolerates a null member on the multi-entity read (a collection miss
-    with a product hit — or vice versa — returns the present entity's
-    state; both null means the read failed outright).
+    LIVE-VERIFIED (2026-09-25, 2026-01): Publishable carries NO `id`
+    field — presence is detected via the publishedOnPublication value
+    itself (present = the entity resolved; both-absent = read failed or
+    entity missed).
     """
     data = read_result.get("data") or {}
-    collection = data.get("collection") or {}
-    product = data.get("product") or {}
-    if collection.get("id"):
+    collection = data.get("collection")
+    product = data.get("product")
+    if collection is not None:
         return None, collection.get("publishedOnPublication")
-    if product.get("id"):
+    if product is not None:
         return product.get("status"), product.get("publishedOnPublication")
     return None, None
 
