@@ -102,10 +102,13 @@ ALTER TABLE page_business_performance
 -- to_regclass keeps both worlds typed and idempotent.
 DO $$
 BEGIN
+    IF to_regclass('api_costs') IS NULL THEN
+        RETURN;  -- fresh DB: 19-cost-tracking.sql never ran, nothing to scope
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'api_costs_site_id_fkey'
-          AND conrelid = 'api_costs'::regclass
+          AND conrelid = to_regclass('api_costs')
     ) THEN
         -- Surface orphans before constraining (SELECT-only guard).
         IF EXISTS (
@@ -131,7 +134,7 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'api_costs_archive_site_id_fkey'
-          AND conrelid = 'api_costs_archive'::regclass
+          AND conrelid = to_regclass('api_costs_archive')
     ) THEN
         IF EXISTS (
             SELECT 1 FROM api_costs_archive c
