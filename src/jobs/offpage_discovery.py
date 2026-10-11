@@ -142,7 +142,22 @@ def _dataforseo_seam(site, platform, query, limit):
                 "data_source": "live", "results": [],
                 "http_status": None, "latency_ms": None,
                 "error": f"adapter_config: {type(exc).__name__}: {exc}"}
-    allowed, reason = costlog.check_budget(service="openseo_serp")
+    # check_budget(conn, service) takes the caller's connection; the job's
+    # per-leg conn is not threaded through the seam contract, so the gate
+    # reads the budget cap on its own (read-only) connection.
+    import db as _dbmod
+    try:
+        budget_conn = _dbmod.get_connection()
+        try:
+            allowed, reason = costlog.check_budget(
+                budget_conn, service="openseo_serp")
+        finally:
+            budget_conn.close()
+    except Exception as exc:
+        return {"ok": False, "provider": SEAM_PROVIDERS["dataforseo"],
+                "data_source": "live", "results": [],
+                "http_status": None, "latency_ms": None,
+                "error": f"budget_gate_db: {type(exc).__name__}: {exc}"}
     if not allowed:
         return {"ok": False, "provider": SEAM_PROVIDERS["dataforseo"],
                 "data_source": "live", "results": [],

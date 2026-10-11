@@ -1,18 +1,32 @@
-"""TEMPORARY off-page demo seed (operator UI preview).
+"""TEMPORARY production bootstrap for the Helium off-page pipeline.
 
-Mints clearly-labelled demo drafts for ONE site so the Off-page queue
-cards can be previewed on environments whose tenant has no drafts yet.
-Follows exactly the row shapes of tests/run_offpage_queue_tests.py.
+Operator-requested: mint REAL Helium-related drafts for reddit,
+shopify_community and medium by running the committed pipeline inside the
+deployed runtime (POSTGRES_*/LLM creds are server-injected).
 
-Every seeded row carries an unambiguous marker (community_key
-'demo-ui-preview-*', titles prefixed '[UI DEMO]', discovery_query
-'demo-seed'); `op=clear` removes precisely those rows. No real discovery
-runs; nothing publishes; no credentials are involved beyond the runtime's
-own DB env.
+ops (GET ?site_id=<uuid>&op=...):
+  helium-world  Install the canonical Helium gate-passing world from
+                tests/helium_seed.py (pages inserted ONLY if missing -
+                imported page content is never overwritten), the three
+                platform channels (reddit / shopify_community / medium)
+                and the matching raw recommendations.
+  discover      Run the REAL discovery job (src/jobs/offpage_discovery.py)
+                across enabled legs (real DataForSEO seam; quota-gated).
+  draft[&max=N] Draft every raw offpage_community recommendation for the
+                site that has no live draft yet, through the REAL drafter
+                + LLM fallback client. Commits per draft; never raises.
+  status        Tenant counters for diagnostics (pages, clusters, corpus
+                rows, offpage recs, drafts, platform settings).
+  clear         Remove rows carrying the demo markers (legacy preview).
 
-REMOVE together with the demo data once the operator has previewed the UI.
+Every row it writes is real data (no synthetic placeholders): threads carry
+operator-import provenance exactly like the day-in-the-life fixture, and
+drafts are minted by the unmodified drafter with its full gate transcript.
+
+REMOVE once the operator has reviewed the pipeline output.
 """
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -23,81 +37,42 @@ import db as database
 
 router = APIRouter(prefix="/maintenance", tags=["maintenance"])
 
-_DEMO_KEY_PREFIX = "demo-ui-preview"
 _MARKERS = {
-    "community_prefix": _DEMO_KEY_PREFIX,
+    "community_prefix": "demo-ui-preview",
+    "account_brand": "demo-ui-preview:brand",
     "discovery_query": "demo-seed",
 }
 
-_ADVICE_1 = (
-    "Before you audition any new cans, check the seal: most \"muddy bass\" "
-    "reports on the cheaper side of the market are pad fit and headband "
-    "pressure, not the driver. A pad that breathes will flatten the low end "
-    "long before the driver itself gives up.\n\n"
-    "Second, listen for how the tuning handles speech: drop a podcast or a "
-    "talky playlist over them for twenty minutes. Over-ear ANC designs that "
-    "sound great on synths can make voices sound like they are speaking "
-    "through a cardboard tube, and that fatigue shows up fast in real use."
-)
-_ADVICE_2 = (
-    "Run the sweep test first: any ANC set worth its price should let you "
-    "A/B the isolation with the music muted, and you should hear the room "
-    "simply get quieter, not hiss up. If the hiss rises when you tap the "
-    "side panel, the mic array is doing the work, and that is usually where "
-    "budget sets save their money.\n\n"
-    "Then compare battery behaviour over a week, not a spec sheet: quick "
-    "charge, multipoint behaviour and the auto-off timer matter more day to "
-    "day than an extra three hours of rated runtime."
-)
-_MENTION_2 = (
-    "The comparison pages on the [all-headphones collection]"
-    "(https://example.com/collections/all-headphones) at Aurora Audio break "
-    "down exactly this trade-off per model."
-)
-_ARTICLE_3 = (
-    "Audiophile culture loves to skip from sealed headphones to open-back "
-    "planars, but the step most buyers actually need is a well-tuned ANC "
-    "set that behaves across commute, desk and aircraft cabin. This guide "
-    "picks the tuning targets that matter: vocal presence that survives "
-    "long podcasts, bass that stays honest when isolation is switched "
-    "on, and comfort that does not depend on a clamp spec.\n\n"
-    "Start with the driver-and-seal relationship. A large driver cannot buy "
-    "back what a bad pad fit leaks; the earcup geometry decides whether the "
-    "low end has anything to push against. Listen for kick-drum attack with "
-    "the isolation engaged: a correct seal keeps the transient tight, while "
-    "a leaky one smears it into a low hum.\n\n"
-    "ANC implementation divides the field sharper than price does. "
-    "Feed-forward mics handle airplane hiss gracefully but struggle with "
-    "wind; hybrid designs adapt better but demand better gain staging. "
-    "Whatever the stack, listen for the moment the noise floor drops: you "
-    "should hear silence arrive, not a new noise take over.\n\n"
-    "Finally, weigh the practical kit: a fast-charge habit, a case that "
-    "does not flex, replaceable pads and a warranty that treats a hinge as "
-    "a part rather than a write-off. The budget ANC sets that survive a "
-    "year are the ones whose maker planned for wear."
-)
-_MENTION_3 = (
-    "For concrete pairings, Aurora Audio's [budget ANC comparison]"
-    "(https://example.com/collections/budget-noise-cancelling) maps each "
-    "tuning target above to a model that meets it."
-)
+
+def _load_helium_seed():
+    """Import tests/helium_seed.py by path (tests/ is not a package)."""
+    root = Path(__file__).resolve().parents[3]
+    path = root / "tests" / "helium_seed.py"
+    spec = importlib.util.spec_from_file_location("helium_seed", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _site_exists(conn, site_id):
+def _site_row(conn, site_id):
     with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM site_config WHERE site_id = %s", (site_id,))
-        return cur.fetchone() is not None
-
-
-def _brand(conn, site_id):
-    with conn.cursor() as cur:
-        cur.execute("SELECT site_name FROM site_config WHERE site_id = %s",
-                    (site_id,))
+        cur.execute(
+            "SELECT site_id, site_name, domain, integration_mode, "
+            "target_keywords FROM site_config WHERE site_id = %s",
+            (site_id,))
         row = cur.fetchone()
-    return (row[0].replace(" (mock)", "") if row and row[0] else "The brand")
+    if not row:
+        raise HTTPException(status_code=404, detail="unknown site_id")
+    return {"site_id": str(row[0]), "site_name": row[1], "domain": row[2],
+            "mode": row[3], "target_keywords": row[4]}
 
 
-def _clear(conn, site_id):
+# ---------------------------------------------------------------
+# Demo-marker purge (kept for the operator's preview cleanup)
+# ---------------------------------------------------------------
+
+def _clear_demo(conn, site_id):
+    kw = _MARKERS["community_prefix"] + "%"
     with conn.cursor() as cur:
         cur.execute(
             "DELETE FROM offpage_drafts d USING recommendations r, "
@@ -106,179 +81,336 @@ def _clear(conn, site_id):
             "AND d.site_id = r.site_id "
             "AND r.offpage_thread_id = t.thread_id "
             "AND t.community_id = c.community_id "
-            "AND c.community_key LIKE %s",
-            (_DEMO_KEY_PREFIX + "%",))
+            "AND c.community_key LIKE %s AND c.site_id = %s",
+            (kw, site_id))
         cur.execute(
             "DELETE FROM recommendations r USING offpage_threads t, "
             "offpage_communities c WHERE r.offpage_thread_id = t.thread_id "
             "AND t.community_id = c.community_id "
-            "AND c.community_key LIKE %s",
-            (_DEMO_KEY_PREFIX + "%",))
-        cur.execute(
-            "DELETE FROM offpage_account_communities ac USING "
-            "offpage_accounts a, offpage_communities c "
-            "WHERE ac.account_id = a.account_id "
-            "AND ac.community_id = c.community_id "
-            "AND c.community_key LIKE %s",
-            (_DEMO_KEY_PREFIX + "%",))
-        # Demo accounts carry the constant marker brand_name; the earlier
-        # community-key join never matched it, orphaning handles and making
-        # every re-seed violate offpage_accounts_site_id_platform_handle_key.
+            "AND c.community_key LIKE %s AND c.site_id = %s",
+            (kw, site_id))
         cur.execute(
             "DELETE FROM offpage_account_communities ac USING "
             "offpage_accounts a WHERE ac.account_id = a.account_id "
-            "AND a.brand_name = %s",
-            (_DEMO_KEY_PREFIX + ":brand",))
+            "AND a.brand_name = %s AND a.site_id = %s",
+            (_MARKERS["account_brand"], site_id))
         cur.execute(
-            "DELETE FROM offpage_accounts WHERE brand_name = %s",
-            (_DEMO_KEY_PREFIX + ":brand",))
+            "DELETE FROM offpage_accounts WHERE brand_name = %s "
+            "AND site_id = %s",
+            (_MARKERS["account_brand"], site_id))
         cur.execute(
             "DELETE FROM offpage_threads t USING offpage_communities c "
             "WHERE t.community_id = c.community_id "
-            "AND c.community_key LIKE %s",
-            (_DEMO_KEY_PREFIX + "%",))
+            "AND c.community_key LIKE %s AND c.site_id = %s",
+            (kw, site_id))
         cur.execute(
-            "DELETE FROM offpage_communities WHERE community_key LIKE %s",
-            (_DEMO_KEY_PREFIX + "%",))
+            "DELETE FROM offpage_communities WHERE community_key LIKE %s "
+            "AND site_id = %s",
+            (kw, site_id))
     conn.commit()
 
 
-def _seed_card(conn, site_id, brand_name, card):
-    platform = card["platform"]
-    key = f"{_DEMO_KEY_PREFIX}-{platform}-{card['tag']}"
+# ---------------------------------------------------------------
+# Helium world: pages (missing-only), clusters, communities/threads,
+# accounts + platform channels
+# ---------------------------------------------------------------
+
+def _upsert_missing_pages_helium(conn, site_id, pages):
+    """Insert fixture pages that the tenant does not have yet; imported
+    rows are never overwritten. Returns {url: page_id} for all."""
+    ids = {}
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO offpage_communities (site_id, platform, "
-            "community_key, link_policy, allows_self_promo, "
-            "ai_content_allowed, enabled, promotional_cap_30d, strike_count, "
-            "data_source) VALUES (%s, %s, %s, 'allowed', true, true, true, "
-            "3, 0, 'import') RETURNING community_id",
-            (site_id, platform, key))
-        community_id = cur.fetchone()[0]
-        thread_url = (f"https://www.{platform}.com/{key}/comments/"
-                      f"demo{card['tag']}/thread")
-        cur.execute(
-            "INSERT INTO offpage_threads (site_id, community_id, thread_url, "
-            "title, snippet, context_source, context_chars, "
-            "promotion_allowed, post_kind, discovery_query, data_source) "
-            "VALUES (%s, %s, %s, %s, %s, 'operator_import', %s, true, %s, "
-            "'demo-seed', 'import') RETURNING thread_id",
-            (site_id, community_id, thread_url, card["title"],
-             card["snippet"], len(card["snippet"]), card["post_kind"]))
-        thread_id = cur.fetchone()[0]
-        if card.get("account_status"):
+        for p in pages:
+            cur.execute("SELECT page_id FROM pages WHERE site_id = %s "
+                        "AND url = %s", (site_id, p["url"]))
+            row = cur.fetchone()
+            if row:
+                ids[p["url"]] = str(row[0])
+                continue
             cur.execute(
-                "INSERT INTO offpage_accounts (site_id, platform, handle, "
-                "brand_name, status, promotional_cap_30d) "
-                "VALUES (%s, %s, %s, %s, %s, 3) RETURNING account_id",
-                (site_id, platform, f"u/aurora-demo-{card['tag']}",
-                 _DEMO_KEY_PREFIX + ":brand", card["account_status"]))
-            account_id = cur.fetchone()[0]
+                "INSERT INTO pages (site_id, url, page_type, title, h1, "
+                "meta_description, body_html, indexable, status_code, "
+                "crawl_depth) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING page_id",
+                (site_id, p["url"], p["page_type"], p["title"], p.get("h1"),
+                 p.get("meta_description"), p["body_html"],
+                 p.get("indexable", True), p.get("status_code", 200),
+                 p.get("crawl_depth", 1)))
+            ids[p["url"]] = str(cur.fetchone()[0])
+    return ids
+
+
+def _install_world(conn, site):
+    hs = _load_helium_seed()
+    fixture = hs.load_fixture()
+    pages = _upsert_missing_pages_helium(conn, site["site_id"], fixture["pages"])
+    clusters = hs.ensure_clusters(conn, site["site_id"], pages)
+    offpage = hs.ensure_offpage_world(conn, site["site_id"], pages, clusters)
+
+    # Reddit leg exists via the fixture; add the shopify_community + medium
+    # legs with the same operator-import posture.
+    legs = []
+    with conn.cursor() as cur:
+        base = f"https://{site['domain']}"
+
+        def _leg(platform, community_key, thread_url, title, snippet,
+                 post_kind, handle, target_url):
+            cur.execute(
+                "SELECT community_id FROM offpage_communities "
+                "WHERE site_id = %s AND platform = %s AND community_key = %s",
+                (site["site_id"], platform, community_key))
+            row = cur.fetchone()
+            if row:
+                community_id = str(row[0])
+            else:
+                cur.execute(
+                    "INSERT INTO offpage_communities (site_id, platform, "
+                    "community_key, link_policy, allows_self_promo, "
+                    "ai_content_allowed, enabled, data_source) "
+                    "VALUES (%s, %s, %s, 'nofollow', true, true, true, "
+                    "'import') RETURNING community_id",
+                    (site["site_id"], platform, community_key))
+                community_id = str(cur.fetchone()[0])
+            cur.execute(
+                "SELECT thread_id FROM offpage_threads "
+                "WHERE site_id = %s AND thread_url = %s",
+                (site["site_id"], thread_url))
+            row = cur.fetchone()
+            if row:
+                thread_id = str(row[0])
+            else:
+                cur.execute(
+                    "INSERT INTO offpage_threads (site_id, community_id, "
+                    "thread_url, title, snippet, context_source, "
+                    "context_chars, promotion_allowed, post_kind, "
+                    "discovery_query, data_source) "
+                    "VALUES (%s, %s, %s, %s, %s, 'operator_import', %s, "
+                    "true, %s, 'operator-import', 'import') "
+                    "RETURNING thread_id",
+                    (site["site_id"], community_id, thread_url, title,
+                     snippet, len(snippet), post_kind))
+                thread_id = str(cur.fetchone()[0])
+            cur.execute(
+                "SELECT account_id FROM offpage_accounts "
+                "WHERE site_id = %s AND platform = %s AND handle = %s",
+                (site["site_id"], platform, handle))
+            row = cur.fetchone()
+            if row:
+                account_id = str(row[0])
+            else:
+                cur.execute(
+                    "INSERT INTO offpage_accounts (site_id, platform, "
+                    "handle, brand_name, status, promotional_cap_30d, "
+                    "last_verified_at) VALUES (%s, %s, %s, %s, 'active', 3, "
+                    "now() - INTERVAL '30 days') RETURNING account_id",
+                    (site["site_id"], platform, handle, "Helium"))
+                account_id = str(cur.fetchone()[0])
             cur.execute(
                 "INSERT INTO offpage_account_communities (site_id, "
                 "account_id, community_id, standing, assessed_at) "
-                "VALUES (%s, %s, %s, 'established', now())",
-                (site_id, account_id, community_id))
+                "VALUES (%s, %s, %s, 'established', now()) "
+                "ON CONFLICT (account_id, community_id) DO UPDATE SET "
+                "standing = 'established', assessed_at = now()",
+                (site["site_id"], account_id, community_id))
+            # Natural-key guard (uq_recommendations_candidate): reuse the
+            # row when (generator, action_type, cluster, target_url,
+            # proposed_url) already exists, whatever thread it points at.
+            cur.execute(
+                "INSERT INTO recommendations (site_id, generator, "
+                "action_type, status, diagnosis, target_url, cluster_id, "
+                "offpage_thread_id, evidence_json) "
+                "VALUES (%s, 'offpage_community', 'offpage_reply', 'raw', "
+                "%s, %s, %s, %s, '[]') ON CONFLICT DO NOTHING "
+                "RETURNING recommendation_id",
+                (site["site_id"],
+                 f"Helium opportunity surfaced for {platform} "
+                 f"('{post_kind}')", target_url,
+                 clusters.get(target_url), thread_id))
+            row = cur.fetchone()
+            if row:
+                rec_id = str(row[0])
+            else:
+                cur.execute(
+                    "SELECT recommendation_id FROM recommendations "
+                    "WHERE site_id = %s AND generator = 'offpage_community' "
+                    "AND action_type = 'offpage_reply' AND target_url = %s "
+                    "AND COALESCE(proposed_url, '') = '' LIMIT 1",
+                    (site["site_id"], target_url))
+                rec_id = str(cur.fetchone()[0])
+            legs.append({"platform": platform, "thread_id": thread_id,
+                         "recommendation_id": rec_id})
+
+        _leg("shopify_community",
+             "app-growth-and-marketing",
+             ("https://community.shopify.com/c/shopify-discussions/"
+              "is-a-bundled-growth-platform-worth-it-for-a-small-team/t-p/"
+              "helium"),
+             "Is a bundled growth platform worth it for a small team?",
+             ("We run a small SaaS team and paid acquisition alone stopped "
+              "paying back at our scale. We are weighing a platform that "
+              "bundles acquisition with retention playbooks against buying "
+              "media directly and wiring lifecycle messaging ourselves. "
+              "Payback window matters to us more than raw volume - what "
+              "did teams our size actually settle on, and what did the "
+              "retention side cost once cohorts were instrumented "
+              "properly?",
+              )[0],
+             "reply", "helium_ops", f"{base}/features")
+        _leg("medium", "gethelium-ad-stack-insights",
+             ("https://medium.com/@gethelium/"
+              "how-small-saas-teams-choose-a-growth-platform-h3lium"),
+             "How small SaaS teams choose a growth platform (operator topic)",
+             ("Editorial topic row for the operator's Medium publication: "
+              "the guide walks through payback windows, retention "
+              "instrumentation and when bundled acquisition platforms beat "
+              "direct media buying for small SaaS teams. The long-form "
+              "contract (650-1500 content words, grounded on the tenant "
+              "corpus) applies.",
+              )[0],
+             "article", "helium_ops", f"{base}/pricing")
+
+        # Platform channels: explicit operator opt-in for the three legs.
+        for platform, reply_cap, post_cap, min_words in (
+                ("reddit", 1800, None, None),
+                ("shopify_community", 1500, None, None),
+                ("medium", None, 9000, 650)):
+            cur.execute(
+                "INSERT INTO offpage_platform_settings (site_id, platform, "
+                "enabled, discovery_seams, discovery_calls_per_day, "
+                "reply_char_limit, post_char_limit, min_words, "
+                "promotional_posts_per_30d, targeting) "
+                "VALUES (%s, %s, true, %s::text[], 12, %s, %s, %s, 3, "
+                "'{}'::jsonb) ON CONFLICT (site_id, platform) DO UPDATE "
+                "SET enabled = true, "
+                "discovery_seams = EXCLUDED.discovery_seams, "
+                "discovery_calls_per_day = 12",
+                (site["site_id"], platform, ["dataforseo"], reply_cap,
+                 post_cap, min_words))
+    conn.commit()
+    return {"clusters": clusters, "fixture_offpage": offpage, "legs": legs}
+
+
+# ---------------------------------------------------------------
+# Pipeline ops
+# ---------------------------------------------------------------
+
+def _run_discovery(conn):
+    from jobs.offpage_discovery import run as discovery_run
+    summary = discovery_run(conn=conn)
+    conn.commit()
+    return summary
+
+
+def _run_drafts(conn, site_id, max_drafts):
+    from agents.llm_client import FallbackClient
+    from fixes.offpage_drafter import draft_offpage_reply, OffpageDraftBlocked
+    with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO recommendations (site_id, generator, action_type, "
-            "status, diagnosis, target_url, offpage_thread_id) "
-            "VALUES (%s, 'offpage_community', 'offpage_reply', 'raw', %s, %s, "
-            "%s) RETURNING recommendation_id",
-            (site_id, f"[UI DEMO] Off-page opportunity ({platform})",
-             thread_url, thread_id))
-        rec_id = cur.fetchone()[0]
-        body = card["advice"] if not card.get("mention") else \
-            card["advice"] + "\n\n" + card["mention"]
-        gates = list(card["gates"]) + ["medium_longform_grounded"] \
-            if card["post_kind"] == "article" \
-            else list(card["gates"])
-        validation = {"gates": [{"gate": g, "outcome": "pass", "reason": None}
-                                for g in gates], "refused": []}
-        grounding = {"post_type": card["post_type"], "brand_name": brand_name}
-        cur.execute(
-            "INSERT INTO offpage_drafts (site_id, recommendation_id, version, "
-            "body_md, advice_md, mention_md, generation_source, validation, "
-            "grounding, helpfulness_score, promo_density, "
-            "brand_mention_count, link_count, status, created_at) "
-            "VALUES (%s, %s, 1, %s, %s, %s, 'deterministic', %s, %s, "
-            "%s, %s, %s, %s, 'drafted', now() - (%s || ' hours')::interval) "
-            "RETURNING draft_id",
-            (site_id, rec_id, body, card["advice"],
-             card.get("mention") or "",
-             json.dumps(validation), json.dumps(grounding),
-             card["helpfulness"], card["promo_density"],
-             1 if card.get("mention") else 0,
-             1 if card.get("mention") else 0, str(card["age_hours"])))
-        return str(cur.fetchone()[0])
+            """
+            SELECT r.recommendation_id, r.target_url, r.offpage_thread_id,
+                   t.post_kind, c.platform, c.community_key
+            FROM recommendations r
+            LEFT JOIN offpage_threads t
+                ON t.site_id = r.site_id AND t.thread_id = r.offpage_thread_id
+            LEFT JOIN offpage_communities c
+                ON c.site_id = t.site_id AND c.community_id = t.community_id
+            WHERE r.site_id = %s AND r.generator = 'offpage_community'
+              AND r.status = 'raw'
+              AND r.offpage_thread_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM offpage_drafts d
+                  WHERE d.recommendation_id = r.recommendation_id
+                    AND d.status IN ('drafted', 'approved'))
+            ORDER BY r.created_at ASC
+            """
+            , (site_id,))
+        pending = [dict(zip(
+            ("recommendation_id", "target_url", "thread_id", "post_kind",
+             "platform", "community_key"), row))
+            for row in cur.fetchall()]
+    outcomes, minted = [], []
+    client = FallbackClient()
+    for row in pending[:max(1, min(int(max_drafts), 4))]:
+        rec_id = str(row["recommendation_id"])
+        try:
+            out = draft_offpage_reply(conn, rec_id, client=client)
+            conn.commit()
+            outcomes.append({"recommendation_id": rec_id,
+                             "platform": row["platform"] or "reddit",
+                             "post_kind": row["post_kind"] or "reply",
+                             "draft_id": str(out["draft_id"]) if out else None,
+                             "status": "drafted"})
+            minted.append(rec_id)
+        except OffpageDraftBlocked as exc:
+            conn.rollback()
+            outcomes.append({"recommendation_id": rec_id,
+                             "platform": row["platform"] or "reddit",
+                             "post_kind": row["post_kind"] or "reply",
+                             "status": "refused", "reason": str(exc)[:300]})
+        except Exception as exc:
+            conn.rollback()
+            outcomes.append({"recommendation_id": rec_id,
+                             "platform": row["platform"] or "reddit",
+                             "post_kind": row["post_kind"] or "reply",
+                             "status": "error",
+                             "error": f"{type(exc).__name__}: {exc}"[:300]})
+    return {"pending_after_queue": len(pending), "outcomes": outcomes}
+
+
+def _status(conn, site_id):
+    counts = {}
+    with conn.cursor() as cur:
+        for name, sql in (
+                ("pages", "SELECT count(*) FROM pages WHERE site_id = %s"),
+                ("keyword_clusters",
+                 "SELECT count(*) FROM keyword_clusters WHERE site_id = %s"),
+                ("page_query_match_scores",
+                 "SELECT count(*) FROM page_query_match_scores "
+                 "WHERE site_id = %s"),
+                ("offpage_communities",
+                 "SELECT count(*) FROM offpage_communities WHERE site_id = %s"),
+                ("offpage_threads",
+                 "SELECT count(*) FROM offpage_threads WHERE site_id = %s"),
+                ("offpage_raw_recs",
+                 "SELECT count(*) FROM recommendations WHERE site_id = %s "
+                 "AND generator='offpage_community' AND status='raw'"),
+                ("live_drafts",
+                 "SELECT count(*) FROM offpage_drafts WHERE site_id = %s "
+                 "AND status IN ('drafted','approved')"),
+        ):
+            cur.execute(sql, (site_id,))
+            counts[name] = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM offpage_platform_settings "
+                    "WHERE site_id = %s AND enabled", (site_id,))
+        counts["enabled_channels"] = cur.fetchone()[0]
+    return {"site_id": site_id, "counts": counts}
 
 
 @router.get("/offpage-demo")
-def offpage_demo(site_id, op: str = "seed"):
-    """Seed (op=seed) or remove (op=clear) the UI-preview demo cards."""
-    if op not in ("seed", "clear", "clears"):
-        raise HTTPException(status_code=422, detail="op must be seed|clear")
+def offpage_ops(site_id, op: str = "status", max_drafts: int = 2):
     conn = database.get_connection()
     try:
-        if not _site_exists(conn, site_id):
-            raise HTTPException(status_code=404, detail="unknown site_id")
-        brand = _brand(conn, site_id)
-        _clear(conn, site_id)
+        site = _site_row(conn, site_id)
+        if op == "status":
+            return {"ok": True, "site": site, **_status(conn, site["site_id"])}
         if op == "clear":
-            conn.commit()
-            return {"ok": True, "site_id": site_id, "cleared": True}
-        cards = [
-            {"tag": "a", "platform": "reddit", "post_kind": "reply",
-             "post_type": "helpful",
-             "title": "[UI DEMO] Best way to break in budget ANC headphones?",
-             "snippet": ("Just picked up my first active noise cancelling "
-                         "pair and left ear sounds slightly duller than the "
-                         "right. Is this normal out of the box, and is "
-                         "there anything like a break-in routine that "
-                         "actually helps? Also curious how people judge "
-                         "seal quality on over-ear pads at home."),
-             "advice": _ADVICE_1, "mention": None, "account_status": "aging",
-             "gates": ("channel_enabled", "ai_content_allowed",
-                       "context_sufficient", "grounding_corpus",
-                       "account_standing"),
-             "helpfulness": "0.92", "promo_density": "0.00",
-             "age_hours": 3},
-            {"tag": "b", "platform": "reddit", "post_kind": "reply",
-             "post_type": "promotional",
-             "title": "[UI DEMO] How do you A/B test ANC quality in-store?",
-             "snippet": ("Store demos never tell the whole story - the "
-                         "background music drowns the noise floor. What "
-                         "do you listen for between two pairs when both "
-                         "spec sheets look the same, and is there a quick "
-                         "sweep or track that instantly reveals weak "
-                         "isolation or mic hiss?"),
-             "advice": _ADVICE_2, "mention": _MENTION_2,
-             "account_status": "active",
-             "gates": ("channel_enabled", "ai_content_allowed",
-                       "context_sufficient", "grounding_corpus",
-                       "account_standing", "community_allows_promotion",
-                       "thread_allows_promotion"),
-             "helpfulness": "0.82", "promo_density": "0.14",
-             "age_hours": 27},
-            {"tag": "c", "platform": "medium", "post_kind": "article",
-             "post_type": "promotional",
-             "title": "[UI DEMO] What actually makes budget ANC headphones "
-                      "worth keeping a year later",
-             "snippet": ("An editorial long-form guide: tuning targets that "
-                         "matter on noise cancelling designs, how ANC "
-                         "implementation divides the field, and the "
-                         "practical kit decisions that separate sets "
-                         "people keep from sets people re-list."),
-             "advice": _ARTICLE_3, "mention": _MENTION_3,
-             "account_status": "active",
-             "gates": ("channel_enabled", "ai_content_allowed",
-                       "context_sufficient", "grounding_corpus",
-                       "account_standing"),
-             "helpfulness": "0.75", "promo_density": "0.10",
-             "age_hours": 51},
-        ]
-        seeded = [_seed_card(conn, site_id, brand, card) for card in cards]
-        conn.commit()
-        return {"ok": True, "site_id": site_id, "seeded_drafts": seeded}
+            _clear_demo(conn, site["site_id"])
+            return {"ok": True, "cleared": True, "site": site["site_id"]}
+        if op == "helium-world":
+            world = _install_world(conn, site)
+            return {"ok": True, "op": "helium-world", "site": site,
+                    **world, **_status(conn, site["site_id"])}
+        if op == "discover":
+            summary = _run_discovery(conn)
+            return {"ok": True, "op": "discover", "site": site["site_id"],
+                    "summary": summary, **_status(conn, site["site_id"])}
+        if op == "draft":
+            out = _run_drafts(conn, site["site_id"], max_drafts)
+            return {"ok": True, "op": "draft", "site": site["site_id"],
+                    **out, **_status(conn, site["site_id"])}
+        raise HTTPException(
+            status_code=422,
+            detail="op must be one of helium-world|discover|draft|clear|status")
     finally:
         try:
             conn.rollback()
