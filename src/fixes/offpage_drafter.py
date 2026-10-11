@@ -199,9 +199,11 @@ etc.) are treated as ungrounded vocabulary: build every sentence from \
 ordinary ecommerce vocabulary plus the sources' own words instead.
 
 "mention_md" MUST hold exactly one sentence that connects the client's \
-product to the article's topic and ends with a Markdown link to one of \
-the source URLs, copied verbatim from the sources list. Never invent a \
-URL and never put a link in advice_md.
+product to the article's topic and ends with a Markdown link in the \
+form [name](URL) - for example [product pages](https://www.gethelium.\
+co/ad-stack) - where the URL is copied verbatim from the sources list. \
+Never invent a URL, never link a page the sources do not list, and \
+never put a link in advice_md.
 
 Each PARAGRAPH-BLOCK (a pair of adjacent paragraphs) of advice_md is \
 checked mechanically: at least 35% of the block's content words (words \
@@ -222,6 +224,11 @@ the moment that matters." Example of a paragraph that FAILS: "Email \
 marketers should segment their lists quarterly because list hygiene \
 drives deliverability metrics upward across every measurable sender \
 reputation dimension."
+
+Write NATURAL, fluent prose: vary sentence openers and lengths (8-25 \
+words), never repeat a sentence pattern or an opening phrase, and drop \
+a reuse word that cannot fit a sentence naturally - only the block's \
+overall share of grounded vocabulary matters.
 """
 
 # ------------------------------------------------------------
@@ -546,6 +553,25 @@ def char_ceiling(ctx):
     return settings.get("reply_char_limit")
 
 
+def _canon_url(u):
+    """www/scheme/markdown-normalised URL for corpus matching.
+
+    The tenant's corpus pages legitimately exist under both the apex and
+    the www host; the model copying either variant of the SAME page must
+    not be refused a matching backlink. The model also writes mentions as
+    markdown `[text](url)` or reddit-style `[url].` — the `_URL` regex
+    attaches those trailing `)` / `]` / punctuation to the match, so the
+    canon step trims them. Normalising scheme + `www.` + trailing
+    punctuation makes the match host-canonical while still requiring an
+    EXACT path match - a link to another site's page or an invented path
+    never passes.
+    """
+    out = (u or "").strip().lower()
+    out = re.sub(r"^https?://", "", out)
+    out = re.sub(r"^www\.", "", out)
+    return out.rstrip(r"/.,()\[\]}>'\"")
+
+
 def longform_problems(ctx, advice_text, mention_text, corpus):
     """Gate (HARD): plan/35 Medium long-form contract.
 
@@ -587,10 +613,9 @@ def longform_problems(ctx, advice_text, mention_text, corpus):
         problems.append(f"long-form article has {len(links)} backlinks "
                         f"(max {LONG_FORM_MAX_BACKLINKS})")
     else:
-        allowed = {str(s.get("url") or "").rstrip("/")
+        allowed = {_canon_url(str(s.get("url") or ""))
                    for s in corpus.get("sources", [])}
-        in_corpus = [u for u in links
-                     if u.rstrip("/") in allowed or u.rstrip("/") + "/" in allowed]
+        in_corpus = [u for u in links if _canon_url(u) in allowed]
         if not in_corpus:
             problems.append("contextual backlink does not resolve to a "
                             "grounding_page_ids source URL")
@@ -742,7 +767,7 @@ def sentence_overlap_problems(text, corpus_text):
     return problems
 
 
-def _corpus_vocabulary(corpus_text, limit=36):
+def _corpus_vocabulary(corpus_text, limit=60):
     """The corpus's most frequent content words, mechanically derived.
 
     The list rides in the article payload as `vocabulary_to_reuse` so the
@@ -792,17 +817,19 @@ def _paragraph_blocks(text, section_size=2, max_sentences_per_block=6):
 
 
 def paragraph_overlap_problems(text, corpus_text):
-    """plan/35 long-form grounding, measured over paragraph BLOCKS.
+    """plan/35 long-form grounding, measured over paragraph-BLOCK sections.
 
     Same inverse token-overlap measure as `sentence_overlap_problems`, but
-    the unit is a thematic block (paragraph, or a 4-sentence section when
-    the response has no paragraphs). Sentence-level floors on a 1,000-word
-    body flagged necessary transitional sentences - "This is the part that
-    decides whether the strategy compounds." - that carry no corpus
-    vocabulary by nature. Aggregated over a block, the grounded vocabulary
-    around them carries the paragraph past the floor, while a block of
-    invented specifics still fails. Fail-closed is preserved: EVERY block
-    must clear the floor.
+    the unit is a core thematic section: a pair of consecutive paragraphs
+    (a 4+ sentence group when the response has no paragraphs). Sentence
+    floors on a 1,000-word body flagged necessary transitional sentences -
+    "This is the part that decides whether the strategy compounds." - a
+    false-positive class the live tenant corpus kept tripping. The section
+    unit amortises connective tissue while still failing a bad section.
+
+    Two tiers keep it fail-closed: a section passes at the 0.35 floor, but
+    a PARAGRAPH that sits below 0.10 is flagged even inside a passing
+    section - fully invented prose cannot hide behind a strong neighbour.
     """
     problems = []
     draft_tokens = _content_tokens(text)
@@ -811,13 +838,50 @@ def paragraph_overlap_problems(text, corpus_text):
         return ["grounding corpus too thin to confirm the article"]
     corpus_set = set(corpus_tokens)
     ungrounded = []
-    for block in _paragraph_blocks(text):
-        block_toks = set(_content_tokens(block))
-        if not block_toks:
+
+    def _overlap(chunk):
+        toks = set(_content_tokens(chunk))
+        if not toks:
+            return None
+        return len(toks & corpus_set) / len(toks)
+
+    paragraphs = [b.strip() for b in re.split(r"\n\s*\n", text or "")
+                  if b and b.strip()]
+    if len(paragraphs) > 1:
+        units = [(p,) for p in paragraphs]          # paragraphs themselves
+        sections = [(" ".join(paragraphs[i:i + 2]),
+                     (paragraphs[i], paragraphs[i + 1]
+                      if i + 1 < len(paragraphs) else None))
+                    for i in range(0, len(paragraphs), 2)]
+    else:
+        units = None
+        sections = [(b, ()) for b in _paragraph_blocks(text)]
+
+    for section_text, members in sections:
+        section_overlap = _overlap(section_text)
+        if section_overlap is None:
             continue
-        overlap = len(block_toks & corpus_set) / len(block_toks)
-        if overlap < MIN_BLOCK_OVERLAP:
-            ungrounded.append(block[:90])
+        if section_overlap >= MIN_BLOCK_OVERLAP:
+            # Section passes; still catch a fully invented paragraph.
+            if units:
+                for para in members:
+                    if para is None:
+                        continue
+                    p_overlap = _overlap(para)
+                    if p_overlap is not None and p_overlap < 0.10:
+                        ungrounded.append(para[:90])
+            continue
+        # Failing section: name invented paragraphs precisely, else the
+        # whole section is the offense (nothing below the hard floor).
+        worst = None
+        for para in members:
+            if para is None:
+                continue
+            p_overlap = _overlap(para)
+            if p_overlap is not None and p_overlap < 0.10:
+                worst = para
+                break
+        ungrounded.append((worst or section_text)[:90])
     if ungrounded:
         problems.append(
             f"unsupported sections ({len(ungrounded)} paragraph block(s) "
@@ -1244,7 +1308,8 @@ def draft_offpage_reply(conn, recommendation_id, client=None):
         if fixable:
             fixed = _call_model(ctx, corpus, allow_promotion, brand_name,
                                 client,
-                                revision_feedback=_revision_feedback(preview))
+                                revision_feedback=_revision_feedback(
+                                    preview, corpus))
             if fixed is not None:
                 segments = fixed
                 gate_log.record("model_revision", "pass",
@@ -1449,14 +1514,17 @@ def draft_offpage_reply(conn, recommendation_id, client=None):
     }
 
 
-def _revision_feedback(problems):
+def _revision_feedback(problems, corpus=None):
     """ONE lightweight corrective directive from gate problem strings.
 
-    Classifies each problem into the two failure families the long-form
-    re-ask cares about (word-count shape, corpus grounding, backlink
-    shape) and attaches the offending block previews so the model repairs
-    the named sections instead of starting from scratch. Bounded: at most
-    6 problems, no corpus repetition.
+    Classifies each problem into the failure families the long-form re-ask
+    cares about (word-count shape, corpus grounding, backlink requirement)
+    and attaches the offending block previews so the model repairs the
+    named sections instead of starting from scratch. For a backlink
+    failure the allowed URLs are enumerated LITERALLY - the model kept
+    inventing plausible paths (e.g. /features, /pricing) rather than
+    copying one of the corpus's own pages. Bounded: at most 6 problems,
+    no corpus repetition.
     """
     counts = {"word_count": 0, "grounding": 0, "backlink": 0, "other": 0}
     for p in problems:
@@ -1474,11 +1542,34 @@ def _revision_feedback(problems):
              "backlink requirement" if counts["backlink"] else None,
              "content checks" if counts["other"] else None)
     summary = ", ".join(n for n in named if n)
+    url_clause = ""
+    if counts["backlink"] and corpus:
+        urls = " | ".join(str(s.get("url") or "")
+                          for s in (corpus.get("sources") or []))
+        url_clause = (
+            " The ONLY permitted links are these exact URLs: %s."
+            " mention_md = ONE sentence that connects the product and "
+            "ends with a Markdown link in [name](EXACT-URL) form, using "
+            "one of those URLs verbatim." % urls)
+    if counts["grounding"] and not counts["word_count"]:
+        # Surgical rewrite: the word window is fine and only specific
+        # sections are ungrounded. Naming them and demanding a LOCAL
+        # repair (everything else kept) converts far more re-asks than
+        # "rewrite the whole article", which just re-rolls the dice.
+        return (
+            "Your previous article's word window is fine. FAILURE TYPE: "
+            "insufficient corpus grounding. Rewrite ONLY the sections "
+            "named below so that most of each block's content words come "
+            "from `vocabulary_to_reuse` (the payload's list, measured "
+            "from the sources); keep every other paragraph EXACTLY as it "
+            "was, same two-field JSON schema:%s\n%s"
+            % (url_clause,
+               "\n".join("  - %s" % p for p in problems[:6])))
     return (
-        "Your previous draft was refused. Failure type(s): %s. Fix these "
-        "exact problems (the check re-runs on your new answer, identical "
-        "two-field JSON schema):\n%s"
-        % (summary or "content checks",
+        "Your previous draft was refused. Failure type(s): %s.%s Fix "
+        "these exact problems (the check re-runs on your new answer, "
+        "identical two-field JSON schema):\n%s"
+        % (summary or "content checks", url_clause,
            "\n".join("  - %s" % p for p in problems[:6])))
 
 
@@ -1557,8 +1648,23 @@ def _call_model(ctx, corpus, allow_promotion, brand_name, client,
     system_prompt = OFFPAGE_SYSTEM_PROMPT
     if (ctx.get("post_kind") or "reply") == "article":
         system_prompt = OFFPAGE_SYSTEM_PROMPT + OFFPAGE_ARTICLE_ADDENDUM
+    # Sampling per call kind: the article's FIRST pass is warmer (0.75)
+    # because at the reply temperature (0.2) gpt-oss falls into
+    # pattern-repetition loops across a 900+ word body; the corrective
+    # re-ask is COLDER (0.35) because it is a focused repair, not a fresh
+    # sample. Replies keep the default 0.2 (concise, deterministic).
+    if (ctx.get("post_kind") or "reply") == "article":
+        temperature = 0.35 if revision_feedback else 0.75
+    else:
+        temperature = 0.2
     try:
-        raw = client.complete_json(system_prompt, payload)
+        try:
+            raw = client.complete_json(system_prompt, payload,
+                                       temperature=temperature)
+        except TypeError:
+            # Older client doubles (tests) predate the temperature ride-
+            # through; their signature decides, not their internals.
+            raw = client.complete_json(system_prompt, payload)
     except Exception as exc:
         # A provider outage (quota, 503, auth) is NOT the same failure as a
         # model that answered with unusable JSON. Record which one it was so

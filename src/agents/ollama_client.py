@@ -162,17 +162,21 @@ class OllamaClient:
                 return reasoning
         return content
 
-    def complete_json(self, system_prompt, user_payload, retries=1):
+    def complete_json(self, system_prompt, user_payload, retries=1,
+                      temperature=0.2):
         """Send system + user JSON payload; parse the model's JSON answer.
 
         One retry with an explicit "valid JSON only" reminder when the model
         returns truncated/malformed JSON (hit the token ceiling, etc.).
+        `temperature` rides through for callers that tune sampling per
+        content kind (long-form articles use a warmer first pass).
         """
         content = self.chat(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(user_payload, default=str)},
             ],
+            temperature=temperature,
         )
         try:
             return parse_json_content(content)

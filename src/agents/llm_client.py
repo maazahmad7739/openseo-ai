@@ -283,25 +283,29 @@ class FallbackClient:
                                        max_tokens=max_tokens))
         return content
 
-    def complete_json(self, system_prompt, user_payload, retries=1):
+    def complete_json(self, system_prompt, user_payload, retries=1,
+                      temperature=0.2):
         """JSON completion with fallback. Always returns PARSED JSON.
 
         Guarantees the contract that `OllamaClient.complete_json` does not:
         the retry path is parsed too, so a caller never receives a raw
-        string and never has to defend against one.
+        string and never has to defend against one. `temperature` rides
+        through for callers that tune sampling per content kind.
         """
         payload, _ = self._run(
             lambda client: self._complete_json_via(client, system_prompt,
-                                                   user_payload, retries))
+                                                   user_payload, retries,
+                                                   temperature))
         return payload
 
-    def _complete_json_via(self, client, system_prompt, user_payload, retries):
+    def _complete_json_via(self, client, system_prompt, user_payload, retries,
+                           temperature=0.2):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(user_payload,
                                                    default=str)},
         ]
-        content = client.chat(messages=messages)
+        content = client.chat(messages=messages, temperature=temperature)
         try:
             return parse_json_content(content)
         except OllamaApiError:

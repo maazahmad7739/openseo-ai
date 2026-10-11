@@ -182,7 +182,8 @@ class GeminiClient:
                 f"empty response (finishReason={finish or 'UNKNOWN'})")
         return text
 
-    def complete_json(self, system_prompt, user_payload, retries=1):
+    def complete_json(self, system_prompt, user_payload, retries=1,
+                      temperature=0.2):
         """Send system + user JSON payload; parse the model's JSON answer.
 
         Same contract as `OllamaClient.complete_json`, including one retry
@@ -190,12 +191,13 @@ class GeminiClient:
         the answer, which `OllamaClient.complete_json` does NOT do on its
         retry path - that path returns the raw string, which is the
         behaviour `offpage_drafter.normalize_llm_response` defends against.
+        `temperature` rides through for callers that tune sampling.
         """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(user_payload, default=str)},
         ]
-        content = self.chat(messages=messages)
+        content = self.chat(messages=messages, temperature=temperature)
         # parse_json_content delegates to the Ollama parser, which signals
         # malformed output with OllamaApiError - NOT GeminiApiError. Catching
         # only the Gemini type here meant a malformed Gemini reply escaped
