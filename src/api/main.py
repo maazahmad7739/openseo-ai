@@ -147,6 +147,8 @@ app.include_router(audit.router)
 app.include_router(offpage.router)
 from api.routes.github_sync import router as github_sync_router
 app.include_router(github_sync_router)
+from api.routes.maintenance import router as maintenance_router  # TEMPORARY (UI preview demo)
+app.include_router(maintenance_router)
 
 # Vercel serves the FastAPI app at /api/* (api/index.py).  The SPA's fetch
 # calls target /api/queue…, /api/pipeline…, etc., so the same routers are
@@ -161,6 +163,8 @@ app.include_router(fixes.router, prefix=_API_PREFIX, include_in_schema=False)
 app.include_router(audit.router, prefix=_API_PREFIX, include_in_schema=False)
 app.include_router(offpage.router, prefix=_API_PREFIX, include_in_schema=False)
 app.include_router(github_sync_router, prefix=_API_PREFIX, include_in_schema=False)
+from api.routes.maintenance import router as _demo_router  # TEMPORARY (UI preview demo)
+app.include_router(_demo_router, prefix=_API_PREFIX, include_in_schema=False)
 
 # Serve the built operator UI (brief §4.1: one deployable process). The API
 # and the SPA share one origin/port, so the UI's relative fetch('/queue', ...)
