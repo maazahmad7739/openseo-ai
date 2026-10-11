@@ -337,12 +337,29 @@ class GscRestAdapter:
             })
         return normalized
 
+    # Canonical slot positions for the fixed 5-dim row shape this module's
+    # fixtures use (gsc_search_analytics.json keys = [date, query, page,
+    # country, device]). Lower-dimensional requests must project BY SLOT:
+    # zipping a [date, page] request into 5-dim keys returns the query text
+    # as page_url, so the page pass of the search_performance two-pass sync
+    # (src/connectors/sync.py) writes query-shaped garbage instead of URLs
+    # and URL-level baselines/control groups go empty on fixture-driven DBs.
+    _KEY_SLOTS = {"date": 0, "query": 1, "page": 2, "page_url": 2, "country": 3, "device": 4}
+
     def _normalize_search_analytics(self, raw, params):
         dims = params.get("dimensions") or params.get("dimension") or DEFAULT_DIMENSIONS
         normalized = []
         for row in raw.get("rows", []) or []:
             keys = row.get("keys") or []
-            item = {dims[i]: keys[i] for i in range(min(len(keys), len(dims)))}
+            if len(keys) == len(dims):
+                # Live API responses (and matching fixtures): keys follow the
+                # requested dimension order.
+                item = {dims[i]: keys[i] for i in range(len(dims))}
+            else:
+                # Fixed-width fixture rows: project every requested dimension
+                # from its canonical slot in [date, query, page, country, device].
+                item = {d: (keys[i] if i < len(keys) else None)
+                        for d, i in self._KEY_SLOTS.items()}
             page_url = item.pop("page", None) or item.pop("page_url", None)
             clicks = row.get("clicks", 0)
             impressions = row.get("impressions", 0)

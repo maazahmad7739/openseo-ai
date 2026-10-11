@@ -50,6 +50,8 @@ jobs:
           python -c "import sys; sys.path.insert(0, 'src'); import db; conn = db.get_connection(); conn.cursor().execute('CREATE EXTENSION IF NOT EXISTS pgcrypto'); conn.commit(); conn.close(); db.apply_schema()"
       - name: Apply schema migrations
         run: python scripts/migrate.py
+      - name: Seed CI test site
+        run: python scripts/seed_test_site.py
       - name: Run backend test suites
         run: python scripts/run_tests.py
 

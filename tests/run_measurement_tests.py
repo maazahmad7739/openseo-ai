@@ -150,6 +150,22 @@ def main():
         tiny_new = f"https://example.com/collections/cp-tiny-{token}"
         _sp_row(conn, cp_site, "2026-10-20", f"cp-tiny-{token}-q1", tiny_new, 2, 30)
 
+        # Control pairing (baseline.py) selects peers from `pages` filtered on
+        # the TARGET page's page_type/template. Mock sync can name the same
+        # collection archetype differently per page (fixture template vs
+        # plan/32 `urlarchetype:` inference), so pin both paired mock pages
+        # to one template — otherwise the control group is empty on any DB
+        # where the fixture/upsert mix happened to diverge.
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO pages (site_id, url, page_type, template) "
+                "VALUES (%s, %s, 'collection', 'collection.liquid'), "
+                "       (%s, %s, 'collection', 'collection.liquid') "
+                "ON CONFLICT (site_id, url_hash) DO UPDATE "
+                "SET page_type = EXCLUDED.page_type, template = EXCLUDED.template",
+                (cp_site, weak_existing, cp_site, control_page))
+        conn.commit()
+
         def _cp_rec(cluster_id, proposed_url):
             with conn.cursor() as cur:
                 cur.execute(

@@ -26,15 +26,14 @@ LEDGER_TABLE = "schema_migrations"
 MIGRATIONS_DIR = ROOT / "plan"
 
 # plan SQL files that are NOT schema migrations:
-# - 00-schema.sql / 19-cost-tracking.sql: legacy DDL predating the ledger,
-#   historically applied by db.apply_schema() / ad-hoc scripts; not written
-#   idempotent (bare CREATE TABLE / CREATE INDEX).
+# - 00-schema.sql: legacy DDL predating the ledger, not written
+#   idempotent (bare CREATE TABLE / CREATE INDEX); historically applied
+#   by db.apply_schema().
 # - 01..05-generator-*.sql: per-site generator query TEMPLATES executed at
 #   runtime by src/generators/runner.py (run_generator binds :site_id /
 #   :reference_date); they are queries, never DDL to apply at deploy time.
 NON_MIGRATIONS = {
     "00-schema.sql",
-    "19-cost-tracking.sql",
     "01-generator-missing-pages.sql",
     "02-generator-existing-opportunities.sql",
     "03-generator-technical-root-causes.sql",
