@@ -121,12 +121,17 @@ def _clear(conn, site_id):
             "AND ac.community_id = c.community_id "
             "AND c.community_key LIKE %s",
             (_DEMO_KEY_PREFIX + "%",))
+        # Demo accounts carry the constant marker brand_name; the earlier
+        # community-key join never matched it, orphaning handles and making
+        # every re-seed violate offpage_accounts_site_id_platform_handle_key.
         cur.execute(
-            "DELETE FROM offpage_accounts a USING offpage_communities c "
-            "WHERE a.site_id = c.site_id AND a.platform = c.platform "
-            "AND a.brand_name = c.community_key || ':brand' "
-            "AND c.community_key LIKE %s",
-            (_DEMO_KEY_PREFIX + "%",))
+            "DELETE FROM offpage_account_communities ac USING "
+            "offpage_accounts a WHERE ac.account_id = a.account_id "
+            "AND a.brand_name = %s",
+            (_DEMO_KEY_PREFIX + ":brand",))
+        cur.execute(
+            "DELETE FROM offpage_accounts WHERE brand_name = %s",
+            (_DEMO_KEY_PREFIX + ":brand",))
         cur.execute(
             "DELETE FROM offpage_threads t USING offpage_communities c "
             "WHERE t.community_id = c.community_id "
