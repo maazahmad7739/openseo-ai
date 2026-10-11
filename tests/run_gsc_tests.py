@@ -98,12 +98,20 @@ def main():
     allok &= nf_expected
 
     cleanup = os.environ.get("GSC_MOCK_MODE")
+    # This block tests LEGACY resolution (GSC_MOCK_MODE=0 -> live -> raise
+    # without a credential). The central INTEGRATION_MODE switch outranks
+    # legacy vars in resolve_mode (connectors/mode.py), so a mock-mode
+    # ambient (e.g. scripts/run_tests.py, CI) would mask the raise — pop it
+    # for the duration and restore after.
+    central_cleanup = os.environ.pop("INTEGRATION_MODE", None)
     os.environ["GSC_MOCK_MODE"] = "0"
     realfail = False
     try:
         get_gsc_adapter(config={})
     except GscConfigError:
         realfail = True
+    if central_cleanup is not None:
+        os.environ["INTEGRATION_MODE"] = central_cleanup
     if cleanup is not None:
         os.environ["GSC_MOCK_MODE"] = cleanup
     else:

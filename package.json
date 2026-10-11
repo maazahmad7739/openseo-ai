@@ -6,6 +6,8 @@
     "node": ">=22.12.0"
   },
   "scripts": {
+    "migrate": "python scripts/migrate.py",
+    "test": "python scripts/run_tests.py",
     "prebuild": "npm --prefix apps/openseo-plus install --no-package-lock",
     "build": "npm --prefix apps/openseo-plus run build"
   }

@@ -81,11 +81,13 @@ class RejectOut(BaseModel):
     recommendation_id: UUID
     status: str
     rejection_log_id: UUID
+    promoted_from_backlog: int = 0
 
 
 class ApproveOut(BaseModel):
     recommendation_id: UUID
     status: str
+    promoted_from_backlog: int = 0
 
 
 class AssignRequest(BaseModel):
@@ -216,3 +218,148 @@ class HealthOut(BaseModel):
     database: str
     integration_mode: str
     agent_credentials: str
+
+
+# ---------------------------------------------------------------------------
+# Off-page operator queue (plan/33 + plan/34)
+# ---------------------------------------------------------------------------
+
+class OffpageGateSummary(BaseModel):
+    gate: str
+    outcome: str
+    reason: Optional[str] = None
+
+
+class OffpageCapOut(BaseModel):
+    """Promotional headroom for the account + community this draft targets.
+
+    Mirrors the drafter's cap gate (v_offpage_promo_cap_usage) so the
+    operator sees the same numbers the pipeline would refuse on.
+    """
+    account_handle: str
+    account_promotional_cap_30d: int
+    account_promotional_30d: int
+    account_cap_reached: bool
+    community_promotional_cap_30d: int
+    community_promotional_30d: int
+    community_cap_reached: bool
+
+
+class OffpageQueueItem(BaseModel):
+    draft_id: UUID
+    version: int
+    status: str
+    approved_at: Optional[datetime] = None
+    created_at: datetime
+    recommendation_id: UUID
+    site_id: UUID
+    client_name: Optional[str] = None
+    domain: Optional[str] = None
+    community_key: Optional[str] = None
+    platform: Optional[str] = None
+    post_kind: Optional[str] = None
+    thread_url: Optional[str] = None
+    thread_title: Optional[str] = None
+    thread_snippet: Optional[str] = None
+    discovery_query: Optional[str] = None
+    context_source: Optional[str] = None
+    context_chars: Optional[int] = None
+    reply_char_limit: Optional[int] = None
+    post_char_limit: Optional[int] = None
+    min_words: Optional[int] = None
+    advice_md: Optional[str] = None
+    mention_md: Optional[str] = None
+    body_md: str
+    post_type: str
+    helpfulness_score: Optional[float] = None
+    promo_density: Optional[float] = None
+    brand_mention_count: Optional[int] = None
+    link_count: Optional[int] = None
+    gates: List[OffpageGateSummary] = []
+    account_handle: Optional[str] = None
+    caps: Optional[OffpageCapOut] = None
+    operator_choice: Optional[str] = None
+
+
+class OffpageQueueOut(BaseModel):
+    site_id: UUID
+    active_cap: int
+    total_active: int
+    total_pending: int
+    showing: int
+    items: List[OffpageQueueItem] = []
+
+
+class OffpageChooseRequest(BaseModel):
+    action: str = Field(..., description="'helpful' copies advice_md; "
+                                        "'promotional' copies the full body "
+                                        "and re-checks the 30d cap")
+
+
+class OffpageChooseOut(BaseModel):
+    draft_id: UUID
+    status: str
+    action: str
+    copied_md: str
+    mention_allowed: bool = False
+    caps: Optional[OffpageCapOut] = None
+
+
+class OffpageSkipRequest(BaseModel):
+    reason: str = Field(min_length=1)
+
+
+class OffpageSkipOut(BaseModel):
+    draft_id: UUID
+    status: str
+    recommendation_id: UUID
+    recommendation_status: str
+    rejection_log_id: Optional[UUID] = None
+
+
+class OffpagePermalinkRequest(BaseModel):
+    permalink: str = Field(min_length=1)
+    operator: Optional[str] = None
+
+
+class OffpageCheckpointOut(BaseModel):
+    checkpoint_index: int
+    offset_minutes: int
+    checkpoint_due_at: datetime
+
+
+class OffpagePermalinkOut(BaseModel):
+    publication_id: UUID
+    draft_id: UUID
+    site_id: UUID
+    status: str
+    post_type: str
+    live_permalink: str
+    submitted_at: datetime
+    recommendation_status: str
+    checkpoints: List[OffpageCheckpointOut] = []
+
+
+# ---------------------------------------------------------------------------
+# Off-page platform settings (plan/35 §3) - per-tenant channel control
+# ---------------------------------------------------------------------------
+
+class OffpagePlatformSettings(BaseModel):
+    """One (site_id, platform) control row; exactly the fail-closed knobs
+    the discovery job and the drafter gates read."""
+    site_id: UUID
+    platform: str
+    enabled: bool = False
+    discovery_seams: List[str] = []
+    discovery_calls_per_day: int = 20
+    reply_char_limit: Optional[int] = None
+    post_char_limit: Optional[int] = None
+    min_words: Optional[int] = None
+    promotional_posts_per_30d: Optional[int] = None
+    targeting: dict = {}
+
+
+class OffpagePlatformSettingsOut(BaseModel):
+    site_id: UUID
+    items: List[OffpagePlatformSettings] = []
+    active_channels: int = 0

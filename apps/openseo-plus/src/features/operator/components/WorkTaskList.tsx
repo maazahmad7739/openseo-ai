@@ -3,11 +3,12 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
   Circle,
+  ExternalLink,
   Loader2,
   Wrench,
   X,
@@ -66,6 +67,31 @@ export function FixStatusBadge({ status }: { status: FixStatus }) {
 
 /* ── Fix diff preview + gate-2 approval ──────────────────────────────── */
 
+/** Client-side mirror of the backend's task classifier (plan/28): the
+ * same specific-match precedence so a task's diff preview shows ITS
+ * OWN sub_type's fixes. Shopfiy patterns omitted (drawer filtering only
+ * needs the netlify surfaces; other platforms rely on fixId linkage). */
+export function taskSubTypeFor(taskText: string): string | null {
+  return taskSubTypesFor(taskText)[0] ?? null;
+}
+
+/** All sub_types a task bundles (backend _sub_types_for_task mirror):
+ * title and meta both route to netlify.title_meta_rewrite on netlify
+ * surfaces; shopify tasks rely on fixId/fix_refs linkage instead. */
+export function taskSubTypesFor(taskText: string): string[] {
+  const lowered = (taskText || "").toLowerCase();
+  if (lowered.includes("structured") || lowered.includes("json")) {
+    return ["netlify.structured_data"];
+  }
+  if (lowered.includes("canonical")) {
+    return ["netlify.canonical_tag"];
+  }
+  if (lowered.includes("title") || lowered.includes("meta description")) {
+    return ["netlify.title_meta_rewrite"];
+  }
+  return [];
+}
+
 interface FixDto {
   fix_id: string;
   sub_type: string | null;
@@ -77,6 +103,11 @@ interface FixDto {
 const FIELD_LABELS: Record<string, string> = {
   "seo.title": "Title tag",
   "seo.description": "Meta description",
+  "meta.canonical": "Canonical tag",
+  "meta.jsonld": "Structured data",
+  "meta.title": "Title tag",
+  "meta.description": "Meta description",
+  "framer.title": "Title tag",
   "collection.description_html": "Collection description",
   "collection.title": "Collection title",
   "collection.handle": "URL handle",
@@ -111,14 +142,25 @@ function stripHtml(value: string): string {
     .trim();
 }
 
+/** Fields whose diff values are PROSE HTML (a description body), where
+ * tag-stripping is the right display. Markup-valued fields — meta.canonical
+ * carries a literal `<link rel="canonical" …>` tag — must render verbatim:
+ * stripping them produced an empty preview next to the green "+" (the tag
+ * was swallowed by the same regex). React escapes text content by default,
+ * so the raw tag string renders safely as text. */
+const HTML_PROSE_FIELDS = new Set(["collection.description_html"]);
+
 const DIFF_PREVIEW_CHAR_CAP = 400;
 
-function DiffPreviewText({ value }: { value?: string }) {
+function DiffPreviewText({ value, field }: { value?: string; field?: string }) {
   const [expanded, setExpanded] = useState(false);
-  // HTML-valued diffs (collection.description_html) arrive pre-stripped by
-  // the generator's diff builder; strip defensively anyway so a raw-HTML
-  // row can never render markup into the drawer.
-  const text = stripHtml(value ?? "");
+  // HTML-prose diffs (collection.description_html) arrive pre-stripped by
+  // the generator's diff builder; strip defensively anyway. Everything
+  // else renders verbatim — a canonical-tag diff IS its markup string.
+  const text =
+    field && HTML_PROSE_FIELDS.has(field)
+      ? stripHtml(value ?? "")
+      : (value ?? "").trim();
   const truncated = !expanded && text.length > DIFF_PREVIEW_CHAR_CAP;
   return (
     <>
@@ -173,7 +215,7 @@ function DiffRow({ field, oldValue, newValue }: {
               −
             </span>
             <span className="text-base-content/50 line-through">
-              <DiffPreviewText value={oldValue} />
+              <DiffPreviewText value={oldValue} field={field} />
             </span>
           </p>
         ) : (
@@ -192,7 +234,7 @@ function DiffRow({ field, oldValue, newValue }: {
               +
             </span>
             <span className="font-medium text-base-content">
-              <DiffPreviewText value={newValue} />
+              <DiffPreviewText value={newValue} field={field} />
             </span>
           </p>
         ) : null}
@@ -206,18 +248,79 @@ function DiffRow({ field, oldValue, newValue }: {
  * The fix engine drafts lazily: when the drawer opens on an approved
  * recommendation with no generated_fixes rows yet, this component calls
  * POST /recommendations/{id}/draft-fixes once, then reads the diff.
+ *
+ * A task bundling several engine surfaces (title + meta) carries
+ * fix_refs — one diff block renders PER ref so every field's before/after
+ * is visible (the seo.title row is no longer shadowed by the
+ * seo.description precedence match).
  */
 function FixDiffPreview({
   recommendationId,
   fixId,
   fixStatus,
+  taskText,
+  fixRefs,
 }: {
   recommendationId: string;
   fixId?: string;
   fixStatus?: FixStatus;
+  /** The task's own text: disambiguates WHICH sub_type this task maps to
+   * when a recommendation carries multiple automated tasks (structured
+   * data AND canonical on netlify), so each task renders ITS OWN fix
+   * diff — never a sibling task's diff. */
+  taskText?: string;
+  /** All fix rows this task bundles (backend enrich_work_tasks). */
+  fixRefs?: WorkRequiredItem["fix_refs"];
+}) {
+  const refs: Array<{ fix_id: string; status?: FixStatus }> =
+    fixRefs && fixRefs.length > 0
+      ? fixRefs.map((r) => ({ fix_id: r.fix_id, status: r.status }))
+      : fixId
+        ? [{ fix_id: fixId, status: fixStatus }]
+        : [];
+  if (refs.length > 1) {
+    return (
+      <div className="mt-2 space-y-2">
+        {refs.map((ref) => (
+          <SingleFixPreview
+            key={ref.fix_id}
+            recommendationId={recommendationId}
+            fixId={ref.fix_id}
+            fixStatus={ref.status}
+            taskText={taskText}
+          />
+        ))}
+      </div>
+    );
+  }
+  return (
+    <SingleFixPreview
+      recommendationId={recommendationId}
+      fixId={refs[0]?.fix_id}
+      fixStatus={refs[0]?.status}
+      taskText={taskText}
+    />
+  );
+}
+
+function SingleFixPreview({
+  recommendationId,
+  fixId,
+  fixStatus,
+  taskText,
+}: {
+  recommendationId: string;
+  fixId?: string;
+  fixStatus?: FixStatus;
+  taskText?: string;
 }) {
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
+  // plan/27+28: version-history toggle. MUST live with the other hooks —
+  // a useState after conditional early returns breaks React's hook order
+  // (the drawer crashed "something went wrong" on the loading->loaded
+  // transition exactly because of that).
+  const [showHistory, setShowHistory] = useState(false);
 
   const fixes = useQuery({
     queryKey: ["openseo", "fixes", recommendationId],
@@ -225,12 +328,23 @@ function FixDiffPreview({
     staleTime: 15_000,
   });
 
-  // Lazy draft: only fire when the fix list came back EMPTY and no fix has
-  // been decided yet. Idempotent server-side (uq_fixes_active_per_target).
+  // plan/28 task-scoped filtering: match the fix row to THIS task via the
+  // same precedence the backend classifier uses (structured/json >
+  // canonical > title/meta). A task only ever sees its own sub_type's
+  // fixes — the structured diff can never leak into the canonical task.
+  const taskSubType = taskSubTypeFor(taskText ?? "");
+  const scopedRows = (fixes.data ?? []).filter((f) => {
+    if (fixId) return f.fix_id === fixId;
+    if (!taskSubType) return true;
+    return f.sub_type === taskSubType;
+  });
+
+  // Lazy draft: only fire when this task has NO fix rows (post-filter) and
+  // no fix has been decided yet. Idempotent server-side.
   const shouldDraft =
     !fixes.isPending &&
     !fixes.isError &&
-    (fixes.data ?? []).length === 0 &&
+    scopedRows.length === 0 &&
     fixId == null &&
     fixStatus == null;
 
@@ -247,6 +361,17 @@ function FixDiffPreview({
       void queryClient.invalidateQueries({ queryKey: ["openseo", "detail", recommendationId] });
     },
   });
+
+  // Lazy draft: actually FIRE the mutation when the drawer opens on a
+  // recommendation with no fix rows yet. The comment above promised
+  // "calls POST …/draft-fixes once" — without this effect the mutation
+  // sat unused and auto-fix tasks silently rendered nothing.
+  useEffect(() => {
+    if (shouldDraft && !draft.isPending && !draft.isError && !draft.data) {
+      draft.mutate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shouldDraft, recommendationId]);
 
   if (fixes.isPending) {
     return (
@@ -310,23 +435,27 @@ function FixDiffPreview({
         </p>
       );
     }
-    if (draft.isError) {
-      return (
-        <p className="mt-2 flex items-center gap-1.5 text-[11px] text-base-content/40">
-          <AlertTriangle className="size-3" /> Drafting failed —{" "}
-          <button
-            type="button"
-            className="underline underline-offset-2 hover:text-primary"
-            onClick={(e) => {
-              e.stopPropagation();
-              draft.mutate();
-            }}
-          >
-            retry
-          </button>
-        </p>
-      );
-    }
+  if (draft.isError) {
+    return (
+      <p className="mt-2 text-[11px] text-base-content/50">
+        <AlertTriangle className="mt-0.5 inline size-3 text-warning" /> Drafting
+        needs card approval —{" "}
+        <button
+          type="button"
+          className="underline underline-offset-2 hover:text-primary"
+          onClick={(e) => {
+            e.stopPropagation();
+            draft.reset();
+          }}
+        >
+          dismiss
+        </button>{" "}
+        <span className="text-base-content/35">
+          ({String(draft.error).slice(0, 90)})
+        </span>
+      </p>
+    );
+  }
     if (draft.data) {
       if (draft.data.drafts.length > 0) return null; // diff renders below on refetch
       return (
@@ -349,8 +478,11 @@ function FixDiffPreview({
     return null;
   }
 
-  const rows = fixes.data ?? [];
-  if (rows.length === 0) {
+  // plan/27+28 UX: only the LATEST ACTIVE fix of THIS task's sub_type
+  // renders inline — the retry chain collapses into a muted "version
+  // history" line. Priority: applied > queued > generated.
+  const allRows = scopedRows;
+  if (allRows.length === 0) {
     return (
       <p className="mt-2 text-[11px] text-base-content/40">
         No drafted fix yet.
@@ -358,77 +490,131 @@ function FixDiffPreview({
     );
   }
 
+  // plan/27+28 UX: only the LATEST ACTIVE fix renders inline — the retry
+  // chain (failed/expired historical rows) collapses into a muted
+  // "version history" line. Priority: applied > queued > generated; the
+  // first row in that order wins (the API already sorts applied first).
+  const active =
+    allRows.find((f) => f.status === "applied") ??
+    allRows.find((f) => f.status === "queued") ??
+    allRows.find((f) => f.status === "generated") ??
+    allRows[0];
+  const superseded = allRows.filter((f) => f.fix_id !== active.fix_id);
+
   const decided = fixStatus === "queued" || fixStatus === "applied";
 
   return (
     <div className="mt-2 space-y-2">
-      {rows.map((fix) => {
-        const diffs = fix.diff_json ?? [];
-        const actionable = fix.status === "generated";
-        return (
-          <div key={fix.fix_id} className="space-y-2">
-            {diffs.map((d, di) => (
-              <DiffRow
-                key={di}
-                field={d.field}
-                oldValue={d.old_value}
-                newValue={d.new_value}
-              />
-            ))}
-            <div className="flex flex-wrap items-center gap-2">
-              {actionable && !decided ? (
-                <>
+      {superseded.length > 0 ? (
+        <button
+          type="button"
+          className="text-[10px] text-base-content/35 underline underline-offset-2 hover:text-base-content/55"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowHistory((v) => !v);
+          }}
+        >
+          {showHistory ? "Hide" : "Show"} {superseded.length} superseded
+          attempt{superseded.length === 1 ? "" : "s"}
+        </button>
+      ) : null}
+      {showHistory
+        ? superseded.map((fix) => (
+            <div
+              key={fix.fix_id}
+              className="rounded-lg border border-base-200/60 bg-base-200/20 p-2 opacity-60"
+            >
+              <p className="text-[10px] uppercase tracking-wider text-base-content/40">
+                superseded · {fix.status}
+              </p>
+              {(fix.diff_json ?? []).map((d, di) => (
+                <DiffRow
+                  key={di}
+                  field={d.field}
+                  oldValue={d.old_value}
+                  newValue={d.new_value}
+                />
+              ))}
+            </div>
+          ))
+        : null}
+      <div className="space-y-2">
+        {(() => {
+          const diffs = active.diff_json ?? [];
+          const actionable = active.status === "generated";
+          const isNetlify = (active.sub_type ?? "").startsWith("netlify.");
+          return (
+            <div className="space-y-2">
+              {diffs.map((d, di) => (
+                <DiffRow
+                  key={di}
+                  field={d.field}
+                  oldValue={d.old_value}
+                  newValue={d.new_value}
+                />
+              ))}
+              <div className="flex flex-wrap items-center gap-2">
+                {actionable && !decided ? (
+                  <>
+                    <button
+                      type="button"
+                      className="btn btn-xs btn-primary"
+                      disabled={busy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void act(active, "approve");
+                      }}
+                    >
+                      {busy ? <Loader2 className="size-3 animate-spin" /> : null}
+                      Approve &amp; Queue
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-xs btn-ghost text-error"
+                      disabled={busy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void act(active, "reject");
+                      }}
+                    >
+                      <X className="size-3" />
+                      Reject
+                    </button>
+                  </>
+                ) : active.status === "queued" ? (
                   <button
                     type="button"
                     className="btn btn-xs btn-primary"
                     disabled={busy}
                     onClick={(e) => {
                       e.stopPropagation();
-                      void act(fix, "approve");
+                      void act(active, "apply");
                     }}
                   >
                     {busy ? <Loader2 className="size-3 animate-spin" /> : null}
-                    Approve &amp; Queue
+                    Apply now
                   </button>
-                  <button
-                    type="button"
-                    className="btn btn-xs btn-ghost text-error"
-                    disabled={busy}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void act(fix, "reject");
-                    }}
-                  >
-                    <X className="size-3" />
-                    Reject
-                  </button>
-                </>
-              ) : fix.status === "queued" ? (
-                <button
-                  type="button"
-                  className="btn btn-xs btn-primary"
-                  disabled={busy}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void act(fix, "apply");
-                  }}
-                >
-                  {busy ? <Loader2 className="size-3 animate-spin" /> : null}
-                  Apply now
-                </button>
-              ) : (
-                <span className="text-[11px] text-base-content/40">
-                  {fix.status === "applied"
-                    ? "Applied to the store"
-                    : "Reviewed"}
-                </span>
-              )}
+                ) : (
+                  <span className="text-[11px] text-base-content/40">
+                    {appliedCopy(active.status, isNetlify)}
+                  </span>
+                )}
+              </div>
             </div>
-          </div>
-        );
-      })}
+          );
+        })()}
+      </div>
     </div>
   );
+}
+
+/** Platform-aware applied copy (plan/27+28): Shopify writes land on the
+ * store; netlify fixes land as GitHub PRs on the content branch. */
+export function appliedCopy(status: FixStatus, isNetlify: boolean): string {
+  if (status === "applied") {
+    return isNetlify ? "PR generated — applied to branch" : "Applied to the store";
+  }
+  return "Reviewed";
 }
 
 /* ── Task list ───────────────────────────────────────────────────────── */
@@ -530,7 +716,22 @@ export function WorkTaskList({
                     recommendationId={recommendationId}
                     fixId={item.fix_id}
                     fixStatus={item.fix_status}
+                    taskText={item.task}
+                    fixRefs={item.fix_refs}
                   />
+                ) : null}
+                {item.fix_pr_url ? (
+                  <a
+                    href={item.fix_pr_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-primary hover:underline"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <ExternalLink className="size-3" />
+                    View PR on GitHub
+                    {item.fix_status === "applied" ? " (open — merge to publish)" : ""}
+                  </a>
                 ) : null}
               </div>
             </div>

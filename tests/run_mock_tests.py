@@ -105,6 +105,47 @@ def main():
     print(f"[{'PASS' if nf_expected else 'FAIL'}] missing fixture -> provider_error, no crash: {nf}")
     allok &= nf_expected
 
+    # Credential isolation. A mock run must not be able to reach a provider
+    # even when .env holds a working key: that combination is what made the
+    # drafting suites dial ollama.com and hang for the full client timeout.
+    import env as env_mod
+
+    for key, want_secret in (
+        ("OLLAMA_API_KEY", True), ("GEMINI_API_KEY", True),
+        ("SHOPIFY_ACCESS_TOKEN", True), ("DATAFORSEO_PASSWORD", True),
+        ("GSC_SERVICE_ACCOUNT_KEY_JSON", True), ("GITHUB_TOKEN", True),
+        ("OLLAMA_MODEL", False), ("SHOPIFY_DOMAIN", False),
+        ("NETLIFY_LIVE_WRITES", False),
+        # The switch is credential-shaped by marker; it is exempted one
+        # layer up, in secret_env_names, not here.
+        ("OPENSEO_LOAD_SECRETS", True),
+    ):
+        got = env_mod._is_secret_key(key)
+        mark = "PASS" if got == want_secret else "FAIL"
+        print(f"[{mark}] classification {key} -> secret={got} (expected {want_secret})")
+        allok &= got == want_secret
+
+    probe = {"OLLAMA_API_KEY": "x", "DATAFORSEO_PASSWORD": "x", "OPENSEO_LOAD_SECRETS": "0"}
+    removed = env_mod.scrub_secret_env(probe)
+    scrub_ok = (sorted(removed) == ["DATAFORSEO_PASSWORD", "OLLAMA_API_KEY"]
+                and "OPENSEO_LOAD_SECRETS" in probe
+                and "OLLAMA_API_KEY" not in probe)
+    print(f"[{'PASS' if scrub_ok else 'FAIL'}] scrub removes creds but cannot disarm the "
+          f"switch: removed={sorted(removed)} remaining={sorted(probe)}")
+    allok &= scrub_ok
+
+    # secret_env_names must never report the switch, or a caller that scrubs
+    # before loading would delete the control and revert to loading secrets.
+    prev = os.environ.get(env_mod.SECRETS_OPT_IN_ENV)
+    os.environ[env_mod.SECRETS_OPT_IN_ENV] = "0"
+    exempt = env_mod.SECRETS_OPT_IN_ENV not in env_mod.secret_env_names()
+    if prev is None:
+        os.environ.pop(env_mod.SECRETS_OPT_IN_ENV, None)
+    else:
+        os.environ[env_mod.SECRETS_OPT_IN_ENV] = prev
+    print(f"[{'PASS' if exempt else 'FAIL'}] switch is exempt from its own scrub: {exempt}")
+    allok &= exempt
+
     print("\nMOCK-MODE TEST RUN", "PASSED" if allok else "FAILED")
     sys.exit(0 if allok else 1)
 

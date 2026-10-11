@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.common import get_conn, require_auth, ensure_env_loaded
 from api.models.schemas import HealthOut
-from api.routes import queue, decisions, measurements, fixes, audit
+from api.routes import queue, decisions, measurements, fixes, audit, offpage
 
 import env as env_loader
 
@@ -47,6 +47,15 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     ensure_env_loaded()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    # P3: return every pooled connection to the OS on process teardown —
+    # Vercel freezes warm instances without this, leaking sockets until
+    # the pooler's idle timeout reaps them.
+    import db as database
+    database.close_pool()
 
 
 @app.get("/health", response_model=HealthOut)
@@ -93,9 +102,17 @@ _AUTH_PROTECTED_PREFIXES = (
     "/results",
     "/fixes",
     "/audit",
+    "/offpage",
 )
 
 _API_PREFIX = "/api"
+
+# GitHub cannot attach our Bearer header, so the webhook is exempted from
+# the shared-token check and verifies itself with HMAC-SHA256 instead
+# (GITHUB_WEBHOOK_SECRET; src/api/routes/github_sync.py). NOTE:
+# "/fixes/github-webhook".startswith("/fixes") is True — the exemption
+# must be checked BEFORE the protected-prefix test.
+_WEBHOOK_EXEMPT_PATHS = {"/fixes/github-webhook"}
 
 
 @app.middleware("http")
@@ -105,12 +122,19 @@ async def auth_middleware(request: Request, call_next):
     path = request.url.path
     if path.startswith(_API_PREFIX):
         path = path[len(_API_PREFIX):] or "/"
+    if path.rstrip("/") in _WEBHOOK_EXEMPT_PATHS:
+        return await call_next(request)  # verified via HMAC in-route
     if not path.startswith(_AUTH_PROTECTED_PREFIXES):
         return await call_next(request)
     from api.common import API_TOKEN_ENV
     token = os.environ.get(API_TOKEN_ENV)
     if token:
-        require_auth(request.headers.get("Authorization"))
+        # require_auth RETURNS the 401 response (never raises): an
+        # HTTPException raised inside a BaseHTTPMiddleware escapes the
+        # exception middleware and renders as a bare 500.
+        unauthorized = require_auth(request.headers.get("Authorization"))
+        if unauthorized is not None:
+            return unauthorized
     return await call_next(request)
 
 
@@ -120,6 +144,9 @@ app.include_router(decisions.router)
 app.include_router(measurements.router)
 app.include_router(fixes.router)
 app.include_router(audit.router)
+app.include_router(offpage.router)
+from api.routes.github_sync import router as github_sync_router
+app.include_router(github_sync_router)
 
 # Vercel serves the FastAPI app at /api/* (api/index.py).  The SPA's fetch
 # calls target /api/queue…, /api/pipeline…, etc., so the same routers are
@@ -132,6 +159,8 @@ app.include_router(decisions.router, prefix=_API_PREFIX, include_in_schema=False
 app.include_router(measurements.router, prefix=_API_PREFIX, include_in_schema=False)
 app.include_router(fixes.router, prefix=_API_PREFIX, include_in_schema=False)
 app.include_router(audit.router, prefix=_API_PREFIX, include_in_schema=False)
+app.include_router(offpage.router, prefix=_API_PREFIX, include_in_schema=False)
+app.include_router(github_sync_router, prefix=_API_PREFIX, include_in_schema=False)
 
 # Serve the built operator UI (brief §4.1: one deployable process). The API
 # and the SPA share one origin/port, so the UI's relative fetch('/queue', ...)

@@ -17,14 +17,17 @@ def _login_password_credential():
 
     DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD are the standard DataForSEO
     authentication surface; when both are present they are combined into
-    the `login:password` string the adapter Base64-encodes. Any other
+    the `login:password` string and Base64-encoded (the exact value a
+    Basic Authorization header carries — the adapter sends the credential
+    verbatim, so the encoding happens HERE at combine time). Any other
     outcome (only one of the two set) is an explicit configuration error
     naming both keys — never a silent half-credential.
     """
+    import base64
     login = os.environ.get("DATAFORSEO_LOGIN")
     password = os.environ.get("DATAFORSEO_PASSWORD")
     if login and password:
-        return f"{login}:{password}"
+        return base64.b64encode(f"{login}:{password}".encode()).decode()
     if login or password:
         raise OpenseoConfigError(
             "incomplete DataForSEO login/password pair: set BOTH "
@@ -71,7 +74,10 @@ def _is_mock_mode(cfg):
     explicit = cfg.get("openseo.mock_mode")
     if explicit is not None:
         return bool(explicit)
-    return resolve_mode(cfg.get("openseo.mode"), (MOCK_MODE_ENV,)) == "mock"
+    mode = resolve_mode(cfg.get("openseo.mode"), (MOCK_MODE_ENV,))
+    # plan/31: 'import' = offline (no fixtures served; sync skips fetches).
+    # 'sandbox'/'live' = real API calls.
+    return mode in ("mock", "import")
 
 
 def _env(name):
@@ -101,7 +107,7 @@ def _resolve_credential(secret_ref, secret_value=None):
         return value
     value = _env("DATAFORSEO_API_KEY")
     if value:
-        return value
+        return _normalize_credential(value)
     value = _login_password_credential()
     if value:
         return value
@@ -112,3 +118,23 @@ def _resolve_credential(secret_ref, secret_value=None):
         "manager. Run in mock mode (set OPENSEO_MOCK_MODE=1) to test "
         "without a real credential."
     )
+
+
+def _looks_like_raw_login_password(value):
+    """A raw 'email:password' pair pasted into DATAFORSEO_API_KEY — valid
+    Basic-auth input that still needs encoding (tolerant normalization;
+    a real pre-encoded base64 key never contains ':'... except padding,
+    which the charset check handles)."""
+    import re
+    return (":" in value
+            and re.fullmatch(r"[\w.+-]+@[\w-]+\.[\w.]+:[^\s]+", value)
+            is not None)
+
+
+def _normalize_credential(value):
+    """Accept a pre-encoded key OR a raw email:password pair; always return
+    the base64 form the Basic Authorization header carries."""
+    import base64
+    if _looks_like_raw_login_password(value):
+        return base64.b64encode(value.encode()).decode()
+    return value

@@ -66,9 +66,21 @@ export interface WorkRequiredItem {
   /** automated = fix engine supports it (title, meta description, 301);
    * manual = operator does it by hand (Liquid theme, schema injection…). */
   execution_type?: "automated" | "manual";
-  /** generated_fixes row linked to this task (automated only). */
+  /** generated_fixes row linked to this task (automated only). When the
+   * task bundles several engine surfaces (title + meta), this is the
+   * highest-priority active row (applied > queued > generated). */
   fix_id?: string;
   fix_status?: FixStatus;
+  /** Every generated_fixes row this task bundles — one diff block per
+   * entry renders in the drawer. */
+  fix_refs?: Array<{
+    fix_id: string;
+    status: FixStatus;
+    sub_type: string | null;
+    pr_url?: string;
+  }>;
+  /** GitHub PR the fix opened (netlify PR engine, plan/27). */
+  fix_pr_url?: string;
 }
 
 export interface Recommendation {

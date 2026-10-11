@@ -49,8 +49,11 @@ LOCK_KEYS = {
     "weekly_crawl": "weekly_crawl",
     "semantic_scoring": "semantic_scoring",
     "stale_approvals": "stale_approvals",
+    "audit_ttl_sweep": "audit_ttl_sweep",
     "cost_report": "cost_report",
     "fix_executor": "fix_executor",
+    "offpage_verify": "offpage_verify",
+    "offpage_discovery": "offpage_discovery",
     "scheduler": "scheduler",
 }
 

@@ -140,7 +140,9 @@ def main():
 
         # ---- 1. daily data sync -------------------------------------------
         print("\n=== 1. daily data sync ===")
-        counts = run_sync()
+        # plan/31: site resolution is strictly mandatory (no default-site
+        # fallback) — pass the site this suite operates on.
+        counts = run_sync(site_id=str(site_id))
         allok &= check("sync inserted search_performance", counts.get("search_performance", 0) > 0)
         allok &= check("sync inserted pages", counts.get("pages", 0) > 0)
 

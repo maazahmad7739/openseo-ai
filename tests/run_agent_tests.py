@@ -16,8 +16,9 @@ from agents.seo_agent import (  # noqa: E402
 import db as database  # noqa: E402
 
 
-def check(name, value):
-    print(f"[{'PASS' if value else 'FAIL'}] {name}")
+def check(name, value, detail=""):
+    print(f"[{'PASS' if value else 'FAIL'}] {name}"
+          + (f" — {detail}" if detail and not value else ""))
     return value
 
 

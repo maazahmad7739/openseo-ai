@@ -28,7 +28,53 @@ class OllamaConfigError(Exception):
 
 
 class OllamaApiError(Exception):
-    pass
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        # Seconds from the provider's Retry-After header, when present. A 429
+        # is a rate limit measured per minute, so a caller's short exponential
+        # backoff just re-collides; the provider states the real number here.
+        self.retry_after = retry_after
+
+
+def parse_retry_after(headers):
+    """Retry-After header -> seconds (float), or None.
+
+    Handles both forms RFC 9110 allows: delta-seconds ("30") and an
+    HTTP-date. Providers disagree, and a malformed or absent header must not
+    turn into an exception on an error path that is already reporting a
+    failure - it degrades to None so the caller falls back to its own
+    backoff. Negative deltas clamp to 0 rather than producing a sleep of
+    -5s, which `time.sleep` would reject.
+    """
+    if not headers:
+        return None
+    raw = None
+    try:
+        raw = headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(raw)
+    except Exception:
+        return None
+    if when is None:
+        return None
+    try:
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.timezone.utc)
+        return max(0.0, (when - now).total_seconds())
+    except Exception:
+        return None
 
 
 def resolve_ollama_config(config=None):
@@ -85,7 +131,11 @@ class OllamaClient:
                 detail = exc.read().decode("utf-8")[:300]
             except Exception:
                 pass
-            raise OllamaApiError(f"HTTP {exc.code}: {detail}") from None
+            # Read Retry-After off the response, not the request.
+            retry_after = parse_retry_after(
+                getattr(exc, "headers", None))
+            raise OllamaApiError(f"HTTP {exc.code}: {detail}",
+                                 retry_after=retry_after) from None
         except urllib.error.URLError as exc:
             raise OllamaApiError(f"connection failed: {exc.reason}") from None
         try:

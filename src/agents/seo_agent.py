@@ -25,7 +25,12 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.ollama_client import OllamaClient, OllamaConfigError, OllamaApiError  # noqa: E402
+from agents.llm_client import FallbackClient  # noqa: E402
+from agents.ollama_client import OllamaApiError, OllamaConfigError  # noqa: E402
+from agents.gemini_client import (  # noqa: E402
+    GeminiApiError,
+    GeminiConfigError,
+)
 
 import db as database  # noqa: E402
 import env as env_loader  # noqa: E402
@@ -134,14 +139,31 @@ def build_agent_input(conn, site_id, max_candidates=25):
         (domain, site_name, tier, in_stock_def,
          prefetch_limit, brand_queries) = row
 
+        # Active-window budget: the operator queue holds at most
+        # MAX_ACTIVE_QUEUE proposed cards (api/routes/queue.py). Generating a
+        # fresh batch of MAX_RECOMMENDATIONS on top of an undrained queue is
+        # what let the backlog grow past the cap — the UI then masked it by
+        # slicing locally. Top up only the free slots; leave the rest as 'raw'
+        # for the next run.
         cur.execute(
-            "SELECT recommendation_id, generator, action_type, target_url, proposed_url, "
-            "       cluster_id, diagnosis, evidence_json "
-            "FROM recommendations WHERE site_id = %s AND status = 'raw' "
-            "ORDER BY created_at DESC LIMIT %s",
-            (site_id, prefetch_limit or 25),
+            "SELECT count(*) FROM recommendations "
+            "WHERE site_id = %s AND status = 'proposed'",
+            (site_id,),
         )
-        rows = cur.fetchall()
+        proposed_now = cur.fetchone()[0]
+        budget = max(MAX_RECOMMENDATIONS - int(proposed_now or 0), 0)
+        prefetch = min(int(prefetch_limit or 25), budget) if budget else 0
+
+        rows = []
+        if prefetch > 0:
+            cur.execute(
+                "SELECT recommendation_id, generator, action_type, target_url, proposed_url, "
+                "       cluster_id, diagnosis, evidence_json "
+                "FROM recommendations WHERE site_id = %s AND status = 'raw' "
+                "ORDER BY created_at DESC LIMIT %s",
+                (site_id, prefetch),
+            )
+            rows = cur.fetchall()
 
         candidate_payloads = []
         for (rec_id, generator, action_type, target_url, proposed_url,
@@ -151,8 +173,9 @@ def build_agent_input(conn, site_id, max_candidates=25):
             if cluster_id:
                 cur.execute(
                     "SELECT cluster_id, primary_keyword, keywords, intent, search_volume, "
-                    "commercial_value FROM keyword_clusters WHERE cluster_id = %s",
-                    (cluster_id,),
+                    "commercial_value FROM keyword_clusters "
+                    "WHERE cluster_id = %s AND site_id = %s",
+                    (cluster_id, site_id),
                 )
                 crow = cur.fetchone()
                 if crow:
@@ -213,7 +236,8 @@ def build_agent_input(conn, site_id, max_candidates=25):
                     SELECT p.indexable, p.status_code, p.canonical_url, p.crawl_depth,
                            p.internal_links_in, p.internal_links_out, p.product_count,
                            p.is_orphan, p.has_structured_data, p.render_status,
-                           p.raw_html_hash, p.rendered_html_hash, p.page_type, p.title
+                           p.raw_html_hash, p.rendered_html_hash, p.page_type, p.title,
+                           p.last_crawled_at
                     FROM pages p WHERE p.site_id = %s AND p.url = %s
                     """,
                     (site_id, full_url),
@@ -248,6 +272,15 @@ def build_agent_input(conn, site_id, max_candidates=25):
                         "rendered_html_hash_present": bool(prow[11]),
                         "page_type": prow[12],
                         "title": prow[13],
+                        # Trust flag: has_structured_data is BOOLEAN DEFAULT
+                        # false, so False is only evidence of absence when a
+                        # crawl actually ran. Without this the agent cannot
+                        # distinguish "looked, none present" from "never
+                        # looked" and reports the second as the first
+                        # (plan/03 structured_data_failure false positives).
+                        "last_crawled_at": (
+                            prow[14].isoformat() if prow[14] else None),
+                        "structured_data_verifiable": bool(prow[14]),
                         "gsc_28d": {
                             "clicks": int(srow[0]),
                             "impressions": int(srow[1]),
@@ -293,7 +326,8 @@ def build_agent_input(conn, site_id, max_candidates=25):
                 "bulk": "Avoid re-proposing these patterns this week.",
             },
             "config": {
-                "max_recommendations": MAX_RECOMMENDATIONS,
+                "max_recommendations": budget,
+                "proposed_remaining": budget,
                 "excluded_patterns": list(brand_queries or []),
             },
         }
@@ -329,6 +363,14 @@ def validate_agent_output(output, candidate_ids, valid_action_types=None):
             raise AgentValidationError(f"invalid impact: {r.get('impact')}")
         if r.get("confidence") not in ("high", "medium", "low"):
             raise AgentValidationError(f"invalid confidence: {r.get('confidence')}")
+        # Model tolerance: '4 hours' / '1 day' normalize to the enum the
+        # schema (and the DB CHECK) expects — an entire run must not die
+        # because the model phrased effort as a duration with a count.
+        effort = str(r.get("effort") or "").strip().lower()
+        if "hour" in effort:
+            r["effort"] = "hours"
+        elif "day" in effort:
+            r["effort"] = "days"
         if r.get("effort") not in ("hours", "days"):
             raise AgentValidationError(f"invalid effort: {r.get('effort')}")
         if r.get("owner") not in ("SEO", "content", "engineering"):
@@ -340,6 +382,135 @@ def validate_agent_output(output, candidate_ids, valid_action_types=None):
         if known_ids and rej.get("candidate_id") not in known_ids:
             raise AgentValidationError(f"rejection for unknown candidate_id: {rej.get('candidate_id')}")
     return recs, rejects
+
+
+# Rules whose impact is decided deterministically by the generator SQL and
+# must not be re-derived by the model. Keyed on the generator's issue_type,
+# which the generator stamps into the evidence payload.
+DETERMINISTIC_IMPACT_ISSUES = ("structured_data_failure",)
+
+
+def _issue_types(evidence_json):
+    """Which deterministically-scored rule produced this evidence payload.
+
+    Two signals, because rows generated before plan/03 started stamping
+    `issue_type` into the evidence object are still in the raw queue:
+
+      * `issue_type` — explicit, preferred (plan/03 structured_data_failure).
+      * an evidence object carrying `has_structured_data` — the legacy
+        signature of that same CTE, which is the only generator-3 rule whose
+        evidence includes that key.
+    """
+    if isinstance(evidence_json, str):
+        try:
+            evidence_json = json.loads(evidence_json)
+        except (TypeError, ValueError):
+            return ()
+    if isinstance(evidence_json, dict):
+        items = [evidence_json]
+    elif isinstance(evidence_json, list):
+        items = [e for e in evidence_json if isinstance(e, dict)]
+    else:
+        return ()
+    out = set()
+    for e in items:
+        val = e.get("issue_type")
+        if isinstance(val, str) and val in DETERMINISTIC_IMPACT_ISSUES:
+            out.add(val)
+        elif "has_structured_data" in e:
+            out.add("structured_data_failure")
+    return tuple(out)
+
+
+# Evidence keys the GENERATOR authored and that downstream code depends on.
+# plan/32: fixes/generator.py expands one grouped structured_data_failure
+# recommendation into a fix per affected page by reading `template` and
+# `page_count` from evidence. The model sees the recommendation and rewrites
+# `evidence` wholesale in persist_agent_output, so without this the grouping
+# metadata is silently dropped at raw→proposed and every grouped fix silently
+# degrades back to a single-URL fix — or to nothing.
+#
+# These are facts about what was measured, not opinions, so the generator's
+# value wins over anything the model returns for the same key. The model may
+# still ADD its own keys; it just cannot restate the measurement.
+GENERATOR_PROVENANCE_KEYS = (
+    "issue_type",
+    "has_structured_data",
+    "scope",
+    "template",
+    "template_inferred",
+    "page_count",
+    "sample_urls",
+    "representative_url",
+    "page_type",
+)
+
+
+def _merge_generator_evidence(model_evidence, stored_evidence):
+    """Re-attach generator-authored evidence keys under the model's output.
+
+    Returns the model's payload unchanged when the row carries no generator
+    provenance, so rows the generator did not shape behave exactly as before.
+    A list payload collapses to a dict here, which is a shape every consumer
+    of evidence already handles (_issue_types, the fix generator).
+    """
+    if not isinstance(stored_evidence, dict):
+        if isinstance(stored_evidence, str):
+            try:
+                stored_evidence = json.loads(stored_evidence)
+            except (TypeError, ValueError):
+                return model_evidence
+        if not isinstance(stored_evidence, dict):
+            return model_evidence
+    provenance = {k: stored_evidence[k] for k in GENERATOR_PROVENANCE_KEYS
+                  if k in stored_evidence}
+    if not provenance:
+        return model_evidence
+    if isinstance(model_evidence, dict):
+        merged = dict(model_evidence)
+    elif isinstance(model_evidence, list):
+        merged = {}
+        for item in model_evidence:
+            if isinstance(item, dict):
+                merged.update(item)
+    elif model_evidence is None:
+        merged = {}
+    else:
+        merged = {"detail": model_evidence}
+    merged.update(provenance)
+    return merged
+
+
+def _stored_recommendation_state(conn, site_id, recs):
+    """{recommendation_id: (impact, evidence)} for rows the generator scored.
+
+    The impact already in the column is the generator's verdict, written at
+    insert time (orchestrator._insert_recommendations) and untouched since —
+    raw rows are not yet visible to the operator, so nothing else has claimed
+    the value. Only rows the generator itself flagged are pinned; every other
+    rule keeps the model-authored impact.
+    """
+    ids = [str(r.get("_recommendation_id")) for r in recs if r.get("_recommendation_id")]
+    if not ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT recommendation_id, impact, evidence_json FROM recommendations "
+            "WHERE site_id = %s AND recommendation_id = ANY(%s::uuid[])",
+            (site_id, ids),
+        )
+        rows = cur.fetchall()
+    return {
+        str(rid): (impact, evidence)
+        for rid, impact, evidence in rows
+        if impact and _issue_types(evidence)
+    }
+
+
+def _pinned_impact_map(conn, site_id, recs):
+    """{recommendation_id: stored_impact} for deterministically-scored rows."""
+    return {rid: impact
+            for rid, (impact, _ev) in _stored_recommendation_state(conn, site_id, recs).items()}
 
 
 def persist_agent_output(conn, site_id, recs, rejects, measurement_windows=None):
@@ -355,10 +526,24 @@ def persist_agent_output(conn, site_id, recs, rejects, measurement_windows=None)
     """
     if measurement_windows is None:
         measurement_windows = load_measurement_windows(conn)
+    # Deterministic-impact rows (plan/03 structured_data_failure) must keep the
+    # generator's page_type verdict: the skill's generic rubric grades on GSC
+    # demand, which plan/03 deliberately withheld for this rule
+    # (gsc_clicks_28d is hardcoded NULL there). Letting the model apply a
+    # traffic rubric here is what made identical defects score differently.
+    pinned = _pinned_impact_map(conn, site_id, recs)
+    stored = _stored_recommendation_state(conn, site_id, recs)
     accepted = 0
     with conn.cursor() as cur:
         for r in recs:
             window = r.get("measurement_window_days") or measurement_windows.get(r.get("action_type"))
+            rec_id = r.get("_recommendation_id")
+            impact = pinned.get(rec_id) or r.get("impact")
+            # plan/32: keep the generator's measurement facts (template, page
+            # count, sample URLs) attached — the grouped auto-fix expands off
+            # them, and the model's rewritten evidence would otherwise drop them.
+            _prior = stored.get(rec_id) or (None, None)
+            evidence = _merge_generator_evidence(r.get("evidence"), _prior[1])
             cur.execute(
                 """
                 UPDATE recommendations SET
@@ -377,13 +562,13 @@ def persist_agent_output(conn, site_id, recs, rejects, measurement_windows=None)
                 """,
                 (
                     r.get("diagnosis"),
-                    json.dumps(r.get("evidence") or [], default=str),
+                    json.dumps(evidence if evidence is not None else [], default=str),
                     json.dumps(r.get("work_required") or [], default=str),
-                    r.get("impact"), r.get("confidence"), r.get("effort"), r.get("owner"),
+                    impact, r.get("confidence"), r.get("effort"), r.get("owner"),
                     r.get("measurement_metric"),
                     window,
                     str(window),
-                    r.get("_recommendation_id"), site_id,
+                    rec_id, site_id,
                 ),
             )
         for rej in rejects:
@@ -424,7 +609,7 @@ def run_agent(site_id, conn=None, client=None):
     if own_conn:
         conn = database.get_connection()
     try:
-        client = client or OllamaClient()
+        client = client or FallbackClient()
         payload = build_agent_input(conn, site_id)
         candidate_ids = [c["candidate_id"] for c in payload["candidates"]]
         if not candidate_ids:
@@ -475,8 +660,17 @@ def run_agent(site_id, conn=None, client=None):
             "total_evaluated": len(payload["candidates"]),
             "total_rejected": len(rejects),
             "approved": counts["approved"],
+            # Which provider actually served this run, and why the primary
+            # was not used. Ops needs this to tell "the model answered" from
+            # "we silently degraded to the fallback and nobody noticed".
+            "llm_provider": getattr(client, "last_provider", None),
+            "llm_model": getattr(client, "last_model", None),
+            "llm_fallback_reason": getattr(client, "fallback_reason", None),
         }
-    except (OllamaConfigError, OllamaApiError, AgentValidationError):
+    except (OllamaConfigError, OllamaApiError, GeminiConfigError,
+            GeminiApiError, RuntimeError, AgentValidationError):
+        # FallbackClient raises RuntimeError when no provider can serve, so
+        # that must roll back too. The generic handler below does the same.
         conn.rollback()
         raise
     except Exception:
@@ -490,18 +684,18 @@ def run_agent(site_id, conn=None, client=None):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--site", help="domain; defaults to the first site")
+    parser.add_argument("--site", help="domain (plan/31: mandatory — no default site)")
     args = parser.parse_args()
+    if not args.site:
+        print("error: --site is required (plan/31 removed the default-site fallback)")
+        sys.exit(2)
     conn = database.get_connection()
     try:
         with conn.cursor() as cur:
-            if args.site:
-                cur.execute("SELECT site_id FROM site_config WHERE domain = %s", (args.site,))
-            else:
-                cur.execute("SELECT site_id FROM site_config ORDER BY created_at LIMIT 1")
+            cur.execute("SELECT site_id FROM site_config WHERE domain = %s", (args.site,))
             row = cur.fetchone()
         if not row:
-            print("no site configured; run sync first")
+            print(f"no site configured for domain {args.site!r}")
             sys.exit(1)
         summary = run_agent(row[0], conn)
         print(json.dumps(summary, default=str))

@@ -34,8 +34,6 @@ import { generatorMeta } from "../components/meta";
 
 const IMPACT_ORDER: Record<ImpactLevel, number> = { high: 0, medium: 1, low: 2 };
 
-const MAX_QUEUE_SIZE = 5;
-
 export function ActionQueuePage({ projectId }: { projectId: string }) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
@@ -99,8 +97,8 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
         break;
       case "generator":
         sorted = sort(list, (a, b) =>
-          generatorMeta[a.generator].label.localeCompare(
-            generatorMeta[b.generator].label,
+          (generatorMeta[a.generator]?.label ?? a.generator).localeCompare(
+            generatorMeta[b.generator]?.label ?? b.generator,
           ),
         );
         break;
@@ -115,9 +113,10 @@ export function ActionQueuePage({ projectId }: { projectId: string }) {
     return sorted;
   }, [rows, stats, query, status, generator, owner, actionType, impact, effort, sortKey]);
 
-  // The queue surfaces the top candidate set only (5 per weekly run, per the
-  // product spec). Filters still browse the full backlog when narrowed.
-  const visible = filtered.slice(0, MAX_QUEUE_SIZE);
+  // The server already caps the active window at MAX_ACTIVE_QUEUE; it
+  // returns the whole window, so the queue is not sliced here. Anything
+  // still shown is exactly what the backend considers actionable.
+  const visible = filtered;
   const queueTotal = filtered.length;
 
   const selectedRowCount = useMemo(
@@ -193,42 +192,89 @@ const hasFilters =
       return next;
     });
 
-  const approve = (rec: Recommendation) => {
-    data.approve(rec.recommendation_id);
+  const approve = async (rec: Recommendation, silent = false) => {
+    try {
+      await data.approve(rec.recommendation_id);
+    } catch (err) {
+      if (!silent) {
+        toast.error(
+          `Could not approve ${rec.target_url ?? rec.proposed_url}: ${
+            err instanceof Error ? err.message : "request failed"
+          }`,
+        );
+      }
+      return false;
+    }
     setSelected((prev) => {
       const next = new Set(prev);
       next.delete(rec.recommendation_id);
       return next;
     });
-    toast.success(`${rec.target_url ?? rec.proposed_url} approved`);
+    if (!silent) toast.success(`${rec.target_url ?? rec.proposed_url} approved`);
+    return true;
   };
 
-  const reject = (rec: Recommendation, reason?: string) => {
-    data.reject(rec.recommendation_id, reason);
+  const reject = async (rec: Recommendation, reason?: string, silent = false) => {
+    try {
+      await data.reject(rec.recommendation_id, reason);
+    } catch (err) {
+      if (!silent) {
+        toast.error(
+          `Could not reject ${rec.target_url ?? rec.proposed_url}: ${
+            err instanceof Error ? err.message : "request failed"
+          }`,
+        );
+      }
+      return false;
+    }
     setSelected((prev) => {
       const next = new Set(prev);
       next.delete(rec.recommendation_id);
       return next;
     });
-    toast.error(`${rec.target_url ?? rec.proposed_url} rejected`);
+    if (!silent) toast.success(`${rec.target_url ?? rec.proposed_url} rejected`);
+    return true;
   };
 
-  const bulkApprove = () => {
+  // Bulk: settle every request, then report the true outcome once. The
+  // per-item toasts above are suppressed here (silent flag) so a 5-item
+  // batch emits one summary, not six.
+  const bulkApprove = async () => {
     const targets = rows.filter(
       (r) => selected.has(r.recommendation_id) && r.status === "proposed",
     );
-    targets.forEach((rec) => approve(rec));
-    toast.success(`Approved ${targets.length} recommendation${targets.length === 1 ? "" : "s"}`);
+    const results = await Promise.all(targets.map((rec) => approve(rec, true)));
+    const ok = results.filter(Boolean).length;
+    if (ok === targets.length) {
+      toast.success(`Approved ${ok} recommendation${ok === 1 ? "" : "s"}`);
+    } else {
+      toast.error(
+        `Approved ${ok} of ${targets.length} — ${
+          targets.length - ok
+        } failed. See messages above.`,
+      );
+    }
   };
 
-  const bulkReject = () => {
+  const bulkReject = async () => {
     const targets = rows.filter(
       (r) =>
         selected.has(r.recommendation_id) &&
         (r.status === "proposed" || r.status === "approved"),
     );
-    targets.forEach((rec) => reject(rec));
-    toast.error(`Rejected ${targets.length} recommendation${targets.length === 1 ? "" : "s"}`);
+    const results = await Promise.all(
+      targets.map((rec) => reject(rec, undefined, true)),
+    );
+    const ok = results.filter(Boolean).length;
+    if (ok === targets.length) {
+      toast.success(`Rejected ${ok} recommendation${ok === 1 ? "" : "s"}`);
+    } else {
+      toast.error(
+        `Rejected ${ok} of ${targets.length} — ${
+          targets.length - ok
+        } failed. See messages above.`,
+      );
+    }
   };
 
   return (

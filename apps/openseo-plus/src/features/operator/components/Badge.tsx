@@ -30,19 +30,25 @@ export function Chip({ className, children }: { className: string; children: Rea
 }
 
 export function ImpactBadge({ impact }: { impact: ImpactLevel }) {
-  const meta = impactMeta[impact];
+  const meta = impactMeta[impact] ?? {
+    label: String(impact),
+    badgeClass: "tag-chip-slate",
+    dotClass: "bg-base-content/40",
+  };
   return <Chip className={meta.badgeClass}>{meta.label}</Chip>;
 }
 
 export function GeneratorBadge({ generator }: { generator: GeneratorType }) {
-  const meta = generatorMeta[generator];
+  const meta = generatorMeta[generator] ?? {
+    label: String(generator),
+    badgeClass: "tag-chip-slate",
+  };
   return <Chip className={meta.badgeClass}>{meta.label}</Chip>;
 }
 
 export function ActionTypeBadge({ actionType }: { actionType: ActionType }) {
-  return (
-    <Chip className="tag-chip-slate">{actionTypeMeta[actionType].label}</Chip>
-  );
+  const label = actionTypeMeta[actionType]?.label ?? String(actionType);
+  return <Chip className="tag-chip-slate">{label}</Chip>;
 }
 
 export function OwnerBadge({ owner }: { owner: Owner }) {
@@ -62,7 +68,11 @@ export function OwnerBadgeSolid({ owner }: { owner: Owner }) {
 }
 
 export function ResultBadge({ result }: { result: ResultClass }) {
-  const meta = resultMeta[result];
+  const meta = resultMeta[result] ?? {
+    label: String(result),
+    badgeClass: "tag-chip-slate",
+    dotClass: "bg-base-content/30",
+  };
   return (
     <Chip className={meta.badgeClass}>
       <span className={`size-1.5 rounded-full ${meta.dotClass}`} />
@@ -72,7 +82,11 @@ export function ResultBadge({ result }: { result: ResultClass }) {
 }
 
 export function StatusBadge({ status }: { status: RecommendationStatus }) {
-  const meta = statusMeta[status];
+  const meta = statusMeta[status] ?? {
+    label: String(status),
+    badgeClass: "tag-chip-slate",
+    dotClass: "bg-base-content/30",
+  };
   return (
     <Chip className={meta.badgeClass}>
       <span className={`size-1.5 rounded-full ${meta.dotClass}`} />
@@ -82,7 +96,11 @@ export function StatusBadge({ status }: { status: RecommendationStatus }) {
 }
 
 export function ConfidenceBadge({ confidence }: { confidence: ConfidenceLevel }) {
-  return <Chip className="tag-chip-slate">{confidenceMeta[confidence].label}</Chip>;
+  return (
+    <Chip className="tag-chip-slate">
+      {confidenceMeta[confidence]?.label ?? String(confidence)}
+    </Chip>
+  );
 }
 
 export function EffortBadge({ effort }: { effort: EffortLevel }) {

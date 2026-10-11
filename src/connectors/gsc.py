@@ -20,8 +20,13 @@ GSC_OAUTH_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
 ENDPOINTS = {
     "sites": "sites",
     "search_analytics": "sites/{site_url}/searchAnalytics/query",
+    # plan/31 GSC fix: the URL Inspection API is served by the Search
+    # Console API v1 (searchconsole.googleapis.com), NOT the webmasters v3
+    # base — the old same-base path returned a bare HTML 404 that surfaced
+    # as provider_error for every inspection probe.
     "url_inspection": "urlInspection/index:inspect",
 }
+URL_INSPECTION_BASE_DEFAULT = "https://searchconsole.googleapis.com/v1"
 
 MOCK_FIXTURES = {
     "sites": "gsc_sites.json",
@@ -125,8 +130,10 @@ class GscRestAdapter:
 
     def __init__(self, base_url=None, site_url=None, access_token=None,
                  token_source=None, capabilities=None, mock_mode=None,
-                 fixtures_dir="tests/fixtures"):
+                 fixtures_dir="tests/fixtures", inspection_base=None):
         self.base_url = (base_url or GSC_API_BASE_DEFAULT).rstrip("/")
+        self.inspection_base = (inspection_base
+                                or URL_INSPECTION_BASE_DEFAULT).rstrip("/")
         self.site_url = site_url
         self.access_token = access_token
         self.token_source = token_source
@@ -196,7 +203,15 @@ class GscRestAdapter:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise GscError(f"HTTP {exc.code}")
+            # Surface the provider's error body (plan/31 GSC debug): the
+            # Google error JSON carries the actionable reason (permission,
+            # property mismatch, quota) — an opaque "HTTP 403" is useless
+            # for diagnosis. Never logs tokens/headers, only the body.
+            try:
+                body = exc.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            raise GscError(f"HTTP {exc.code}: {body or exc.reason}") from exc
         except urllib.error.URLError as exc:
             raise GscError(f"connection failed: {exc.reason}")
 
@@ -267,7 +282,12 @@ class GscRestAdapter:
             "siteUrl": site_url,
             "languageCode": params.get("language_code") or "en-US",
         }
-        return self._request("POST", f"{self.base_url}/{ENDPOINTS['url_inspection']}",
+        # plan/31 GSC fix: URL Inspection lives on its own service base
+        # (searchconsole.googleapis.com/v1) — never the webmasters v3 base.
+        inspection_base = (self.inspection_base
+                           or os.environ.get("GSC_URL_INSPECTION_BASE")
+                           or URL_INSPECTION_BASE_DEFAULT).rstrip("/")
+        return self._request("POST", f"{inspection_base}/{ENDPOINTS['url_inspection']}",
                              payload=body)
 
     def _normalize(self, capability, raw, params):
@@ -349,6 +369,13 @@ def get_gsc_adapter(config=None):
     whose client_email must be an authorized user on the property; tokens are
     minted and refreshed automatically. Mock mode (GSC_MOCK_MODE=1) skips
     credential resolution entirely and never touches the secrets store.
+
+    plan/31 (Helium import bridge): an 'import'-mode site builds a special
+    adapter that is OFFLINE but neither serves mock fixtures nor requires
+    credentials — its fetch() returns a typed 'import_mode' skip so the sync
+    preserves operator-imported GSC rows. Switching such a site to the real
+    GSC API later needs ONLY: set gsc_property + credentials and flip
+    integration_mode='live' — zero code changes.
     """
     cfg = config or {}
     mock_mode = _is_mock_mode(cfg)
@@ -367,6 +394,12 @@ def get_gsc_adapter(config=None):
         key_file = key_file or _env("GOOGLE_APPLICATION_CREDENTIALS")
         key_json = key_json or _env("GSC_SERVICE_ACCOUNT_KEY")
 
+    # plan/31: import-mode sites are handled upstream — sync.py skips all
+    # connector fetches for integration_mode='import' (adapter_mode() maps
+    # 'import' to the offline polarity and run_sync returns before any
+    # fetch), so imported GSC rows are preserved untouched. When such a
+    # site later gains real credentials, flipping integration_mode='live'
+    # routes it through the live path below with zero code changes.
     token_source = None
     access_token = None
     if not mock_mode:
@@ -403,7 +436,11 @@ def _is_mock_mode(cfg):
     explicit = cfg.get("gsc.mock_mode")
     if explicit is not None:
         return bool(explicit)
-    return resolve_mode(cfg.get("gsc.mode"), (MOCK_MODE_ENV,)) == "mock"
+    mode = resolve_mode(cfg.get("gsc.mode"), (MOCK_MODE_ENV,))
+    # plan/31: 'import' is offline-without-fixtures for adapters; the sync
+    # layer skips fetches entirely for import sites, so treat it as mock
+    # polarity here (never a live credential requirement).
+    return mode in ("mock", "import")
 
 
 def _env(name):

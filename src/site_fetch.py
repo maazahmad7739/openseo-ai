@@ -274,3 +274,213 @@ def sync_sitemap_membership(conn, site_id, domain, opener=None):
             )
             summary["pages_flagged"] += cur.rowcount
     return summary
+
+
+# ------------------------------------------------------------
+# Generic sitemap → pages ingestion (plan/26 Phase 1)
+# ------------------------------------------------------------
+# The batch pipeline's only full pages-ingestion path was Shopify
+# (connectors.sync.sync_pages_from_shopify). Non-Shopify platforms (Framer,
+# WordPress, headless) had NO source of pages rows, so generators and fix
+# targeting found nothing. This ingests the sitemap's URL set into pages
+# with a bounded per-page fetch — the same guard stack the audit engine
+# already proved (validate → SSRF → robots → GET → parse).
+#
+# Never-raise: every failure is a typed summary key (the
+# sync_sitemap_membership pattern). Shopify sites never call this (the
+# weekly_crawl wiring gates on platform) — catalogue ingestion remains
+# their single source.
+
+MAX_SITEMAP_INGEST_PAGES = 200    # per-run page-fetch ceiling
+_INGEST_SKIP_CONTENT = ("script", "style", "noscript", "svg", "template")
+_INGEST_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.I | re.S)
+_INGEST_META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.I)
+_INGEST_META_NAME_RE = re.compile(r'name\s*=\s*["\']description["\']', re.I)
+_INGEST_META_CONTENT_RE = re.compile(r'content\s*=\s*["\'](.*?)["\']', re.I | re.S)
+_INGEST_BODY_RE = re.compile(r"<body\b[^>]*>(.*)</body\s*>", re.I | re.S)
+_INGEST_SKIP_RE = re.compile(
+    r"<(?:script|style|noscript|svg|template)\b.*?"
+    r"</(?:script|style|noscript|svg|template)>", re.I | re.S)
+_INGEST_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+
+
+def _page_title_from_html(html):
+    m = _INGEST_TITLE_RE.search(html or "")
+    return " ".join(m.group(1).split()) or None if m else None
+
+
+def _page_meta_from_html(html):
+    for tag in _INGEST_META_TAG_RE.finditer(html or ""):
+        if _INGEST_META_NAME_RE.search(tag.group(0)):
+            cm = _INGEST_META_CONTENT_RE.search(tag.group(0))
+            if cm:
+                return " ".join(cm.group(1).split()) or None
+            break
+    return None
+
+
+def _page_body_from_html(html):
+    """<body> inner HTML → (body_html, body_text, heading H1 text)."""
+    html = html or ""
+    body = html
+    m = _INGEST_BODY_RE.search(html)
+    if m:
+        body = m.group(1)
+    body = _INGEST_SKIP_RE.sub(" ", body)
+    h1 = None
+    h1m = re.search(r"<h1\b[^>]*>(.*?)</h1\s*>", body, re.I | re.S)
+    if h1m:
+        h1 = " ".join(_INGEST_TAG_STRIP_RE.sub(" ", h1m.group(1)).split()) or None
+    body_html = body.strip() or None
+    text = " ".join(_INGEST_TAG_STRIP_RE.sub(" ", body_html or "").split())
+    return body_html, text or None, h1
+
+
+def _body_text_hash_of(body_html):
+    """Normalized visible-text md5 (matches sync._body_text_hash semantics:
+    lowercased; empty → NULL — a null never equals a null)."""
+    if not body_html:
+        return None
+    text = " ".join(_INGEST_TAG_STRIP_RE.sub(" ", body_html).split()).lower()
+    if not text:
+        return None
+    import hashlib
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _robots_ok_for_url(robots_parser, url):
+    if robots_parser is None:
+        return True
+    try:
+        return robots_parser.can_fetch(USER_AGENT, url)
+    except Exception:
+        return True
+
+
+def sync_pages_from_sitemap(conn, site_id, domain, opener=None,
+                            max_pages=MAX_SITEMAP_INGEST_PAGES):
+    """Sitemap.xml → pages rows for NON-Shopify platforms (plan/26 Phase 1).
+
+    Resolution: the same fetch_sitemap order as the membership pass
+    (explicit → robots.txt Sitemap: lines → /sitemap.xml). Each URL is
+    fetched (bounded by max_pages; robots.txt honored) and upserted into
+    pages: page_type from the URL archetype, title/meta/body from the
+    HTML, body_text_hash near-duplicate key, shopify_gid stays NULL
+    (never fabricated). ON CONFLICT upsert with COALESCE semantics so an
+    existing row's richer fields are never overwritten by a poorer fetch.
+
+    Returns a typed summary — every failure degrades to a typed key,
+    never a crash (the Task 5 semantics this module established).
+    """
+    from audit.url_pattern import page_type_from_url, template_from_url
+    from audit.structured_data import html_has_structured_data
+
+    origin = domain if "://" in (domain or "") else f"https://{domain}"
+    summary = {
+        "platform_mode": "generic_sitemap_ingest",
+        "sitemap_fetchable": False,
+        "sitemap_url": None,
+        "urls_in_sitemap": 0,
+        "pages_attempted": 0,
+        "pages_upserted": 0,
+        "pages_robots_blocked": 0,
+        "pages_fetch_failed": 0,
+        "truncated_to": max_pages,
+        "error": None,
+    }
+    try:
+        sitemap = fetch_sitemap(origin, opener=opener, sitemap_url=None)
+    except Exception as exc:
+        return dict(summary, error=f"fetch_sitemap: {type(exc).__name__}: {exc}")
+    if not sitemap.get("ok"):
+        return dict(summary, error=sitemap.get("reason") or "sitemap_unreachable")
+
+    urls = list(dict.fromkeys(sitemap.get("urls") or []))[:max_pages]
+    summary.update({
+        "sitemap_fetchable": True,
+        "sitemap_url": sitemap.get("sitemap_url"),
+        "urls_in_sitemap": len(sitemap.get("urls") or []),
+        "pages_attempted": len(urls),
+    })
+
+    # robots.txt once per site; each page's fetch re-checks via the parser
+    robots = fetch_robots_txt(origin, opener=opener)
+    robots_parser = None
+    if robots.get("fetchable"):
+        robots_parser = urllib.robotparser.RobotFileParser()
+        robots_parser.parse((robots.get("body") or "").splitlines())
+
+    # Lazy import: audit.page_fetch owns the SSRF guard + fetch + parse
+    # stack (shared with the live audit engine — one implementation).
+    # ssrf_guard=False here is the BATCH-CRAWL posture, NOT a live-audit
+    # shortcut: the URL set originates from the site's OWN sitemap (a
+    # trusted, operator-registered origin — site_config.domain), unlike
+    # the on-demand audit where a pasted URL is untrusted input. Loopback
+    # fixture servers in tests stay fetchable through the opener seam.
+    from audit.page_fetch import build_page_snapshot, PageFetchError
+
+    for url in urls:
+        if summary["pages_upserted"] + summary["pages_robots_blocked"] \
+                + summary["pages_fetch_failed"] >= max_pages:
+            break
+        if not _robots_ok_for_url(robots_parser, url):
+            summary["pages_robots_blocked"] += 1
+            continue
+        try:
+            snapshot = build_page_snapshot(url, opener=opener, ssrf_guard=False)
+        except PageFetchError as exc:
+            if exc.reason == "blocked_robots":
+                summary["pages_robots_blocked"] += 1
+            else:
+                summary["pages_fetch_failed"] += 1
+            continue
+        except Exception:
+            summary["pages_fetch_failed"] += 1
+            continue
+
+        body_html, body_text, h1 = _page_body_from_html(snapshot.get("body_html"))
+        title = snapshot.get("title") or _page_title_from_html(
+            snapshot.get("body_html") or "")
+        meta = snapshot.get("meta_description") or _page_meta_from_html(
+            snapshot.get("body_html") or "")
+        status_code = snapshot.get("status_code")
+        indexable = status_code == 200
+        # Detect schema from the RAW snapshot, not `body_html`:
+        # _page_body_from_html strips <script>, which is where JSON-LD lives.
+        # None (no HTML) must not be written as False — that is the default-
+        # value false positive generator 3 reads as "verified: no schema".
+        raw_html = snapshot.get("body_html")
+        has_structured_data = html_has_structured_data(raw_html)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pages (site_id, url, page_type, title, h1,
+                                   meta_description, body_html, body_text_hash,
+                                   status_code, indexable, last_crawled_at,
+                                   has_structured_data, template)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s)
+                ON CONFLICT (site_id, url_hash) DO UPDATE SET
+                    page_type = EXCLUDED.page_type,
+                    title = COALESCE(EXCLUDED.title, pages.title),
+                    h1 = COALESCE(EXCLUDED.h1, pages.h1),
+                    meta_description = COALESCE(EXCLUDED.meta_description,
+                                                pages.meta_description),
+                    body_html = COALESCE(EXCLUDED.body_html, pages.body_html),
+                    body_text_hash = COALESCE(EXCLUDED.body_text_hash,
+                                              pages.body_text_hash),
+                    status_code = EXCLUDED.status_code,
+                    indexable = EXCLUDED.indexable,
+                    last_crawled_at = now(),
+                    has_structured_data = COALESCE(
+                        EXCLUDED.has_structured_data, pages.has_structured_data),
+                    -- plan/32: never let an INFERRED archetype clobber a real
+                    -- provider-reported template (product.liquid etc).
+                    template = COALESCE(pages.template, EXCLUDED.template)
+                """,
+                (site_id, url, page_type_from_url(url), title, h1, meta,
+                 body_html, _body_text_hash_of(body_html),
+                 status_code, indexable, has_structured_data,
+                 template_from_url(url)),
+            )
+            summary["pages_upserted"] += cur.rowcount
+    return summary

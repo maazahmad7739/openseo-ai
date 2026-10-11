@@ -184,7 +184,8 @@ def test_unit_checks():
     print("\n== validator unit checks ==")
     from fixes.generator import (validate_title_draft, intent_match_check,
                                  brand_suffix_check, validator_extra_checks,
-                                 draft_title, draft_meta_description)
+                                 draft_title, draft_meta_description,
+                                 _tokens_contained, _front_keyword)
 
     allok = True
 
@@ -302,8 +303,56 @@ def test_unit_checks():
     allok &= check("stacked title rejected by validator",
                    any("repeated" in p for p in problems), str(problems))
 
-    # Distinct keyword/product pair still concatenates normally (guard must
-    # not over-trigger).
+    # ---- below-floor variant of the same trap ----
+    # The overlap guard above merges 'buy complete snowboard' (22 chars,
+    # ABOVE the 20-char floor) so it returns early. When the merged
+    # candidate lands UNDER the floor the guard used to fall through to the
+    # concatenating path and stack the product name anyway:
+    #   'Api Widget Ad44Ab3D: Api Widget' -> 'product name repeated in title'
+    # i.e. a page whose title words sit inside its keyword could never get a
+    # title fix at all. Exercised per page_type, since the framing phrase
+    # differs.
+    for page_type, expect_suffix in (("product", "Shop Direct"),
+                                     ("collection", "Shop the Full Range")):
+        rec_short = {
+            "page_title": "Api Widget",
+            "primary_keyword": "api widget ad44ab3d",
+            "intent": "commercial",
+            "site_name": "ActionSEO Dev",
+            "page_type": page_type,
+            "body_text": "An api widget for testing draft title framing.",
+            "competitor_context": {},
+        }
+        draft = draft_title(dict(rec_short))
+        allok &= check(f"[{page_type}] below-floor draft produced",
+                       draft is not None, str(draft))
+        allok &= check(f"[{page_type}] draft does not stack the product name",
+                       (draft or "").lower().count("api widget") == 1,
+                       str(draft))
+        allok &= check(f"[{page_type}] draft uses {page_type} framing",
+                       expect_suffix in (draft or ""), str(draft))
+        problems = validate_title_draft(
+            draft, "api widget ad44ab3d", product_title="Api Widget",
+            intent="commercial", site_name="ActionSEO Dev") if draft else ["none"]
+        allok &= check(f"[{page_type}] below-floor draft passes the validator",
+                       not problems, str(problems))
+
+    # Containment must be order-preserving and unbroken, not a bag-of-tokens
+    # overlap: a scattered match is not the same as the phrase being present.
+    allok &= check("contained: keyword carries the title phrase",
+                   _tokens_contained("api widget pro", "api widget"))
+    allok &= check("not contained: scattered tokens do not count",
+                   not _tokens_contained("blue running shoe", "shoe blue"))
+    allok &= check("not contained: needle longer than haystack",
+                   not _tokens_contained("api", "api widget pro"))
+    allok &= check("not contained: disjoint phrases",
+                   not _tokens_contained("stainless steel bottle",
+                                         "noise cancelling headphones"))
+
+    # _front_keyword must not prepend a keyword the text already sits inside.
+    allok &= check("_front_keyword does not re-stack a contained phrase",
+                   _front_keyword("Api Widget", "api widget pro") == "Api widget pro",
+                   str(_front_keyword("Api Widget", "api widget pro")))
     draft_distinct = draft_title({"page_title": "Powder Gold Collector Edition",
                                   "primary_keyword": "buy snowboard goggles",
                                   "competitor_context": {}})

@@ -1,9 +1,9 @@
-﻿"""Fix endpoints (plan/21 Â§3): generate / approve / reject / get / revert.
+"""Fix endpoints (plan/21 §3): generate / approve / reject / get / revert.
 
 Second approval gate lives here: recommendation approve (gate 1) then the
 operator approves the DIFF (gate 2) before a fix can ever sit 'queued'.
 Writes are never free-running in-request: POST /execute and POST /revert are
-dev/manual triggers that run the SAME job path as the scheduled executor â€”
+dev/manual triggers that run the SAME job path as the scheduled executor —
 under the same per-site advisory lock, so a request and a scheduled run can
 never collide. (Vercel's 60s window still cannot own a long write batch;
 that stays the executor job's domain.)
@@ -64,6 +64,12 @@ class FixGenerateOut(BaseModel):
     status: str
     created: bool
     diff_json: Any = None
+    # plan/32: a template-grouped recommendation expands to one fix per
+    # affected page. `fix_id` stays the first fix so existing single-fix
+    # callers are unaffected; `fix_ids` carries the whole batch and
+    # `group` explains what it covered and what it could not.
+    fix_ids: List[UUID] = []
+    group: Any = None
 
 
 class FixDraftOut(BaseModel):
@@ -151,7 +157,7 @@ def generate_fix(recommendation_id, conn=Depends(get_conn)):
     Gate 1 must already be recorded (approve) or must be recorded in the same
     operator action; generating requires the recommendation to exist. The
     recommendation status transition itself stays on /approve (TRANSITIONS
-    untouched) â€” this endpoint only writes the generated_fixes row.
+    untouched) — this endpoint only writes the generated_fixes row.
 
     Best effort fresh read of the live seo.title (the subject the fix
     rewrites) so the quality gate judges the real value: the shop_domain is
@@ -180,6 +186,9 @@ def generate_fix(recommendation_id, conn=Depends(get_conn)):
         status=result["status"],
         created=result["created"],
         diff_json=result["diff"],
+        # plan/32: present only for template-grouped recommendations.
+        fix_ids=result.get("fix_ids") or [],
+        group=result.get("group"),
     )
 
 
@@ -214,6 +223,9 @@ def generate_meta_fix(recommendation_id, conn=Depends(get_conn)):
         status=result["status"],
         created=result["created"],
         diff_json=result["diff"],
+        # plan/32: present only for template-grouped recommendations.
+        fix_ids=result.get("fix_ids") or [],
+        group=result.get("group"),
     )
 
 
@@ -246,17 +258,31 @@ def draft_fixes(recommendation_id, conn=Depends(get_conn)):
 
     drafts: List[dict] = []
     unsupported: List[dict] = []
-    for label, fn, kwargs in (
-        ("seo.title", generate_fix_for_recommendation,
-         {"live_seo_title": _fresh_live_seo_title(conn, recommendation_id)}),
-        ("seo.description", generate_meta_fix_for_recommendation,
-         {"live_meta_description": _fresh_live_meta_description(conn, recommendation_id)}),
-        ("collection_description",
-         generate_collection_description_fix_for_recommendation,
-         {"live_body_html": _fresh_live_description_html(conn, recommendation_id)}),
-        ("collection_create",
-         generate_collection_create_fix_for_recommendation, {}),
-    ):
+    # plan/27+28: netlify platforms route to the GitHub-PR engine — the
+    # structured-data fix AND (plan/28) the canonical-tag fix are both
+    # executable surfaces (each opens its own PR; the unique per-target
+    # index keeps them distinct).
+    platform = rec.get("platform") or "shopify"
+    if platform == "netlify":
+        generator_entries = (
+            ("netlify.structured_data",
+             _generate_netlify_structured_fix, {}),
+            ("netlify.canonical_tag",
+             _generate_netlify_canonical_fix, {}),
+        )
+    else:
+        generator_entries = (
+            ("seo.title", generate_fix_for_recommendation,
+             {"live_seo_title": _fresh_live_seo_title(conn, recommendation_id)}),
+            ("seo.description", generate_meta_fix_for_recommendation,
+             {"live_meta_description": _fresh_live_meta_description(conn, recommendation_id)}),
+            ("collection_description",
+             generate_collection_description_fix_for_recommendation,
+             {"live_body_html": _fresh_live_description_html(conn, recommendation_id)}),
+            ("collection_create",
+             generate_collection_create_fix_for_recommendation, {}),
+        )
+    for label, fn, kwargs in generator_entries:
         try:
             result = fn(conn, recommendation_id, **kwargs_safe(kwargs))
             drafts.append({
@@ -282,8 +308,67 @@ def draft_fixes(recommendation_id, conn=Depends(get_conn)):
     return FixDraftOut(drafts=drafts, unsupported=unsupported)
 
 
+def _generate_netlify_structured_fix(conn, recommendation_id):
+    """plan/27 wrapper: approved technical_fix -> netlify.structured_data fix.
+
+    The recommendation's own evidence drives the generator (the same path
+    the executor rehearsal validated live). Requires the site's GitHub
+    binding (typed FixNotSupported otherwise)."""
+    from fixes.generator import (generate_netlify_technical_fix,
+                                 load_decision_inputs)
+    rec = load_decision_inputs(conn, recommendation_id)
+    rec["platform"] = "netlify"
+    evidence = rec.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        evidence = {}
+    rec["evidence"] = dict(
+        evidence,
+        issue_type=evidence.get("issue_type") or "structured_data_failure",
+        has_structured_data=False,
+    )
+    return generate_netlify_technical_fix(conn, rec,
+                                          generation_source="deterministic")
+
+
+def _generate_netlify_canonical_fix(conn, recommendation_id):
+    """plan/28 wrapper: approved technical_fix -> netlify.canonical_tag fix.
+
+    The canonical href = the page's own URL (self-referencing by
+    construction); the generator refuses when the page already carries a
+    canonical (crawl-verified) — never a duplicate-canonical PR."""
+    from fixes.generator import (generate_netlify_canonical_fix,
+                                 load_decision_inputs)
+    rec = load_decision_inputs(conn, recommendation_id)
+    rec["platform"] = "netlify"
+    evidence = rec.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        evidence = {}
+    rec["evidence"] = dict(
+        evidence,
+        issue_type="canonical_missing",
+        canonical_missing=True,
+    )
+    return generate_netlify_canonical_fix(conn, rec,
+                                          generation_source="deterministic")
+
+
 def kwargs_safe(kwargs):
     return kwargs
+
+
+def _write_credential_ok(config):
+    """Platform-aware credential check (plan/26 Phase 4) — mirrors
+    jobs.fix_executor._credential_ok_for_platform; legacy injected/flat
+    configs fall back to the Shopify key check."""
+    platform = config.get("platform")
+    if platform == "framer":
+        return bool(config.get("framer_api_key")
+                    and config.get("framer_site_ref"))
+    if platform == "netlify":
+        return bool(config.get("github_token") and config.get("github_repo"))
+    if platform == "shopify":
+        return bool(config.get("shop_domain") and config.get("access_token"))
+    return bool(config.get("shop_domain") and config.get("access_token"))
 
 
 @router.post("/recommendations/{recommendation_id}/publish-fix", response_model=FixGenerateOut)
@@ -316,20 +401,26 @@ def generate_publish_fix(recommendation_id, conn=Depends(get_conn)):
         status=result["status"],
         created=result["created"],
         diff_json=result["diff"],
+        # plan/32: present only for template-grouped recommendations.
+        fix_ids=result.get("fix_ids") or [],
+        group=result.get("group"),
     )
 
 
 def _fresh_live_seo_title(conn, recommendation_id):
-    """One cheap GraphQL read for the gate input; None on anything odd."""
+    """One cheap live read for the gate input; None on anything odd.
+
+    plan/26 Phase 4: platform-aware — framer sites read via FramerClient
+    (mock/fixture mode in mock environments; live is flag-gated inside the
+    client), shopify sites use the existing GraphQL read (unchanged)."""
     import os
-    from connectors.shopify import ShopifyGraphQLClient
+    from connectors.write_credentials import resolve_write_credentials
     from jobs.fix_executor import _normalize_shop_domain
 
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT s.shopify_domain, p.url FROM recommendations r "
-                "JOIN site_config s ON s.site_id = r.site_id "
+                "SELECT r.site_id, p.url FROM recommendations r "
                 "JOIN pages p ON p.site_id = r.site_id AND p.url = r.target_url "
                 "WHERE r.recommendation_id = %s",
                 (recommendation_id,),
@@ -337,10 +428,49 @@ def _fresh_live_seo_title(conn, recommendation_id):
             row = cur.fetchone()
         if not row:
             return None
-        shop_domain, target_url = row
-        token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+        site_id, target_url = row
+        resolved = resolve_write_credentials(conn, site_id)
+        platform = resolved.get("platform") or "shopify"
+        cfg = resolved.get("config") or {}
+        if platform == "framer":
+            if not resolved.get("ok"):
+                return None
+            from connectors.framer import FramerClient
+            client = FramerClient(
+                framer_api_key=cfg.get("framer_api_key"),
+                framer_site_ref=cfg.get("framer_site_ref"),
+                api_base=cfg.get("api_base"))
+            read = client.read_page_meta(target_url)
+            if read.get("ok"):
+                return (read.get("data") or {}).get("title")
+            return None
+        if platform == "netlify":
+            if not resolved.get("ok"):
+                return None
+            from connectors.github_static import (GitHubPRClient,
+                                                  file_path_for_url)
+            client = GitHubPRClient(
+                github_token=cfg.get("github_token"),
+                github_repo=cfg.get("github_repo"),
+                github_branch=cfg.get("github_branch"),
+                github_root_dir=cfg.get("github_root_dir"),
+                api_base=cfg.get("api_base"))
+            path = file_path_for_url(
+                target_url, root_dir=cfg.get("github_root_dir") or "")
+            if not path:
+                return None
+            read = client.read_file(path)
+            if read.get("ok"):
+                from fixes.adapters import _parse_live_meta
+                return _parse_live_meta(
+                    (read.get("data") or {}).get("content")).get("title")
+            return None
+        # shopify (legacy shape preserved)
+        token = cfg.get("access_token") or os.environ.get("SHOPIFY_ACCESS_TOKEN")
+        shop_domain = cfg.get("shop_domain")
         if not shop_domain or not token:
             return None
+        from connectors.shopify import ShopifyGraphQLClient
         client = ShopifyGraphQLClient(shop_domain=_normalize_shop_domain(shop_domain),
                                       access_token=token)
         handle = target_url.rstrip("/").rsplit("/", 1)[-1]
@@ -357,16 +487,16 @@ def _fresh_live_seo_title(conn, recommendation_id):
 
 def _fresh_live_meta_description(conn, recommendation_id):
     """Phase 2: same best-effort live read for seo.description (gate input;
-    None on anything odd -> gate falls back to pages.meta_description)."""
+    None on anything odd -> gate falls back to pages.meta_description).
+    plan/26 Phase 4: platform-aware — framer reads via FramerClient."""
     import os
-    from connectors.shopify import ShopifyGraphQLClient
+    from connectors.write_credentials import resolve_write_credentials
     from jobs.fix_executor import _normalize_shop_domain
 
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT s.shopify_domain, p.url FROM recommendations r "
-                "JOIN site_config s ON s.site_id = r.site_id "
+                "SELECT r.site_id, p.url FROM recommendations r "
                 "JOIN pages p ON p.site_id = r.site_id AND p.url = r.target_url "
                 "WHERE r.recommendation_id = %s",
                 (recommendation_id,),
@@ -374,10 +504,50 @@ def _fresh_live_meta_description(conn, recommendation_id):
             row = cur.fetchone()
         if not row:
             return None
-        shop_domain, target_url = row
-        token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+        site_id, target_url = row
+        resolved = resolve_write_credentials(conn, site_id)
+        platform = resolved.get("platform") or "shopify"
+        cfg = resolved.get("config") or {}
+        if platform == "framer":
+            if not resolved.get("ok"):
+                return None
+            from connectors.framer import FramerClient
+            client = FramerClient(
+                framer_api_key=cfg.get("framer_api_key"),
+                framer_site_ref=cfg.get("framer_site_ref"),
+                api_base=cfg.get("api_base"))
+            read = client.read_page_meta(target_url)
+            if read.get("ok"):
+                return (read.get("data") or {}).get("description")
+            return None
+        if platform == "netlify":
+            if not resolved.get("ok"):
+                return None
+            from connectors.github_static import (GitHubPRClient,
+                                                  file_path_for_url)
+            client = GitHubPRClient(
+                github_token=cfg.get("github_token"),
+                github_repo=cfg.get("github_repo"),
+                github_branch=cfg.get("github_branch"),
+                github_root_dir=cfg.get("github_root_dir"),
+                api_base=cfg.get("api_base"))
+            path = file_path_for_url(
+                target_url, root_dir=cfg.get("github_root_dir") or "")
+            if not path:
+                return None
+            read = client.read_file(path)
+            if read.get("ok"):
+                from fixes.adapters import _parse_live_meta
+                return _parse_live_meta(
+                    (read.get("data") or {}).get("content")).get(
+                    "description")
+            return None
+        # shopify (legacy shape preserved)
+        token = cfg.get("access_token") or os.environ.get("SHOPIFY_ACCESS_TOKEN")
+        shop_domain = cfg.get("shop_domain")
         if not shop_domain or not token:
             return None
+        from connectors.shopify import ShopifyGraphQLClient
         client = ShopifyGraphQLClient(shop_domain=_normalize_shop_domain(shop_domain),
                                       access_token=token)
         handle = target_url.rstrip("/").rsplit("/", 1)[-1]
@@ -467,6 +637,9 @@ def generate_collection_description_fix(recommendation_id,
         status=result["status"],
         created=result["created"],
         diff_json=result["diff"],
+        # plan/32: present only for template-grouped recommendations.
+        fix_ids=result.get("fix_ids") or [],
+        group=result.get("group"),
     )
 
 
@@ -504,6 +677,9 @@ def generate_collection_create_fix(recommendation_id,
         status=result["status"],
         created=result["created"],
         diff_json=result["diff"],
+        # plan/32: present only for template-grouped recommendations.
+        fix_ids=result.get("fix_ids") or [],
+        group=result.get("group"),
     )
 
 
@@ -610,7 +786,7 @@ def get_fix(fix_id, conn=Depends(get_conn)):
 
 # ------------------------------------------------------------
 # Execution is ALWAYS the executor job's (queued -> applied there).
-# This endpoint is a dev/manual trigger that runs the SAME job path â€”
+# This endpoint is a dev/manual trigger that runs the SAME job path —
 # including the per-site advisory lock (an API request can still collide
 # with a running executor; the lock makes them mutually exclusive).
 # ------------------------------------------------------------
@@ -627,9 +803,15 @@ def execute_fix(fix_id, conn=Depends(get_conn)):
             detail=f"execute requires status 'queued' (current: '{row['status']}'); "
                    "approve the diff first (plan/21 two-gate rule)",
         )
+    # plan/26 Phase 4: platform-aware credential resolution (the resolver
+    # returns the legacy flat Shopify dict for shopify sites; framer sites
+    # get the framer config — the executor's adapters dispatch on it).
     config = _resolve_shop_config(conn, row["site_id"])
-    if not config.get("access_token"):
-        raise HTTPException(status_code=409, detail="no Shopify credential resolved")
+    if not _write_credential_ok(config):
+        raise HTTPException(
+            status_code=409,
+            detail=f"no {(config.get('platform') or 'shopify')} write "
+                   "credential resolved")
     fix_row = {
         "fix_id": row["fix_id"],
         "recommendation_id": row["recommendation_id"],
@@ -643,7 +825,7 @@ def execute_fix(fix_id, conn=Depends(get_conn)):
         "risk_tier": row["risk_tier"],
         "rollback_of": None,
     }
-    # Same advisory lock the scheduled executor holds (plan/21 Â§5.2): this
+    # Same advisory lock the scheduled executor holds (plan/21 §5.2): this
     # request and a scheduled run can never double-execute the same site.
     with job_lock(conn, LOCK_KEYS["fix_executor"], site_id=str(row["site_id"])) as got:
         if not got:
@@ -655,7 +837,7 @@ def execute_fix(fix_id, conn=Depends(get_conn)):
 
 
 # ------------------------------------------------------------
-# Revert (plan/21 Â§5.3): snapshot values -> adapter -> audited row
+# Revert (plan/21 §5.3): snapshot values -> adapter -> audited row
 # ------------------------------------------------------------
 
 @router.post("/fixes/{fix_id}/revert")
@@ -672,10 +854,15 @@ def revert_fix_endpoint(fix_id, conn=Depends(get_conn)):
         )
     snapshot = row["snapshot_json"]
     if snapshot is None:
-        raise HTTPException(status_code=409, detail="no snapshot stored â€” cannot revert")
+        raise HTTPException(status_code=409, detail="no snapshot stored — cannot revert")
+    # plan/26 Phase 4: platform-aware credential resolution (execute + revert
+    # dispatch through the same resolver the executor uses).
     config = _resolve_shop_config(conn, row["site_id"])
-    if not config.get("access_token"):
-        raise HTTPException(status_code=409, detail="no Shopify credential resolved")
+    if not _write_credential_ok(config):
+        raise HTTPException(
+            status_code=409,
+            detail=f"no {(config.get('platform') or 'shopify')} write "
+                   "credential resolved")
     with job_lock(conn, LOCK_KEYS["fix_executor"], site_id=str(row["site_id"])) as got:
         if not got:
             raise HTTPException(status_code=409,

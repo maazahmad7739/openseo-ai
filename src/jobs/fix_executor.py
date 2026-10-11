@@ -37,44 +37,129 @@ import env as env_loader
 def _normalize_shop_domain(domain):
     """site_config may store the bare handle ('my-store'); GraphQL needs the
     myshopify.com FQDN. The sync path tolerates both (REST base formats with
-    .format()), so the executor accepts both too."""
-    if not domain:
-        return domain
-    if "." in domain:
-        return domain
-    return f"{domain}.myshopify.com"
+    .format()), so the executor accepts both too.
+
+    plan/26 Phase 0: the rule itself moved to
+    connectors.write_credentials._normalize_shop_domain (single source); the
+    local name stays because routes/fixes.py imports it."""
+    from connectors.write_credentials import _normalize_shop_domain as _norm
+    return _norm(domain)
+
+
+def _credential_ok_for_platform(config):
+    """Platform-aware fail-closed credential check (plan/26 Phase 0).
+
+    shopify: identical keys the executor always required
+             (shop_domain + access_token). framer: framer_api_key +
+             framer_site_ref. Explicit platform key wins; missing key
+             (legacy caller) falls back to the Shopify check so injected
+             test configs behave exactly as before.
+    """
+    platform = config.get("platform")
+    if platform == "framer":
+        return bool(config.get("framer_api_key")
+                    and config.get("framer_site_ref"))
+    if platform == "netlify":
+        return bool(config.get("github_token") and config.get("github_repo"))
+    if platform == "shopify":
+        return bool(config.get("shop_domain") and config.get("access_token"))
+    return bool(config.get("shop_domain") and config.get("access_token"))
 
 
 def _resolve_shop_config(conn, site_id, api_version=None):
-    """Per-site Shopify GraphQL credential (site_config + env; mode-layer rules).
+    """Per-site write credential via the plan/26 multi-connector resolver.
 
-    The executor is the ONLY writer: it refuses to run live without
-    credentials (fail-closed), and honors INTEGRATION_MODE for dry runs in
-    CI/mock environments.
+    Delegates to resolve_write_credentials() and returns the legacy
+    flat Shopify dict for platform='shopify' — the exact keys the
+    executor/adapters/routes always consumed ({shop_domain, access_token,
+    api_version}), so every existing Shopify call site is byte-identical.
+    Extra 'platform'/'ok' metadata keys ride along harmlessly.
+
+    Framer sites resolve a framer config here too (the executor's
+    fail-closed refusal branches on the resolved shape, and Phase 3's
+    framer adapters consume the same dict). A site_config row that does
+    not exist at all still returns the legacy shape (all None) rather
+    than raising — the original behavior for that edge.
     """
+    from connectors.write_credentials import resolve_write_credentials
+    try:
+        resolved = resolve_write_credentials(conn, site_id, api_version=api_version)
+    except Exception:
+        # site row missing: legacy behavior returned a dict with a
+        # SHOPIFY_DOMAIN-env fallback and no token — the executor's
+        # fail-closed refusal then fired. Preserve exactly that.
+        return {"shop_domain": _normalize_shop_domain(os.environ.get("SHOPIFY_DOMAIN")),
+                "access_token": os.environ.get("SHOPIFY_ACCESS_TOKEN"),
+                "api_version": api_version or _shopify_api_version(conn),
+                "platform": "shopify", "ok": False}
+    config = resolved.get("config") or {}
+    if resolved.get("platform") == "framer":
+        return dict(config, ok=resolved.get("ok", False),
+                    outcome=resolved.get("outcome"))
+    if resolved.get("platform") == "netlify":
+        return dict(config, ok=resolved.get("ok", False),
+                    outcome=resolved.get("outcome"))
+    # shopify (or legacy): legacy flat shape + metadata keys
+    out = {"shop_domain": config.get("shop_domain"),
+           "access_token": config.get("access_token"),
+           "api_version": config.get("api_version")
+           or api_version or _shopify_api_version(conn)}
+    out["platform"] = "shopify"
+    out["ok"] = resolved.get("ok", False)
+    if resolved.get("outcome"):
+        out["outcome"] = resolved["outcome"]
+    return out
+
+
+def _shopify_api_version(conn):
+    """system_config shopify.api_version (legacy default 2026-01)."""
     with conn.cursor() as cur:
-        cur.execute("SELECT shopify_domain FROM site_config WHERE site_id = %s", (site_id,))
-        row = cur.fetchone()
-    shop_domain = _normalize_shop_domain(
-        (row[0] if row else None) or os.environ.get("SHOPIFY_DOMAIN"))
-    access_token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
-    if api_version is None:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT config_value FROM system_config WHERE config_key = 'shopify.api_version'"
-            )
-            vrow = cur.fetchone()
-        api_version = (vrow[0] if vrow else None) or "2026-01"
-    return {"shop_domain": shop_domain, "access_token": access_token,
-            "api_version": api_version}
+        cur.execute(
+            "SELECT config_value FROM system_config WHERE config_key = 'shopify.api_version'"
+        )
+        vrow = cur.fetchone()
+    return (vrow[0] if vrow else None) or "2026-01"
 
 
 def _fix_scope_probes(conn, site_id, sub_type):
-    """Startup diagnostics (plan/21 §4): granted-vs-required scopes."""
+    """Startup diagnostics (plan/21 §4): granted-vs-required scopes.
+
+    plan/26 Phase 0: framer.* sub_types are NOT Shopify-scope material —
+    they dispatch to a Framer auth probe (live) or a loud typed skip
+    (mock/unverified), never into required_scopes_for_sub_types (which
+    would KeyError on the registry-drift guard)."""
     from connectors.shopify import (ShopifyGraphQLClient,
                                     required_scopes_for_sub_types,
                                     granted_covers_required)
 
+    if sub_type and sub_type.startswith("framer."):
+        # plan/26 Phase 3: the Framer auth probe (mirrors probe_scopes;
+        # never raises, never logs credential values). Live mode is
+        # flag-gated inside the client — the probe reports what it can
+        # verify honestly; the policy gate remains the enforcement.
+        from connectors.framer import FramerClient
+        from connectors.write_credentials import resolve_write_credentials
+        resolved = resolve_write_credentials(conn, site_id)
+        client = FramerClient(
+            framer_api_key=(resolved.get("config") or {}).get("framer_api_key"),
+            framer_site_ref=(resolved.get("config") or {}).get("framer_site_ref"),
+        )
+        return dict(client.probe_auth(), required=["framer.meta_write"])
+    if sub_type and sub_type.startswith("netlify."):
+        # plan/27: the GitHub PR auth probe (same never-raise pattern;
+        # live calls flag-gated inside the client via NETLIFY_LIVE_WRITES).
+        from connectors.github_static import GitHubPRClient
+        from connectors.write_credentials import resolve_write_credentials
+        resolved = resolve_write_credentials(conn, site_id)
+        cfg = resolved.get("config") or {}
+        client = GitHubPRClient(
+            github_token=cfg.get("github_token"),
+            github_repo=cfg.get("github_repo"),
+            github_branch=cfg.get("github_branch"),
+            github_root_dir=cfg.get("github_root_dir"),
+            api_base=cfg.get("api_base"),
+        )
+        return dict(client.probe_auth(), required=["repo:pr_write"])
     def probe(client, required):
         granted = client.probe_scopes()
         if not granted.get("ok"):
@@ -366,10 +451,13 @@ def _mint_unpublish_followup(conn, fix_row, snapshot,
                        or os.environ.get("SHOPIFY_DOMAIN"))
         token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
         publication_id = None
-        if shop_domain and token:
-            client = ShopifyGraphQLClient(shop_domain=shop_domain,
-                                          access_token=token)
-            publication_id = resolve_publication_id(conn, client)
+        # Cache first, credentials second (see resolve_publication_id's
+        # documented order). Same defect as the publish path: gating the
+        # whole call on `shop_domain and token` meant a cached publication
+        # id was ignored offline and unpublish silently skipped the page.
+        client = ShopifyGraphQLClient(shop_domain=shop_domain,
+                                      access_token=token)
+        publication_id = resolve_publication_id(conn, client)
         if not publication_id:
             print(f"[fix_executor] unpublish follow-up skipped: no publication "
                   f"id for collection {source_url}", flush=True)
@@ -723,6 +811,7 @@ def run_fix_executor(site_id, conn=None, dry_run=False, limit=MAX_APPLIES_PER_RU
     omitted the per-site Shopify credential is resolved from site_config + env.
     """
     from fixes.policy import check_execution_allowed, PolicyBlocked
+    from connectors.mode import resolve_site_mode
 
     own_conn = conn is None
     if own_conn:
@@ -731,11 +820,23 @@ def run_fix_executor(site_id, conn=None, dry_run=False, limit=MAX_APPLIES_PER_RU
     try:
         config = shop_config or _resolve_shop_config(conn, site_id,
                                                       api_version=api_version)
-        if not dry_run and (not config.get("shop_domain")
-                            or not config.get("access_token")):
-            print("[fix_executor] no Shopify credential resolved — refusing to run "
-                  "(fail-closed)", flush=True)
-            return {"status": "no_credentials", "site_id": str(site_id)}
+        # plan/31: 'import' sites take ZERO connector write traffic (their
+        # content is operator-imported; a PR write would still be safe, but
+        # the site has explicitly opted out of live pipeline execution).
+        site_mode = resolve_site_mode(conn, site_id)
+        if site_mode == "import" and not dry_run:
+            print(f"[fix_executor] site {site_id} is integration_mode='import' — "
+                  "skipping execution (connector traffic disabled)", flush=True)
+            return {"status": "skipped_import_mode", "site_id": str(site_id)}
+        # plan/26 Phase 0: platform-aware fail-closed refusal. Shopify
+        # keeps the identical check + return shape; Framer refuses on its
+        # own missing keys. Dry runs never refuse (they write nothing).
+        if not dry_run and not _credential_ok_for_platform(config):
+            platform = config.get("platform") or "shopify"
+            print(f"[fix_executor] no {platform} write credential resolved — "
+                  "refusing to run (fail-closed)", flush=True)
+            return {"status": "no_credentials", "site_id": str(site_id),
+                    "platform": platform}
 
         # Startup diagnostics: scope introspection + version drift warning.
         with conn.cursor() as cur:
@@ -755,7 +856,7 @@ def run_fix_executor(site_id, conn=None, dry_run=False, limit=MAX_APPLIES_PER_RU
                 if parts:
                     print(f"[fix_executor] WARNING: {'; '.join(parts)} "
                           f"(required: {scopes['required']})", flush=True)
-            elif not scopes.get("ok") and os.environ.get("INTEGRATION_MODE") == "live":
+            elif not scopes.get("ok") and resolve_site_mode(conn, site_id) in ("live", "sandbox"):
                 print(f"[fix_executor] scope probe failed: {scopes.get('error')}",
                       flush=True)
 

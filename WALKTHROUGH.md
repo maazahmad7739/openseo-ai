@@ -33,6 +33,9 @@ src/
   connectors/                 # Ingestion layer
     mode.py                   #   central mock/live switch (INTEGRATION_MODE)
     gsc.py / shopify.py / ga4.py / openseo.py / openseo_rest_adapter.py
+    framer.py                 #   Framer write client (plan/26)
+    github_static.py          #   GitHub-PR write client (plan/27)
+    write_credentials.py      #   per-platform write-credential resolver
     sync.py                   # per-site sync orchestrator (run_sync)
     costlog.py                # cost ledger + weekly budget caps
     url_normalize.py          # canonical URL helper
@@ -279,6 +282,8 @@ All DataForSEO access flows through `openseo_rest_adapter.py` (typed `supports()
 - Backend = FastAPI imported by `api/index.py`, served as a Python serverless function; PostgreSQL over TLS via `POSTGRES_HOST/PORT/DB/USER/PASSWORD`.
 - Live: **https://openseo-plus.vercel.app** (canonical domain; Vercel preview URL is auth-gated). Deploys from `main`.
 - Prod data seeded via `scripts/seed_remote.py` (remote-only DB binding) / `scripts/seed_operator_data.py`; `.env.vercel-prod` holds prod env (secrets — never commit).
+- Static-site onboarding (Netlify/GitHub-PR writes): `docs/NETLIFY_STATIC_SITE_ONBOARDING_RUNBOOK.md` (plan/27; `platform='netlify'`, one PR per fix, revert = close PR).
+- Framer onboarding: `docs/FRAMER_ONBOARDING_RUNBOOK.md` (plan/26).
 
 **Local development**:
 1. Venv + `pip install -r requirements.txt` (+ `google-auth` only for live GSC).
@@ -309,6 +314,22 @@ Standalone suites, run directly (`python tests/<name>.py`), need a live local Po
 | `run_day_in_the_life.py` | Full pipeline: sync → generate → evaluate → approve → measure |
 | `run_measurement_tests.py` | Baseline/post/classify logic |
 | `run_live_agent.py` | Live Ollama agent (needs creds) |
+
+**Live-agent verification policy (Category 2, P3):** the automated runner
+(`scripts/run_tests.py`) never asserts on a live LLM's decisions.
+`run_day_in_the_life.py` runs with `--skip-agent` there (its documented
+deterministic mode — the agent stage is simulated, every other stage is
+exercised); `run_live_agent.py` is skipped outright. To verify the live
+agent manually, run standalone:
+
+    python tests/run_live_agent.py                 # needs OLLAMA_API_*
+    python tests/run_day_in_the_life.py            # live agent + full pipeline
+
+Note the day-in-the-life live path asserts "agent approves ≥1 of ~7
+candidates" — the LLM's approve/reject split is non-deterministic, so a
+0-approval run is a model-behavior data point, NOT a regression. Judge it
+against the rejection reasons in `rejection_log`, and re-run before
+investigating code.
 
 Fixtures (`tests/fixtures/`): GSC sites/analytics, Shopify products/collections (Aurora Audio demo storefront: 7 in-stock swim products, published/unpublished collections, draft/out-of-stock variants, indexability/canonical defects, SERP alternation), GA4 page performance, DataForSEO keyword-volume/SERP/competitors/backlinks/crawl-audit. Mock runs record fixture cost fields into the ledger too — the fixture universe is a validation harness, not a parallel demo pipeline.
 

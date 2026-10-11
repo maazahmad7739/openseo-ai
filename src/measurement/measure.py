@@ -204,8 +204,8 @@ def store_cluster_post_snapshots(conn, recommendation_id, measured_at):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT recommended_page_type FROM keyword_clusters "
-                "WHERE cluster_id = %s",
-                (cluster_id,),
+                "WHERE cluster_id = %s AND site_id = %s",
+                (cluster_id, site_id),
             )
             r = cur.fetchone()
             if r:

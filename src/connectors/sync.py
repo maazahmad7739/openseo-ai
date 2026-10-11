@@ -6,11 +6,13 @@ Per-site sequence:
   3. GA4 page_performance → page_business_performance (upsert)
   4. OpenSEO keyword_volume → keyword_clusters.search_volume (existing clusters)
 
-Connector modes resolve via the central INTEGRATION_MODE switch (connectors/
-mode.py) with per-connector legacy env vars as fallback; when a live mode is
-requested but no credentials are present, each adapter falls back to mock
-instead of failing the whole sync. Every fetch is idempotent via ON CONFLICT
-upserts, so re-running the sync is safe.
+Connector modes resolve PER-SITE from site_config.integration_mode
+(connectors/mode.py resolve_site_mode) with the global INTEGRATION_MODE env
+as fallback. plan/31: a live/sandbox site whose credentials are missing
+FAILS LOUDLY (SiteModeError) — mock fixture data is never silently injected
+into a live run. 'import' sites (Helium) skip connector fetches entirely so
+operator-imported rows are never overwritten by mock fixtures. Every fetch
+is idempotent via ON CONFLICT upserts, so re-running the sync is safe.
 """
 
 import os
@@ -29,7 +31,10 @@ from connectors.gsc import (  # noqa: E402
 )
 from connectors.shopify import get_shopify_adapter, ShopifyError  # noqa: E402
 from connectors.ga4 import get_ga4_adapter, Ga4Error  # noqa: E402
+from connectors.mode import resolve_site_mode, adapter_mode  # noqa: E402
 from connectors.url_normalize import canonicalize_url  # noqa: E402
+from audit.structured_data import html_has_structured_data  # noqa: E402
+from audit.url_pattern import template_from_url  # noqa: E402
 
 import db as database  # noqa: E402
 
@@ -48,6 +53,28 @@ FIXTURE_ANCHOR_DATE = "2026-09-10"
 # Live-crawl/task polling budget for the on_page crawl flow (openseo adapter).
 CRAWL_READY_ATTEMPTS = 30
 CRAWL_READY_INTERVAL_SECONDS = 5
+
+# Keyword research: per-site target keywords come from site_config
+# (target_keywords TEXT[]; plan/31). Empty/NULL = keyword/SERP steps are
+# skipped cleanly (they are paid DataForSEO calls) — never the old
+# Aurora headphone list.
+TARGET_KEYWORDS_COLUMN = "target_keywords"
+
+
+class SiteModeError(Exception):
+    """Raised when a live/sandbox site cannot build a live adapter.
+
+    plan/31: fail-closed. The old behavior silently fell back to mock
+    fixtures, blending synthetic data into a live sync. A site running
+    integration_mode='live'/'sandbox' with missing credentials must halt
+    the sync instead.
+    """
+
+
+class SiteRequiredError(Exception):
+    """plan/31: site resolution is strictly mandatory. The old
+    'ORDER BY created_at LIMIT 1' fallback silently operated on the
+    oldest site (Aurora); every caller must now resolve a real site."""
 
 
 def _reference_window(reference_date, live, days_back):
@@ -74,24 +101,70 @@ def _days_before(days):
     return str(anchor - timedelta(days=days))
 
 
-def _build_adapter(factory, key, config, fixtures_dir, error_types):
-    """Build a connector adapter honoring env-driven mode.
+def _build_adapter(conn, factory, key, config, fixtures_dir, error_types, site_id,
+                   applicable=True):
+    """Build a connector adapter honoring the SITE's integration mode.
 
-    Per-call config wins over environment (connectors resolve mode via
-    resolve_mode()). If a live mode is requested but no credentials are
-    configured, the adapter factory raises a typed config error — we fall
-    back to the mock adapter so the sync never dies on a missing secret.
+    plan/31: mode comes from site_config.integration_mode (resolve_site_mode),
+    then the global env. Mock/import sites get the offline adapter. A
+    live/sandbox site whose credentials are missing raises SiteModeError —
+    the silent mock fallback is gone (never blend fixtures into a live run).
+
+    applicable=False (the site lacks the connector's coordinate, e.g. no
+    ga4_property_id) returns None cleanly — that connector's sync step is
+    skipped, and a live site is never failed for an inapplicable connector.
     """
+    if not applicable:
+        return None, "not_applicable"
+    site_mode = resolve_site_mode(conn, site_id)
+    amode = adapter_mode(site_mode)
     cfg = dict(config)
+    cfg[f"{key}.mode"] = amode
     cfg[f"{key}.mock_fixtures_dir"] = fixtures_dir
+    if amode == "live":
+        try:
+            return factory(config=cfg), amode
+        except error_types as exc:
+            raise SiteModeError(
+                f"site {site_id} is integration_mode='{site_mode}' but the "
+                f"{key} adapter cannot go live: {exc}"
+            ) from exc
     try:
-        return factory(config=cfg)
+        return factory(config=cfg), amode
     except error_types as exc:
-        print(f"[sync] {key}: live mode unavailable ({exc}) — falling back to mock", flush=True)
+        # Offline site, adapter build still failed (e.g. malformed config):
+        # fall back to plain mock so the offline demo keeps working.
+        print(f"[sync] {key}: adapter build failed ({exc}) — falling back to mock", flush=True)
         cfg = dict(config)
         cfg[f"{key}.mode"] = "mock"
         cfg[f"{key}.mock_fixtures_dir"] = fixtures_dir
-        return factory(config=cfg)
+        return factory(config=cfg), amode
+
+
+def _site_connector_applicability(conn, site_id, site):
+    """Which connectors does this site actually use (plan/31)?
+
+    GSC needs a gsc_property; GA4 needs a ga4_property_id; Shopify applies
+    only to platform='shopify' sites. Missing coordinates skip the
+    connector's sync step cleanly — a live site never fails on an
+    inapplicable connector.
+    """
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT COALESCE(platform, 'shopify') FROM site_config WHERE site_id = %s",
+                (site_id,),
+            )
+            row = cur.fetchone()
+        except Exception:
+            conn.rollback()
+            row = ("shopify",)
+    platform = (row[0] if row and row[0] else "shopify")
+    return {
+        "gsc": bool(site.get("gsc_property")),
+        "ga4": bool(site.get("ga4_property_id")),
+        "shopify": platform == "shopify",
+    }
 
 
 def _is_fresh(conn, site_id, capability, ttl_days):
@@ -233,8 +306,14 @@ MOCK_SITE = {
 }
 
 
-def ensure_site(conn, site=MOCK_SITE):
-    """Insert the mock site once; return site_id (idempotent by domain)."""
+def ensure_site(conn, site=None):
+    """Insert a site row once; return site_id (idempotent by domain).
+
+    plan/31: the implicit MOCK_SITE default is removed — callers pass the
+    site explicitly. Kept for tests/seed scripts that construct their own
+    site dict.
+    """
+    site = site or MOCK_SITE
     with conn.cursor() as cur:
         cur.execute(
             "SELECT site_id FROM site_config WHERE domain = %s",
@@ -254,25 +333,89 @@ def ensure_site(conn, site=MOCK_SITE):
         return cur.fetchone()[0]
 
 
-def sync_search_performance(conn, gsc, site_id, site, window=None):
+def sync_search_performance(conn, gsc, site_id, site, window=None, data_source=None):
+    """GSC search_analytics -> search_performance (plan/31 GSC fix).
+
+    Two-pass strategy tuned to real GSC API row-visibility behavior:
+      Pass 1: dimensions=[date,page], dataState='all' — fresh/unfinalized
+              rows only survive at LOW-cardinality groupings (a 5-dim
+              date+query+page+country+device grouping on a small/new
+              property returns 0 rows even when data exists; adding any
+              third dimension to date+page collapses 31 rows to 1).
+      Pass 2: dimensions=[date,query], dataState='all' — per-query rows
+              when the property has them.
+    query is NOT NULL in the DB; page-level rows carry the
+    '(not provided/none)' placeholder (the same convention the GSC
+    export import already used), query-level rows use their page's best
+    match the same way. Both pass merge into one idempotent upsert.
+    """
     start, end = window or _reference_window(None, False, 7)
+    NOT_PROVIDED = "(not provided/none)"
     result = gsc.fetch("search_analytics", {
         "site_url": site["gsc_property"],
         "start_date": start,
         "end_date": end,
+        "dimensions": ["date", "page"],
+        # dataState='all': the API default returns only FINALIZED rows; a
+        # new/low-traffic property's rows stay unfinalized for days, so
+        # default queries return empty. 'all' includes fresh data.
+        "data_state": "all",
     })
     if not result.get("ok"):
-        print(f"[sync] gsc.search_analytics skipped: {result.get('error')}")
+        print(f"[sync] gsc.search_analytics skipped: {result.get('error')} "
+              f"detail: {str(result.get('detail'))[:200]}")
         return 0
-    rows = [dict(r, site_id=str(site_id)) for r in result["data"]]
-    return database.insert_rows(
+    rows = [dict(r, site_id=str(site_id), query=NOT_PROVIDED,
+                 country="all", device="all")
+            for r in result["data"]]
+    # Pass 2: query-level rows (only when the property has any)
+    result_q = gsc.fetch("search_analytics", {
+        "site_url": site["gsc_property"],
+        "start_date": start,
+        "end_date": end,
+        "dimensions": ["date", "query"],
+        "data_state": "all",
+    })
+    query_rows = []
+    if result_q.get("ok"):
+        for r in result_q["data"]:
+            if not r.get("query"):
+                continue
+            # Map the query row to the page that earned it (the site's top
+            # page within the window that also has data on that date) —
+            # the same mapping convention as scripts/import_gethelium_gsc.py.
+            page_candidates = {(row["date"], row["page_url"]): row
+                               for row in result["data"]}
+            match = None
+            for (d, purl), row in page_candidates.items():
+                if d == r.get("date"):
+                    match = row
+                    break
+            query_rows.append(dict(
+                r, site_id=str(site_id),
+                page_url=(match or {}).get("page_url"),
+                country="all", device="all",
+            ))
+        # De-dup: drop pass-1 placeholder rows whose (date,page) got a
+        # query-level row (query rows are strictly more informative).
+    if data_source:
+        rows = [dict(r, data_source=data_source) for r in rows]
+        query_rows = [dict(r, data_source=data_source) for r in query_rows]
+    inserted = database.insert_rows(
         conn, "search_performance", rows,
         conflict_target="site_id, date, query, page_url_hash, country, device",
-        update_keys=["clicks", "impressions", "ctr", "position"],
+        update_keys=["clicks", "impressions", "ctr", "position", "data_source"],
     )
+    if query_rows:
+        inserted += database.insert_rows(
+            conn, "search_performance", query_rows,
+            conflict_target="site_id, date, query, page_url_hash, country, device",
+            update_keys=["clicks", "impressions", "ctr", "position", "data_source"],
+        )
+    return inserted
 
 
-def sync_pages_from_shopify(conn, shopify, site_id, domain="example.com"):
+def sync_pages_from_shopify(conn, shopify, site_id, domain="example.com", data_source=None):
     products = shopify.fetch("products", {})
     if not products.get("ok"):
         print(f"[sync] shopify.products skipped: {products.get('error')}")
@@ -320,22 +463,29 @@ def sync_pages_from_shopify(conn, shopify, site_id, domain="example.com"):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO pages (site_id, url, page_type, title, indexable,
-                                   meta_description, body_html, body_text_hash,
-                                   shopify_gid)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (site_id, url_hash) DO UPDATE SET
+            INSERT INTO pages (site_id, url, page_type, title, indexable,
+                               meta_description, body_html, body_text_hash,
+                               shopify_gid, data_source, has_structured_data,
+                               template)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (site_id, url_hash) DO UPDATE SET
                     title = EXCLUDED.title,
                     indexable = EXCLUDED.indexable,
                     meta_description = COALESCE(EXCLUDED.meta_description, pages.meta_description),
                     body_html = COALESCE(EXCLUDED.body_html, pages.body_html),
                     body_text_hash = COALESCE(EXCLUDED.body_text_hash, pages.body_text_hash),
-                    shopify_gid = COALESCE(EXCLUDED.shopify_gid, pages.shopify_gid)
-                """,
-                (site_id, row["url"], row["page_type"], row["title"], row["indexable"],
-                 row.get("meta_description"), row.get("body_html"), body_text_hash,
-                 row.get("shopify_gid")),
-            )
+                    shopify_gid = COALESCE(EXCLUDED.shopify_gid, pages.shopify_gid),
+                    data_source = COALESCE(EXCLUDED.data_source, pages.data_source),
+                    has_structured_data = COALESCE(
+                        EXCLUDED.has_structured_data, pages.has_structured_data),
+                    template = COALESCE(pages.template, EXCLUDED.template)
+            """,
+            (site_id, row["url"], row["page_type"], row["title"], row["indexable"],
+             row.get("meta_description"), row.get("body_html"), body_text_hash,
+             row.get("shopify_gid"), data_source,
+             html_has_structured_data(row.get("body_html")),
+             template_from_url(row["url"])),
+        )
             inserted += 1
     return inserted
 
@@ -373,7 +523,7 @@ def _body_text_hash(body_html):
     return database.md5_hash(text)
 
 
-def sync_page_business_performance(conn, ga4, site_id, domain="example.com", window=None):
+def sync_page_business_performance(conn, ga4, site_id, domain="example.com", window=None, data_source=None):
     start, end = window or _reference_window(None, False, 1)
     result = ga4.fetch("page_performance", {
         "start_date": start,
@@ -397,6 +547,8 @@ def sync_page_business_performance(conn, ga4, site_id, domain="example.com", win
             "revenue": r["revenue"],
             "conversion_rate": r["conversion_rate"],
         })
+        if data_source:
+            rows[-1]["data_source"] = data_source
     return database.insert_rows(
         conn, "page_business_performance", rows,
         conflict_target="site_id, date, page_url_hash",
@@ -565,7 +717,7 @@ def _url_pattern(url):
     return "/" + segments[0].lower() + "/"
 
 
-def sync_crawl_audit(conn, openseo, site_id, domain):
+def sync_crawl_audit(conn, openseo, site_id, domain, data_source=None):
     """OpenSEO weekly crawl pull → pages.* crawl/audit columns (plan/09 Data Flow 1 step 5)."""
     result = openseo.fetch("crawl_audit", {"site": domain})
     if not result.get("ok"):
@@ -576,6 +728,10 @@ def sync_crawl_audit(conn, openseo, site_id, domain):
         for page in result["data"]:
             url = canonicalize_url(page.get("url"), domain)
             canonical = canonicalize_url(page.get("canonical"), domain) if page.get("canonical") else None
+            # plan/32: the provider's template is authoritative; fall back to
+            # the inferred archetype only when it reports none, so generator
+            # can group by template for provider crawls too.
+            template = page.get("template") or template_from_url(url)
             cur.execute(
                 "UPDATE pages SET "
                 "status_code = %s, indexable = %s, canonical_url = %s, template = %s, "
@@ -584,7 +740,7 @@ def sync_crawl_audit(conn, openseo, site_id, domain):
                 "has_structured_data = %s, is_orphan = %s, last_crawled_at = now() "
                 "WHERE site_id = %s AND url = %s",
                 (page.get("status_code"), page.get("indexable"), canonical,
-                 page.get("template"), page.get("crawl_depth"), page.get("internal_links_in"),
+                 template, page.get("crawl_depth"), page.get("internal_links_in"),
                  page.get("internal_links_out"), page.get("raw_html_hash"),
                  page.get("rendered_html_hash"), page.get("render_status"),
                  page.get("structured_data"), page.get("is_orphan"), site_id, url),
@@ -594,15 +750,16 @@ def sync_crawl_audit(conn, openseo, site_id, domain):
                     "INSERT INTO pages (site_id, url, page_type, title, indexable, "
                     "status_code, canonical_url, template, crawl_depth, internal_links_in, "
                     "internal_links_out, raw_html_hash, rendered_html_hash, render_status, "
-                    "has_structured_data, is_orphan, last_crawled_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
+                    "has_structured_data, is_orphan, last_crawled_at, data_source) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s) "
                     "ON CONFLICT (site_id, url_hash) DO NOTHING",
                     (site_id, url, page.get("page_type") or "unknown",
                      url, page.get("indexable"), page.get("status_code"),
-                     canonical, page.get("template"), page.get("crawl_depth"),
+                     canonical, template, page.get("crawl_depth"),
                      page.get("internal_links_in"), page.get("internal_links_out"),
                      page.get("raw_html_hash"), page.get("rendered_html_hash"),
-                     page.get("render_status"), page.get("structured_data"), page.get("is_orphan")),
+                     page.get("render_status"), page.get("structured_data"), page.get("is_orphan"),
+                     data_source),
                 )
             updated += 1
     return updated
@@ -628,22 +785,23 @@ def _inspection_targets(conn, site_id, limit):
             """
             SELECT p.url
             FROM pages p
-            LEFT JOIN (
-                SELECT page_url_hash, SUM(clicks) AS clicks_28d
-                FROM search_performance
-                WHERE date >= CURRENT_DATE - INTERVAL '28 days'
-                GROUP BY page_url_hash
-            ) sp ON sp.page_url_hash = p.url_hash
-            WHERE p.site_id = %s
-              AND (p.indexable = false
-                   OR p.gsc_inspected_at IS NULL
-                   OR p.gsc_inspected_at < now() - INTERVAL '%s days')
-            ORDER BY p.indexable ASC NULLS LAST,
-                     COALESCE(sp.clicks_28d, 0) DESC,
-                     COALESCE(p.gsc_inspected_at, 'epoch') ASC
-            LIMIT %s
-            """,
-            (site_id, INSPECTION_TTL_DAYS, limit),
+LEFT JOIN (
+                    SELECT page_url_hash, SUM(clicks) AS clicks_28d
+                    FROM search_performance
+                    WHERE date >= CURRENT_DATE - INTERVAL '28 days'
+                      AND site_id = %s
+                    GROUP BY page_url_hash
+                ) sp ON sp.page_url_hash = p.url_hash
+                WHERE p.site_id = %s
+                  AND (p.indexable = false
+                       OR p.gsc_inspected_at IS NULL
+                       OR p.gsc_inspected_at < now() - INTERVAL '%s days')
+                ORDER BY p.indexable ASC NULLS LAST,
+                         COALESCE(sp.clicks_28d, 0) DESC,
+                         COALESCE(p.gsc_inspected_at, 'epoch') ASC
+                LIMIT %s
+                """,
+                (site_id, site_id, INSPECTION_TTL_DAYS, limit),
         )
         return [r[0] for r in cur.fetchall()]
 
@@ -693,7 +851,10 @@ def sync_url_inspection(conn, gsc, site_id, limit=None):
     Quota respected via the per-run limit + a shared count against the
     api_costs rows logged for gsc_url_inspection today (UTC). Every
     failure is a typed skip (never-raise adapter contract; never a crash).
+    plan/31: a None adapter (inapplicable connector) skips cleanly.
     """
+    if gsc is None:
+        return 0
     run_limit = limit or INSPECTION_DEFAULT_RUN_LIMIT
     inspected = 0
     for url in _inspection_targets(conn, site_id, run_limit):
@@ -871,13 +1032,16 @@ def sync_page_query_match_scores(conn, site_id, cluster_ids=None, chunk_size=MAT
         raise
 
 
-def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, reference_date=None):
+def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, reference_date=None,
+             site_id=None):
     """Full per-site sync; returns a dict of row counts. Idempotent.
 
-    `site` may be a site_config-shaped dict (site_name, domain, gsc_property,
-    shopify_domain, ga4_property_id, catalogue_size_tier, min_in_stock_products)
-    built from the DB, or None to resolve the first configured site (falling
-    back to MOCK_SITE when none exists, which keeps the sandbox demo working).
+    `site` may be a site_config-shaped dict (site_id, site_name, domain,
+    gsc_property, shopify_domain, ga4_property_id, catalogue_size_tier,
+    min_in_stock_products, integration_mode, target_keywords) built from the
+    DB. plan/31: site resolution is STRICTLY mandatory — `site` (with
+    site_id) or `site_id` must resolve a real site_config row; the old
+    first-site/mock fallbacks are gone (SiteRequiredError instead).
     `reference_date` overrides the clock (used by jobs for backfills); in live
     mode without it, real "today" drives all windows (anchor only in mock).
     """
@@ -886,18 +1050,27 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, referenc
     counts = {}
     conn = database.get_connection()
     try:
-        site = site or _resolve_default_site(conn)
-        site_id = ensure_site(conn, site)
+        site, site_id = _resolve_site(conn, site, site_id)
+        site_mode = resolve_site_mode(conn, site_id)
+        amode = adapter_mode(site_mode)
 
-        gsc = _build_adapter(
-            get_gsc_adapter, "gsc",
+        # Applicability (plan/31): a live site only fails on connectors it
+        # actually uses. Missing site coordinates (no ga4_property_id, no
+        # shopify_domain on a non-shopify platform) SKIP that connector
+        # step cleanly instead of failing the whole live sync.
+        applicable = _site_connector_applicability(conn, site_id, site)
+
+        gsc, gsc_amode = _build_adapter(
+            conn, get_gsc_adapter, "gsc",
             {"gsc.site_url": site["gsc_property"]}, fixtures_dir, (GscConfigError,),
+            site_id, applicable=applicable["gsc"],
         )
-        # OpenSEO is the paid-data path: mode is env/config-driven (default
-        # mock) and falls back to mock when no credential is resolvable.
-        openseo = _build_adapter(
-            get_openseo_adapter, "openseo",
+        # OpenSEO is the paid-data path: mode is per-site/env-driven (default
+        # mock); live/sandbox sites with missing credentials fail loudly.
+        openseo, openseo_amode = _build_adapter(
+            conn, get_openseo_adapter, "openseo",
             {}, fixtures_dir, (OpenseoConfigError,),
+            site_id, applicable=True,
         )
         from connectors.costlog import log_cost
         openseo._on_fetch_complete = lambda capability, params, result: log_cost(
@@ -908,24 +1081,56 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, referenc
             cost=result.get("cost"),
             metadata={"params": params},
         )
-        shopify = _build_adapter(
-            get_shopify_adapter, "shopify",
+        shopify, shopify_amode = _build_adapter(
+            conn, get_shopify_adapter, "shopify",
             {"shopify.domain": site["shopify_domain"]}, fixtures_dir, (ShopifyError,),
+            site_id, applicable=applicable["shopify"],
         )
-        ga4 = _build_adapter(
-            get_ga4_adapter, "ga4",
+        ga4, ga4_amode = _build_adapter(
+            conn, get_ga4_adapter, "ga4",
             {"ga4.property_id": site["ga4_property_id"]}, fixtures_dir, (Ga4Error,),
+            site_id, applicable=applicable["ga4"],
         )
 
         # Any connector in live mode uses the real clock (or reference_date);
         # only a fully-mock sync anchors to the fixture universe.
-        live = any(not a.mock_mode for a in (gsc, shopify, ga4, openseo))
+        live = any(m == "live" for m in (gsc_amode, shopify_amode, ga4_amode, openseo_amode))
 
-        counts["search_performance"] = sync_search_performance(
-            conn, gsc, site_id, site, _reference_window(reference_date, live, 7))
-        counts["pages"] = sync_pages_from_shopify(conn, shopify, site_id, site["domain"])
-        counts["page_business_performance"] = sync_page_business_performance(
-            conn, ga4, site_id, site["domain"], _reference_window(reference_date, live, 1))
+        # plan/31 'import' sites (Helium): connector traffic is DISABLED —
+        # data arrives via operator file imports, and mock fixtures must
+        # never overwrite imported rows. The site's identity row is ensured,
+        # then the connector steps are skipped cleanly.
+        if site_mode == "import":
+            counts["skipped_reason"] = "integration_mode=import (connector traffic disabled; imported data preserved)"
+            conn.commit()
+            return counts
+
+        if gsc is None:
+            counts["search_performance"] = 0
+            counts["gsc_skipped"] = "no gsc_property"
+        else:
+            counts["search_performance"] = sync_search_performance(
+                conn, gsc, site_id, site, _reference_window(reference_date, live, 7),
+                data_source=_data_source_for(amode, site_mode))
+        if shopify is None:
+            counts["pages"] = 0
+            counts["pages_skipped"] = "not a shopify-platform site"
+        else:
+            counts["pages"] = sync_pages_from_shopify(conn, shopify, site_id, site["domain"],
+                                                      data_source=_data_source_for(shopify_amode, site_mode))
+        if ga4 is None:
+            counts["page_business_performance"] = 0
+            counts["ga4_skipped"] = "no ga4_property_id"
+        else:
+            counts["page_business_performance"] = sync_page_business_performance(
+                conn, ga4, site_id, site["domain"], _reference_window(reference_date, live, 1),
+                data_source=_data_source_for(ga4_amode, site_mode))
+
+        # Per-site keyword research targets (plan/31): site_config
+        # .target_keywords. None/empty -> the paid keyword/SERP steps are
+        # skipped (no hardcoded fallback ever).
+        targets = _site_target_keywords(conn, site_id)
+        counts["target_keywords"] = len(targets)
 
         # ── keyword_volume TTL gate ──────────────────────────────────
         with conn.cursor() as cur:
@@ -938,40 +1143,47 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, referenc
         kw_ttl = ttl_row[0] if ttl_row else 30
         serp_ttl = ttl_row[1] if ttl_row else 7
 
-        if not force_refresh and _is_fresh(conn, site_id, "keyword_volume", kw_ttl):
+        if not targets:
+            print("[sync] keyword_volume: skipped -- no target_keywords configured for site")
+            counts["keyword_clusters"] = 0
+            counts["keyword_clusters_updated"] = 0
+        elif not force_refresh and _is_fresh(conn, site_id, "keyword_volume", kw_ttl):
             print("[sync] keyword_volume: skipped -- fresh snapshot within TTL")
             counts["keyword_clusters"] = 0
             counts["keyword_clusters_updated"] = 0
         else:
             kw = openseo.fetch("keyword_volume", {
-                "keywords": [
-                    "wireless noise cancelling headphones",
-                    "best budget noise cancelling headphones",
-                    "noise cancelling headphones sale",
-                    "best wireless headphones for travel",
-                    "bose quietcomfort comparison",
-                ],
+                "keywords": targets,
                 "date": _reference_window(reference_date, live, 9)[0],
             })
             counts["keyword_clusters"] = sync_keyword_clusters(conn, openseo, site_id, [kw] if kw.get("ok") else [])
             counts["keyword_clusters_updated"] = sync_keyword_volumes(conn, openseo, site_id, [kw] if kw.get("ok") else [])
 
         # ── SERP TTL gate ────────────────────────────────────────────
-        if not force_refresh and _is_fresh(conn, site_id, "serp", serp_ttl):
+        if not targets:
+            print("[sync] serp: skipped -- no target_keywords configured for site")
+            counts["openseo_serp_snapshots"] = 0
+        elif not force_refresh and _is_fresh(conn, site_id, "serp", serp_ttl):
             print("[sync] serp: skipped -- fresh snapshot within TTL")
             counts["openseo_serp_snapshots"] = 0
         else:
-            serp = openseo.fetch("serp", {
-                "query": "wireless noise cancelling headphones", "limit": 10, "geo": "us",
-            })
-            counts["openseo_serp_snapshots"] = sync_serp_snapshots(
-                conn, openseo, site_id, [serp] if serp.get("ok") else [],
-                reference_date=reference_date, live=live,
-            )
+            counts["openseo_serp_snapshots"] = 0
+            for query in targets:
+                serp = openseo.fetch("serp", {
+                    "query": query, "limit": 10, "geo": "us",
+                })
+                counts["openseo_serp_snapshots"] += sync_serp_snapshots(
+                    conn, openseo, site_id, [serp] if serp.get("ok") else [],
+                    reference_date=reference_date, live=live,
+                )
 
         counts["crawl_audit_updated"] = sync_crawl_audit(conn, openseo, site_id, site["domain"])
         counts["url_inspection_updated"] = sync_url_inspection(conn, gsc, site_id)
-        counts["catalogue_coverage"] = sync_catalogue_coverage(conn, site_id, site["domain"], shopify)
+        if shopify is None:
+            counts["catalogue_coverage"] = 0
+            counts["catalogue_coverage_skipped"] = "not a shopify-platform site"
+        else:
+            counts["catalogue_coverage"] = sync_catalogue_coverage(conn, site_id, site["domain"], shopify)
         # Scoped recompute: only clusters whose coverage/keyword data changed in
         # THIS sync (their catalogue_coverage was rewritten) get a fresh match
         # score. Full pass only when no scores exist yet (first sync / backfill).
@@ -1003,32 +1215,85 @@ def run_sync(fixtures_dir=FIXTURES_DIR, site=None, force_refresh=False, referenc
         conn.close()
 
 
-def _resolve_default_site(conn):
-    """First configured site from site_config, else the mock-site fallback.
+def _data_source_for(adapter_amode, site_mode):
+    """Provenance stamp for rows written by a connector (plan/31).
 
-    This is the only remaining place that touches MOCK_SITE: real deployments
-    have ≥1 row in site_config and daily_sync iterates every row; an empty
-    site_config falls back to the sandbox site so the demo keeps working.
+    live/sandbox adapter -> 'live'; mock adapter -> 'mock' EXCEPT for an
+    'import' site: its sync never writes mock-derived rows (the sync skips
+    connector fetches for import sites), so the stamp would never fire in
+    practice — but if a standalone helper does write, it must never claim
+    'mock' for an import tenant.
     """
+    if adapter_amode == "live":
+        return "live"
+    if site_mode == "import":
+        return "import"
+    return "mock"
+
+
+def _resolve_site(conn, site, site_id):
+    """Strictly mandatory site resolution (plan/31).
+
+    Accepts a site_config-shaped dict (with site_id) or a bare site_id;
+    loads the row from the DB. The old 'first configured site'/'mock site'
+    fallbacks are removed: a missing site raises SiteRequiredError.
+    """
+    if site:
+        if not site.get("site_id"):
+            raise SiteRequiredError(
+                "run_sync: site dict must carry site_id (plan/31: no "
+                "positional/default-site fallback)")
+        site_id = site["site_id"]
+    if not site_id:
+        raise SiteRequiredError(
+            "run_sync: site_id is required (plan/31: no default-site fallback)")
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT site_name, domain, gsc_property, shopify_domain, "
+            "SELECT site_id, site_name, domain, gsc_property, shopify_domain, "
             "ga4_property_id, catalogue_size_tier, min_in_stock_products "
-            "FROM site_config ORDER BY created_at LIMIT 1",
+            "FROM site_config WHERE site_id = %s",
+            (site_id,),
         )
         row = cur.fetchone()
     if not row:
-        return dict(MOCK_SITE)
-    site = dict(zip(("site_name", "domain", "gsc_property", "shopify_domain",
-                     "ga4_property_id", "catalogue_size_tier",
+        raise SiteRequiredError(f"site_config row not found for site_id {site_id}")
+    site = dict(zip(("site_id", "site_name", "domain", "gsc_property",
+                     "shopify_domain", "ga4_property_id", "catalogue_size_tier",
                      "min_in_stock_products"), row))
     if site.get("min_in_stock_products") is None:
         site["min_in_stock_products"] = 1
-    return site
+    return site, site_id
+
+
+def _site_target_keywords(conn, site_id):
+    """Per-site DataForSEO targets (site_config.target_keywords TEXT[]).
+
+    Returns [] when the column doesn't exist yet (legacy deployment) or the
+    list is empty — the keyword/SERP steps are skipped cleanly, never fed
+    with hardcoded fixtures. Keywordless sites legitimately skip.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {TARGET_KEYWORDS_COLUMN} FROM site_config WHERE site_id = %s",
+                (site_id,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        conn.rollback()
+        return []
+    if not row or not row[0]:
+        return []
+    return [str(k).strip() for k in row[0] if str(k).strip()]
 
 
 def main():
-    counts = run_sync()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--site_id", required=True,
+                        help="site_config.site_id (plan/31: mandatory, no default site)")
+    args = parser.parse_args()
+    counts = run_sync(site_id=args.site_id)
     print(json.dumps(counts, indent=2))
     return counts
 

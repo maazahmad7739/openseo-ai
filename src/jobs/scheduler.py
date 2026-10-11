@@ -21,16 +21,20 @@ Scheduling model (deterministic, testable — no hidden now() at import):
 
 Cadences (single source of truth — SCHEDULE below; jobs' designed cadences
 per WALKTHROUGH §8):
-  daily   01:00 UTC  daily_sync
-  daily   02:15 UTC  measurement_clock (jobs/measurements.py sweep)
-  daily   03:30 UTC  fix_executor   (queued -> applied; policy kill-switches
+    daily   01:00 UTC  daily_sync
+    daily   02:15 UTC  measurement_clock (jobs/measurements.py sweep)
+    daily   03:30 UTC  fix_executor   (queued -> applied; policy kill-switches
                       decide whether anything actually writes)
-  daily   05:00 UTC  stale_approvals
-  weekly  (Sat) 04:00 weekly_candidates
-  weekly  (Sat) 05:00 weekly_agent (Ollama budget gate inside)
-  weekly  (Sat) 06:00 weekly_crawl
-  weekly  (Sat) 07:00 semantic_scoring
-  weekly  (Sun) 04:30 cost_report
+    daily   05:00 UTC  stale_approvals
+    daily   06:00 UTC  audit_ttl_sweep (expired audit sessions + cascaded
+                      children pruned; src/audit/ttl_sweep.py)
+    daily   07:00 UTC  offpage_discovery (plan/35 seam sweep; disabled legs
+                      are no-ops, quota + costlog brake the paid seams)
+    weekly  (Sat) 04:00 weekly_candidates
+    weekly  (Sat) 05:00 weekly_agent (Ollama budget gate inside)
+    weekly  (Sat) 06:00 weekly_crawl
+    weekly  (Sat) 07:00 semantic_scoring
+    weekly  (Sun) 04:30 cost_report
 
 Safety properties:
   * fix_executor fires with fix_policy kill-switches as the write authority:
@@ -60,11 +64,26 @@ SCHEDULE = {
     "measurements": {"cadence": "daily", "hour_utc": 2},
     "fix_executor": {"cadence": "daily", "hour_utc": 3},
     "stale_approvals": {"cadence": "daily", "hour_utc": 5},
+    # plan/23 §2.2 retention: expired audit sessions + cascaded children.
+    # Daily off-peak (after stale_approvals, an hour clear of it); a no-op
+    # when nothing is expired.
+    "audit_ttl_sweep": {"cadence": "daily", "hour_utc": 6},
+    # plan/35: automated off-page discovery. 07:00 keeps it clear of
+    # measurement_clock (02:15) and fix_executor (03:30); disabled legs are
+    # no-ops, and every paid seam call is quota- and budget-gated inside the
+    # job. One fixed slot a day mirrors daily_sync's contribution model.
+    "offpage_discovery": {"cadence": "daily", "hour_utc": 7},
     "weekly_candidates": {"cadence": "weekly", "hour_utc": 4, "weekday_utc": 5},  # Sat
     "weekly_agent": {"cadence": "weekly", "hour_utc": 5, "weekday_utc": 5},
     "weekly_crawl": {"cadence": "weekly", "hour_utc": 6, "weekday_utc": 5},
     "semantic_scoring": {"cadence": "weekly", "hour_utc": 7, "weekday_utc": 5},
     "cost_report": {"cadence": "weekly", "hour_utc": 8, "weekday_utc": 6},  # Sun
+    # plan/33 5b: off-page publication survival checkpoints are minutes-granular
+    # (+15m/+2h/+24h/+72h). A daily slot could not reclaim a T+15m checkpoint
+    # for up to a day, so this entry uses the minute cadence (interval_minutes)
+    # — the same scheduler, the same SLEEP loop, a sub-daily tick. The sweep
+    # itself never writes without work: due rows are the partial-index scan.
+    "offpage_verify": {"cadence": "minutes", "interval_minutes": 15},
 }
 
 LAST_RUN_KEY = "scheduler.lastrun.{job}"
@@ -78,6 +97,9 @@ def _job_module(job_name):
     if job_name == "fix_executor":
         from jobs import fix_executor
         return fix_executor
+    if job_name == "audit_ttl_sweep":
+        from audit import ttl_sweep
+        return ttl_sweep
     module = __import__(f"jobs.{job_name}", fromlist=[job_name])
     return module
 
@@ -96,10 +118,16 @@ def slot_period_key(job_name, now_utc, spec):
 
     daily -> 'YYYY-MM-DD' (the slot for that calendar day at hour_utc);
     weekly -> ISO week + weekday so a job missed on its weekday does not
-    re-fire every day until the next scheduled day.
+    re-fire every day until the next scheduled day;
+    minutes -> the interval bucket containing the tick ('Y-m-dTH:M|I'), purely
+    informational — is_due decides by elapsed time, not by bucket equality.
     """
     if spec["cadence"] == "daily":
         return now_utc.strftime("%Y-%m-%d")
+    if spec["cadence"] == "minutes":
+        interval = spec.get("interval_minutes", 15)
+        bucket = int(now_utc.timestamp()) // (interval * 60)
+        return f"{now_utc.strftime('%Y-%m-%dT%H:%M')}|{bucket}"
     iso = now_utc.isocalendar()
     return f"{iso[0]}-W{iso[1]:02d}"
 
@@ -107,7 +135,18 @@ def slot_period_key(job_name, now_utc, spec):
 def is_due(job_name, now_utc, spec, last_run_at):
     """Slot-fire rule: past hour_utc in the CURRENT slot period, not yet run
     for that period. Weekly: additionally only fires on the scheduled weekday
-    (or later in the week when the weekday was missed)."""
+    (or later in the week when the weekday was missed). Minutes: fires when at
+    least `interval_minutes` have elapsed since the last run (or immediately
+    when never run)."""
+    if spec["cadence"] == "minutes":
+        interval_minutes = spec.get("interval_minutes", 15)
+        if last_run_at is not None:
+            if last_run_at.tzinfo is None and now_utc.tzinfo is not None:
+                now_utc = now_utc.replace(tzinfo=None)
+            elapsed_minutes = (now_utc - last_run_at).total_seconds() / 60.0
+            if elapsed_minutes < interval_minutes:
+                return False
+        return True
     if last_run_at is None:
         pass
     else:
@@ -221,8 +260,10 @@ def run_forever():
     import env as env_loader
     env_loader.load_env_file(quiet=True)
     print("[scheduler] started; cadences:", json.dumps(
-        {k: f"{v['cadence']}@{v['hour_utc']:02d}:00"
-         + (f" dow{v['weekday_utc']}" if "weekday_utc" in v else "")
+        {k: (f"{v['cadence']} every {v['interval_minutes']}m"
+             if v["cadence"] == "minutes" else
+             f"{v['cadence']}@{v['hour_utc']:02d}:00"
+             + (f" dow{v['weekday_utc']}" if "weekday_utc" in v else ""))
          for k, v in SCHEDULE.items()}, indent=1), flush=True)
     conn = database.get_connection()
     try:

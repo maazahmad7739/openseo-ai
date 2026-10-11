@@ -12,7 +12,11 @@ import {
   Target,
   X,
 } from "lucide-react";
-import { api } from "../data/useOperatorData";
+import {
+  api,
+  parseEvidence,
+  parseWorkTasks,
+} from "../data/useOperatorData";
 import type {
   ActionType,
   ConfidenceLevel,
@@ -43,7 +47,10 @@ export interface RecommendationDetail {
   target_url: string | null;
   proposed_url: string | null;
   diagnosis: string;
-  evidence_json: Array<{ source: string; finding: string; value?: string }> | null;
+  evidence_json:
+    | Array<{ source: string; finding: string; value?: string }>
+    | Record<string, unknown>
+    | null;
   work_required_json: Array<{
     owner: string;
     task: string;
@@ -51,6 +58,12 @@ export interface RecommendationDetail {
     execution_type?: "automated" | "manual";
     fix_id?: string;
     fix_status?: string;
+    fix_refs?: Array<{
+      fix_id: string;
+      status: string;
+      sub_type: string | null;
+      pr_url?: string;
+    }>;
   }> | null;
   impact: ImpactLevel;
   confidence: ConfidenceLevel;
@@ -242,7 +255,8 @@ function WhyItMatters({ detail }: { detail: RecommendationDetail }) {
       </p>
       <div className="mt-3 flex flex-wrap items-center gap-1.5">
         <span className="text-[11px] uppercase tracking-wider text-base-content/40">
-          {actionTypeMeta[detail.action_type as ActionType].label}
+          {actionTypeMeta[detail.action_type as ActionType]?.label ??
+          detail.action_type}
         </span>
         <span className="text-base-content/25">·</span>
         <span className="text-xs text-base-content/55">
@@ -274,14 +288,13 @@ function WhyItMatters({ detail }: { detail: RecommendationDetail }) {
   );
 }
 
-function WorkRequired({
-  detail,
-  projectId,
-}: {
+function WorkRequired({ detail, projectId }: {
   detail: RecommendationDetail;
   projectId?: string;
 }) {
-  const work = detail.work_required_json ?? [];
+  // parseWorkTasks is the shared defensive filter (data layer); the local
+  // parse below adds nothing beyond it — keep one implementation.
+  const work = parseWorkTasks(detail.work_required_json);
   if (work.length === 0) return null;
   return (
     <SectionCard title="Exact work required" icon={<FileText />}>
@@ -295,7 +308,9 @@ function WorkRequired({
 }
 
 function EvidenceBlock({ detail }: { detail: RecommendationDetail }) {
-  const evidence = detail.evidence_json ?? [];
+  // parseEvidence is the shared defensive normalizer (data layer): array OR
+  // dict evidence payloads both render; malformed shapes hide the block.
+  const evidence = parseEvidence(detail.evidence_json);
   if (evidence.length === 0) return null;
   return (
     <SectionCard title="Supporting evidence" icon={<FileText />}>

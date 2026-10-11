@@ -99,7 +99,7 @@ export function RecommendationCard({
                 <span className="truncate font-mono text-[13px]">{url}</span>
                 {rec.target_url ? (
                   <span className="shrink-0 rounded bg-base-200 px-1.5 py-0.5 text-[10px] font-medium text-base-content/50">
-                    {actionTypeMeta[rec.action_type].label}
+                    {actionTypeMeta[rec.action_type]?.label ?? rec.action_type}
                   </span>
                 ) : null}
               </p>

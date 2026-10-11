@@ -29,6 +29,7 @@ Verifies:
    14. plan/23-audit-schema.sql applies idempotently
    15. session + snapshot insert; CHECK constraints reject bad statuses
    16. TTL sweep prunes expired sessions, cascades children, keeps fresh
+   16b. sweep() commits its own DELETE (survives caller-side rollback)
   isolation: every site_config row and session row keyed off RUN_TOKEN,
   removed in cleanup.
 
@@ -523,6 +524,31 @@ def main():
     check("16 children cascade with the session", gone_children == 0,
           f"children={gone_children}")
     check("16 fresh session survives the sweep", kept_fresh == 1)
+
+    # 16b: sweep() persists without a caller-side commit — the scheduler
+    # wrapper closes its conn in finally, so a rollback-on-close must never
+    # silently discard the prune (regression: DELETE rolled back at close).
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO audit_sessions (requested_url, normalized_url, domain,
+                                        mode, fetch_status, expires_at)
+            VALUES (%s, %s, 'expired2.example', 'audit_checklist', 'fetched',
+                    now() - INTERVAL '1 hour')
+            RETURNING session_id
+            """,
+            (f"https://expired2.example/page?run={RUN_TOKEN}",
+             f"https://expired2.example/page?run={RUN_TOKEN}"))
+        expired2_id = str(cur.fetchone()[0])
+    conn.commit()
+    sweep(conn)  # NOTE: deliberately NO commit here — sweep() must commit
+    conn.rollback()  # discard anything still open; sweep's own commit stands
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM audit_sessions WHERE session_id = %s",
+                    (expired2_id,))
+        still_there = cur.fetchone()[0]
+    check("16b sweep() commits its own DELETE (survives caller rollback)",
+          still_there == 0, f"rows={still_there}")
 
     # 15: CHECK constraints reject invalid statuses
     def _insert_bad_fetch_status():

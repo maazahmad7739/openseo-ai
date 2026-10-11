@@ -185,4 +185,7 @@ def _is_mock_mode(cfg):
     explicit = cfg.get("ga4.mock_mode")
     if explicit is not None:
         return bool(explicit)
-    return resolve_mode(cfg.get("ga4.mode"), (MOCK_MODE_ENV,)) == "mock"
+    mode = resolve_mode(cfg.get("ga4.mode"), (MOCK_MODE_ENV,))
+    # plan/31: 'import' = offline (no fixtures served; sync skips fetches).
+    # 'sandbox'/'live' = real API calls.
+    return mode in ("mock", "import")

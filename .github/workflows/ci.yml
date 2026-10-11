@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      INTEGRATION_MODE: mock
+      OPENSEO_MOCK_MODE: "1"
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5433"
+      POSTGRES_DB: openseo
+      POSTGRES_USER: openseo
+      POSTGRES_PASSWORD: openseo_local_only
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: openseo
+          POSTGRES_USER: openseo
+          POSTGRES_PASSWORD: openseo_local_only
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install backend deps
+        run: pip install -r requirements.txt
+      # 00-schema.sql is NOT a ledger migration (legacy DDL, not idempotent);
+      # apply it here so migrate.py starts from the documented base schema
+      # (matches src/db.py SCHEMA_PATH; pgcrypto supplies gen_random_uuid).
+      - name: Apply base schema
+        run: |
+          python -c "import sys; sys.path.insert(0, 'src'); import db; conn = db.get_connection(); conn.cursor().execute('CREATE EXTENSION IF NOT EXISTS pgcrypto'); conn.commit(); conn.close(); db.apply_schema()"
+      - name: Apply schema migrations
+        run: python scripts/migrate.py
+      - name: Run backend test suites
+        run: python scripts/run_tests.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/openseo-plus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/openseo-plus/pnpm-lock.yaml
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+      - name: Type check
+        run: pnpm run types:check
+      - name: Lint
+        run: pnpm run lint
+      - name: Build
+        run: pnpm run build

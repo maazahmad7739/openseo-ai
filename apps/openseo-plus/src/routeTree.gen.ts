@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as PProjectIdIndexRouteImport } from './routes/p/$projectId/index'
 import { Route as PProjectIdActionQueueRouteImport } from './routes/p/$projectId/action-queue'
+import { Route as PProjectIdOffpageQueueRouteImport } from './routes/p/$projectId/offpage-queue'
 import { Route as PProjectIdPipelinesRouteImport } from './routes/p/$projectId/pipelines'
 import { Route as PProjectIdResultsRouteImport } from './routes/p/$projectId/results'
 
@@ -30,6 +31,11 @@ const PProjectIdActionQueueRoute = PProjectIdActionQueueRouteImport.update({
   path: '/p/$projectId/action-queue',
   getParentRoute: () => rootRouteImport,
 } as any)
+const PProjectIdOffpageQueueRoute = PProjectIdOffpageQueueRouteImport.update({
+  id: '/p/$projectId/offpage-queue',
+  path: '/p/$projectId/offpage-queue',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PProjectIdPipelinesRoute = PProjectIdPipelinesRouteImport.update({
   id: '/p/$projectId/pipelines',
   path: '/p/$projectId/pipelines',
@@ -44,6 +50,7 @@ const PProjectIdResultsRoute = PProjectIdResultsRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/p/$projectId/action-queue': typeof PProjectIdActionQueueRoute
+  '/p/$projectId/offpage-queue': typeof PProjectIdOffpageQueueRoute
   '/p/$projectId/pipelines': typeof PProjectIdPipelinesRoute
   '/p/$projectId/results': typeof PProjectIdResultsRoute
   '/p/$projectId/': typeof PProjectIdIndexRoute
@@ -51,6 +58,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/p/$projectId/action-queue': typeof PProjectIdActionQueueRoute
+  '/p/$projectId/offpage-queue': typeof PProjectIdOffpageQueueRoute
   '/p/$projectId/pipelines': typeof PProjectIdPipelinesRoute
   '/p/$projectId/results': typeof PProjectIdResultsRoute
   '/p/$projectId': typeof PProjectIdIndexRoute
@@ -59,6 +67,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/p/$projectId/action-queue': typeof PProjectIdActionQueueRoute
+  '/p/$projectId/offpage-queue': typeof PProjectIdOffpageQueueRoute
   '/p/$projectId/pipelines': typeof PProjectIdPipelinesRoute
   '/p/$projectId/results': typeof PProjectIdResultsRoute
   '/p/$projectId/': typeof PProjectIdIndexRoute
@@ -68,6 +77,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/p/$projectId/action-queue'
+    | '/p/$projectId/offpage-queue'
     | '/p/$projectId/pipelines'
     | '/p/$projectId/results'
     | '/p/$projectId/'
@@ -75,6 +85,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/p/$projectId/action-queue'
+    | '/p/$projectId/offpage-queue'
     | '/p/$projectId/pipelines'
     | '/p/$projectId/results'
     | '/p/$projectId'
@@ -82,6 +93,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/p/$projectId/action-queue'
+    | '/p/$projectId/offpage-queue'
     | '/p/$projectId/pipelines'
     | '/p/$projectId/results'
     | '/p/$projectId/'
@@ -90,6 +102,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   PProjectIdActionQueueRoute: typeof PProjectIdActionQueueRoute
+  PProjectIdOffpageQueueRoute: typeof PProjectIdOffpageQueueRoute
   PProjectIdPipelinesRoute: typeof PProjectIdPipelinesRoute
   PProjectIdResultsRoute: typeof PProjectIdResultsRoute
   PProjectIdIndexRoute: typeof PProjectIdIndexRoute
@@ -118,6 +131,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PProjectIdActionQueueRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/p/$projectId/offpage-queue': {
+      id: '/p/$projectId/offpage-queue'
+      path: '/p/$projectId/offpage-queue'
+      fullPath: '/p/$projectId/offpage-queue'
+      preLoaderRoute: typeof PProjectIdOffpageQueueRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/p/$projectId/pipelines': {
       id: '/p/$projectId/pipelines'
       path: '/p/$projectId/pipelines'
@@ -138,6 +158,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   PProjectIdActionQueueRoute: PProjectIdActionQueueRoute,
+  PProjectIdOffpageQueueRoute: PProjectIdOffpageQueueRoute,
   PProjectIdPipelinesRoute: PProjectIdPipelinesRoute,
   PProjectIdResultsRoute: PProjectIdResultsRoute,
   PProjectIdIndexRoute: PProjectIdIndexRoute,

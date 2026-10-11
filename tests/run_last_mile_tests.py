@@ -442,10 +442,29 @@ def main():
     targets = _inspection_targets(conn, site_id, 50)
     insp_a = f"https://loopback-{RUN_TOKEN}.test/products/insp-a"
     insp_b = f"https://loopback-{RUN_TOKEN}.test/products/insp-b"
-    check("T3 indexable=false prioritized before indexable",
-          insp_a in targets and insp_b in targets
-          and targets.index(insp_a) < targets.index(insp_b),
-          repr(targets[:4]))
+    # Assert the documented ordering contract directly rather than pinning
+    # two specific URLs against each other. The old form required
+    # `insp_b in targets`, but insp-b is indexable=true and _inspection_targets
+    # drops fresh indexable pages out of the pool entirely
+    # (`indexable=false OR gsc_inspected_at IS NULL OR stale`). Whether
+    # sync_url_inspection(limit=10) reaches it depends on how many unrelated
+    # seeded pages rank ahead, so that assertion was pass/fail at the mercy of
+    # suite ordering. The real contract is: no indexable page may precede an
+    # indexable=false one.
+    with conn.cursor() as cur:
+        cur.execute("SELECT url, indexable FROM pages WHERE site_id = %s",
+                    (site_id,))
+        idx = {u: bool(i) for u, i in cur.fetchall()}
+    order = [idx.get(u) for u in targets if u in idx]
+    first_indexable = next((n for n, i in enumerate(order) if i), None)
+    last_not_indexable = next((n for n in range(len(order) - 1, -1, -1)
+                               if not order[n]), None)
+    contract_ok = (first_indexable is None or last_not_indexable is None
+                   or first_indexable > last_not_indexable)
+    check("T3 all indexable=false targets precede indexable ones",
+          contract_ok and insp_a in targets,
+          "first_indexable=%s last_not_indexable=%s targets=%r" % (
+              first_indexable, last_not_indexable, targets[:6]))
 
     # ------------------------------------------------------------
     # TASK 4: competitor heading grounding (fetcher seam, no network)

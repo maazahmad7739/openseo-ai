@@ -21,6 +21,10 @@ important_pages AS (
            p.render_status, p.raw_html_hash, p.rendered_html_hash,
            p.robots_allowed, p.in_sitemap,
            p.last_crawled_at,
+           -- plan/32: needed to prove a crawl actually returned a document.
+           -- A 403/404/500 body is real HTML; without its presence AND size
+           -- we cannot tell "page has no schema" from "we never loaded it".
+           p.body_html,
 
            -- A page is "important" if it has organic traffic or commercial products
            COALESCE(pbp.total_organic_sessions, 0) AS organic_sessions_28d,
@@ -375,24 +379,142 @@ duplicate_faceted AS (
 
 -- ────────────────────────────────────────────
 -- Issue 8: Structured-data failure on commercial templates
+--
+-- plan/32: grouped by TEMPLATE, not by URL.
+--
+-- A missing JSON-LD block is a template defect, not a per-page defect: the
+-- same layout is rendered by the same Liquid/Next template on every page of
+-- that type, so fixing one URL leaves every sibling page broken. Emitting
+-- one recommendation per page produced 18 indistinguishable rows for a
+-- single JSON-LD gap on kineticgrowth.co.in, which then had to be triaged
+-- by hand 18 times for one fix.
+--
+-- So: one recommendation per template, with the page count and a sample of
+-- affected URLs in the evidence, and ONE fix expanded across the whole
+-- group at generation time (fixes/generator.py). `target_url` carries a
+-- real, deterministic member URL (highest clicks, tie-broken by URL) —
+-- it is the recommendation's natural key, so it must be a real page, never
+-- a synthetic "template://" pseudo-URL that matches no row in `pages`.
 -- ────────────────────────────────────────────
+
+-- Crawl-evidence floor. Below this byte count the response is an error
+-- page, an interstitial, or a bare shell — not a rendered document we can
+-- judge. Live data showed rows with 0-byte and 47-byte bodies being scored
+-- as "no structured data", which is reporting absence on a page that was
+-- never actually loaded.
+crawl_document_floor AS (
+    SELECT 500::INT AS min_body_bytes
+),
+
+-- Pages whose crawl genuinely produced a readable document. Every one of
+-- these guards is load-bearing; dropping any one re-admits a false positive:
+--   status_code = 200      → an error page's body has no schema, by design
+--   body_html IS NOT NULL  → never fetched at all
+--   length(body_html)      → fetched, but got a stub / redirect / error body
+--   last_crawled_at        → ingest upsert that set no crawl timestamp
+--   indexable = true       → non-indexable pages are not a priority defect
+schema_evidence_pages AS (
+    SELECT ip.*
+    FROM important_pages ip
+    CROSS JOIN crawl_document_floor f
+    WHERE ip.has_structured_data = false
+      AND ip.page_type IN ('product', 'collection')
+      AND ip.status_code = 200
+      AND ip.indexable = true
+      AND ip.last_crawled_at IS NOT NULL
+      AND ip.body_html IS NOT NULL
+      AND length(ip.body_html) >= f.min_body_bytes
+),
+
+-- One row per (site, template). Grouping includes site_id because template
+-- names are only unique within a site — 'product.liquid' exists on every
+-- Shopify store — and a recommendation is always per site.
+--
+-- urls_ordered is sorted by traffic then URL so that element [1] is a
+-- stable representative: the same template always yields the same
+-- target_url across runs, which matters because that value is the
+-- generator's dedup key and would otherwise churn the natural key.
+schema_template_groups AS (
+    SELECT
+        ip.site_id,
+        ip.template,
+        count(*)::INT AS page_count,
+        array_agg(ip.url ORDER BY ip.gsc_clicks_28d DESC NULLS LAST, ip.url ASC)
+            AS urls_ordered,
+        bool_or(ip.page_type = 'product') AS has_product,
+        COALESCE(sum(ip.gsc_clicks_28d), 0)::BIGINT AS total_clicks,
+        COALESCE(max(ip.organic_sessions_28d), 0)::BIGINT AS peak_sessions
+    FROM schema_evidence_pages ip
+    WHERE ip.template IS NOT NULL
+    GROUP BY ip.site_id, ip.template
+),
+
 structured_data_failure AS (
+    -- (a) Template with a known identity → one grouped recommendation.
     SELECT
         'structured_data_failure' AS issue_type,
         'technical_fix' AS action_type,
-        ip.site_id,
-        ip.url AS target_url,
-        ip.page_type,
-        ip.template,
-        ip.status_code,
-        ip.organic_sessions_28d,
-        NULL::INT AS gsc_clicks_28d,
+        g.site_id,
+        g.urls_ordered[1] AS target_url,
+        CASE WHEN g.has_product THEN 'product' ELSE 'collection' END AS page_type,
+        g.template,
+        200::INT AS status_code,
+        g.peak_sessions AS organic_sessions_28d,
+        g.total_clicks AS gsc_clicks_28d,
 
         jsonb_build_object(
+            'issue_type', 'structured_data_failure',
+            'issue', 'Commercial template renders without structured data',
+            'has_structured_data', false,
+            'scope', 'template',
+            'template', g.template,
+            'template_inferred', g.template LIKE 'urlarchetype:%',
+            'page_count', g.page_count,
+            'sample_urls', g.urls_ordered[1:5],
+            'representative_url', g.urls_ordered[1],
+            'page_type', CASE WHEN g.has_product THEN 'product' ELSE 'collection' END
+        ) AS evidence,
+
+        jsonb_build_array(
+            jsonb_build_object(
+                'owner', 'engineering',
+                'task', 'Add appropriate structured data (Product, CollectionPage, BreadcrumbList) to the template layout, not to individual pages',
+                'acceptance_criteria', 'All pages on this template pass the Rich Results Test and carry valid JSON-LD'
+            )
+        ) AS work_required,
+
+        CASE WHEN g.has_product THEN 'high' ELSE 'medium' END AS impact
+
+    FROM schema_template_groups g
+
+    UNION ALL
+
+    -- (b) Template unknown → fall back to one row per URL. Grouping pages
+    -- together on a NULL template would merge unrelated layouts into a
+    -- single bogus finding, and generating one fix from a synthetic target
+    -- would rewrite the wrong pages. Per-URL is the honest fallback: it
+    -- reproduces the old behaviour only where the old behaviour was valid.
+    SELECT
+        'structured_data_failure' AS issue_type,
+        'technical_fix' AS action_type,
+        sp.site_id,
+        sp.url AS target_url,
+        sp.page_type,
+        NULL::TEXT AS template,
+        sp.status_code,
+        sp.organic_sessions_28d,
+        sp.gsc_clicks_28d,
+
+        jsonb_build_object(
+            'issue_type', 'structured_data_failure',
             'issue', 'Commercial page missing structured data',
-            'has_structured_data', ip.has_structured_data,
-            'page_type', ip.page_type,
-            'template', ip.template
+            'has_structured_data', false,
+            'scope', 'url',
+            'template_known', false,
+            'page_count', 1,
+            'sample_urls', jsonb_build_array(sp.url),
+            'representative_url', sp.url,
+            'page_type', sp.page_type
         ) AS evidence,
 
         jsonb_build_array(
@@ -403,13 +525,10 @@ structured_data_failure AS (
             )
         ) AS work_required,
 
-        CASE WHEN ip.page_type = 'product' THEN 'high' ELSE 'medium' END AS impact
+        CASE WHEN sp.page_type = 'product' THEN 'high' ELSE 'medium' END AS impact
 
-    FROM important_pages ip
-    WHERE ip.has_structured_data = false
-      AND ip.page_type IN ('product', 'collection')
-      AND ip.status_code = 200
-      AND ip.indexable = true
+    FROM schema_evidence_pages sp
+    WHERE sp.template IS NULL
 ),
 
 -- ────────────────────────────────────────────

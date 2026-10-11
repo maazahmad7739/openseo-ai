@@ -432,6 +432,116 @@ def test_executor_and_rollback(conn):
     return allok
 
 
+def test_chain_loop_guard(conn):
+    """plan/21 §2.5 closure: chain flattening + loop refusal on the real DB."""
+    print("\n== chain/loop guard (real DB) ==")
+    from fixes.generator import (generate_fix_for_recommendation,
+                                 FixNotSupported, _existing_redirect_map)
+
+    allok = True
+
+    # --- loop: existing applied rule B -> A, new candidate A -> B --------
+    ids = seed_world(conn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO generated_fixes
+                    (recommendation_id, site_id, action_type, sub_type,
+                     target_url, target_entity_ref, payload_json, diff_json,
+                     generation_source, status, risk_tier)
+                VALUES (%s, %s, 'technical_fix', 'redirect', %s, NULL,
+                        %s::jsonb, %s::jsonb, 'deterministic', 'applied', 'high')
+                RETURNING fix_id
+                """,
+                (ids["rec_id"], ids["site_id"], ids["survivor_url"],
+                 json.dumps({"mutation": "urlRedirectCreate",
+                             "variables": {"urlRedirect": {
+                                 "path": "/collections/snowboard",
+                                 "target": f"/products/dead-{RUN_TOKEN[:6]}"}}}),
+                 json.dumps([{"field": "redirect", "old_value": None,
+                              "new_value": "seed rule"}])),
+            )
+        conn.commit()
+        seeded_map = _existing_redirect_map(conn, ids["site_id"])
+        allok &= check(
+            "seeded applied rule /collections/snowboard -> /products/dead",
+            seeded_map == {"/collections/snowboard":
+                           f"/products/dead-{RUN_TOKEN[:6]}"},
+            str(seeded_map))
+        try:
+            generate_fix_for_recommendation(conn, ids["rec_id"])
+            allok &= check("loop candidate -> FixNotSupported", False,
+                           "no exception")
+        except FixNotSupported as exc:
+            allok &= check("loop candidate -> FixNotSupported",
+                           "redirect chain guard" in str(exc)
+                           and "manual_review=True" in str(exc), str(exc))
+        # re-run: the refusal is deterministic (no partial row written)
+        try:
+            generate_fix_for_recommendation(conn, ids["rec_id"])
+            allok &= check("refusal is deterministic on re-run", False,
+                           "no exception")
+        except FixNotSupported:
+            allok &= check("refusal is deterministic on re-run", True)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM generated_fixes WHERE site_id = %s "
+                "AND target_url = %s", (ids["site_id"], ids["target_url"]))
+            allok &= check("no fix row minted for the loop candidate",
+                           cur.fetchone()[0] == 0)
+    finally:
+        cleanup(conn, ids)
+
+    # --- flatten: existing applied rule /collections/snowboard -> /old-home
+    ids = seed_world(conn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO generated_fixes
+                    (recommendation_id, site_id, action_type, sub_type,
+                     target_url, target_entity_ref, payload_json, diff_json,
+                     generation_source, status, risk_tier)
+                VALUES (%s, %s, 'technical_fix', 'redirect', %s, NULL,
+                        %s::jsonb, %s::jsonb, 'deterministic', 'applied', 'high')
+                RETURNING fix_id
+                """,
+                (ids["rec_id"], ids["site_id"], ids["survivor_url"],
+                 json.dumps({"mutation": "urlRedirectCreate",
+                             "variables": {"urlRedirect": {
+                                 "path": "/collections/snowboard",
+                                 "target": "/collections/old-home"}}}),
+                 json.dumps([{"field": "redirect", "old_value": None,
+                              "new_value": "seed rule"}])),
+            )
+        conn.commit()
+        out = generate_fix_for_recommendation(conn, ids["rec_id"])
+        payload = out["payload"]
+        url_redirect = payload["variables"]["urlRedirect"]
+        allok &= check("flattened rule /products/dead -> /collections/old-home",
+                       url_redirect["path"] == f"/products/dead-{RUN_TOKEN[:6]}"
+                       and url_redirect["target"] == "/collections/old-home",
+                       json.dumps(payload)[:220])
+        grounding = payload.get("grounding", {}).get("redirect_chain")
+        allok &= check("grounding records the flatten trail",
+                       bool(grounding)
+                       and grounding["flattened"] is True
+                       and grounding["hops"] == 1
+                       and grounding["original_target_path"]
+                       == "/collections/snowboard"
+                       and grounding["resolved_target_path"]
+                       == "/collections/old-home",
+                       json.dumps(grounding)[:220])
+        allok &= check("diff names the flattened rule",
+                       out["diff"][0]["new_value"]
+                       == f"/products/dead-{RUN_TOKEN[:6]} -> /collections/old-home",
+                       str(out["diff"]))
+    finally:
+        cleanup(conn, ids)
+    return allok
+
+
 def main():
     env_loader.load_env_file(quiet=True)
     conn = database.get_connection()
@@ -440,6 +550,7 @@ def main():
         allok &= test_routing_gates(conn)
         allok &= test_conflict_guard(conn)
         allok &= test_executor_and_rollback(conn)
+        allok &= test_chain_loop_guard(conn)
     finally:
         conn.close()
 

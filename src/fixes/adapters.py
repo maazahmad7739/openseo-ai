@@ -33,6 +33,23 @@ def _client_from_config(config):
     )
 
 
+def _client_from_framer_config(config, client=None):
+    """Build the Framer client from a Phase 0 credential dict.
+
+    client: TEST seam (injected fake/mock client) — same pattern as the
+    redirect adapter's client seam. When omitted, the real FramerClient is
+    built from the resolved config (mode resolved by the connector).
+    """
+    if client is not None:
+        return client
+    from connectors.framer import FramerClient
+    return FramerClient(
+        framer_api_key=config.get("framer_api_key"),
+        framer_site_ref=config.get("framer_site_ref"),
+        api_base=config.get("api_base"),
+    )
+
+
 # ------------------------------------------------------------
 # product_seo_title (sub_type 'seo.title') — PILOT write path
 # ------------------------------------------------------------
@@ -2163,4 +2180,991 @@ ADAPTERS.update({
         "restore": collection_create_restore,
         "snapshot": collection_create_snapshot,
     },
+})
+
+
+# ------------------------------------------------------------
+# framer.title / framer.description (plan/26 Phase 3) — the FIRST
+# non-Shopify write path. Same safety bar as the Shopify adapters:
+#   * snapshot() fresh-reads the page meta at executor pickup (the
+#     executor compares live values against diff old_values — the
+#     stale-diff guard) and doubles as the revert source;
+#   * the meta surface is WHOLE-OBJECT (a write replaces both fields —
+#     the same hazard class as productUpdate.seo, verified live on
+#     Shopify 2026-09-23): every write carries BOTH fields, the value
+#     being fixed plus the SIBLING from the fresh snapshot. A missing
+#     sibling refuses (typed no_snapshot) — never a data-destroying
+#     partial write;
+#   * restore() writes back BOTH fields from the snapshot; None is a
+#     legitimate pre-state (empty meta) and is preserved as None;
+#   * payload validated BEFORE any network call; dry_run writes nothing;
+#   * never raises — typed dicts everywhere.
+# target_entity_ref = the canonical URL (generation contract, plan/26
+# Phase 2); the client resolves the live page by that ref.
+# ------------------------------------------------------------
+
+ADAPTER_FRAMER_TITLE = "framer.title"
+ADAPTER_FRAMER_DESCRIPTION = "framer.description"
+
+FRAMER_SNAPSHOT_TITLE_KEY = "meta.title"
+FRAMER_SNAPSHOT_DESCRIPTION_KEY = "meta.description"
+
+
+def _framer_payload_for(payload_json, field):
+    """Validate the framer payload BEFORE any network call.
+
+    payload_json (from plan/26 Phase 2 generation):
+      {mutation: 'framer.updatePageMeta',
+       variables: {page_ref, field: 'title'|'description', <field>: value},
+       surface: 'framer'}
+    Strict allowlist: no drift fields ride the write.
+    """
+    if not isinstance(payload_json, dict):
+        raise WriteAdapterError("payload_json is not an object")
+    if payload_json.get("mutation") != "framer.updatePageMeta":
+        raise WriteAdapterError(
+            f"unsupported mutation for framer {field} adapter: "
+            f"{payload_json.get('mutation')!r}")
+    if payload_json.get("surface") != "framer":
+        raise WriteAdapterError(
+            "framer payload must carry surface='framer'")
+    variables = payload_json.get("variables") or {}
+    page_ref = (variables.get("page_ref") or "").strip()
+    if not page_ref:
+        raise WriteAdapterError("framer payload must carry variables.page_ref")
+    payload_field = variables.get("field")
+    if payload_field != field:
+        raise WriteAdapterError(
+            f"framer {field} adapter refuses payload field {payload_field!r}")
+    value = variables.get(field)
+    if not isinstance(value, str):
+        raise WriteAdapterError(
+            f"framer payload must carry variables.{field} as a string")
+    extra = set(variables.keys()) - {"page_ref", "field", field}
+    if extra:
+        raise WriteAdapterError(
+            f"framer adapter writes ONLY page_ref+field+{field} "
+            f"(drift fields: {sorted(extra)})")
+    return page_ref, value
+
+
+def _framer_sibling(fix_row, snapshot_key):
+    """The sibling meta field from the fresh pickup snapshot (WHOLE-OBJECT
+    write rule — mirror of _sibling_seo_field).
+
+    Key-precision discipline: a MISSING snapshot key returns None (the
+    caller refuses — no snapshot, no write); a PRESENT key with None/''
+    returns '' (an empty meta pre-state is legitimate and preserved)."""
+    snapshot = fix_row.get("snapshot_json") or {}
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError):
+            snapshot = {}
+    if not isinstance(snapshot, dict) or snapshot_key not in snapshot:
+        return None
+    value = snapshot.get(snapshot_key)
+    return value if isinstance(value, str) else ""
+
+
+def _framer_write_and_verify(client, page_ref, title, description,
+                             adapter_name, dry_run=False):
+    """Shared write -> read-back verify tail for both framer adapters.
+
+    Returns the typed adapter result. Write carries BOTH fields
+    (sibling discipline); verify re-READS and compares the written field.
+    """
+    if dry_run:
+        return {"ok": True, "outcome": "dry_run", "adapter": adapter_name,
+                "detail": {"mutation": "framer.updatePageMeta",
+                           "page_ref": page_ref,
+                           "title": title, "description": description}}
+    write = client.update_page_meta(page_ref, title=title,
+                                    description=description)
+    if not write.get("ok"):
+        return {"ok": False,
+                "outcome": write.get("outcome", "provider_error"),
+                "errors": [],
+                "detail": write.get("detail"), "adapter": adapter_name}
+    verify = client.read_page_meta(page_ref)
+    live = (verify.get("data") or {}) if verify.get("ok") else {}
+    return {
+        "ok": True,
+        "outcome": "ok",
+        "verified": False,
+        "live_value": None,
+        "adapter": adapter_name,
+        "_verify_state": {"live": live, "title": title,
+                          "description": description},
+    }
+
+
+def _framer_verify_result(verify_state, field, adapter_name):
+    """Compare the fresh read to the written state -> verification_status."""
+    live = verify_state.get("live") or {}
+    live_title = live.get("title")
+    live_description = live.get("description")
+    if field == "title":
+        verified = (live_title == verify_state["title"]
+                    and live_description == verify_state["description"])
+        live_value = live_title
+    else:
+        live_description = live.get("description")
+        verified = (live_description == verify_state["description"]
+                    and live_title == verify_state["title"])
+        live_value = live_description
+    return {
+        "ok": True,
+        "outcome": "ok",
+        "verified": verified,
+        "verification_status": "verified" if verified else "verify_failed",
+        "live_value": live_value,
+        "adapter": adapter_name,
+    }
+
+
+def _framer_title_variables(fix_row):
+    page_ref, new_title = _framer_payload_for(
+        fix_row["payload_json"], "title")
+    return page_ref, new_title
+
+
+def _framer_description_variables(fix_row):
+    page_ref, new_description = _framer_payload_for(
+        fix_row["payload_json"], "description")
+    return page_ref, new_description
+
+
+def framer_title_snapshot(conn, fix_row, config, client=None):
+    """FRESH READ pre-state at pickup: BOTH meta fields (whole-object
+    surface — the snapshot is the sibling source AND the revert source)."""
+    client = _client_from_framer_config(config, client)
+    try:
+        page_ref, _new_title = _framer_payload_for(
+            fix_row["payload_json"], "title")
+    except WriteAdapterError as exc:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": str(exc), "adapter": ADAPTER_FRAMER_TITLE}
+    try:
+        read = client.read_page_meta(page_ref)
+    except Exception as exc:
+        return {"ok": False, "outcome": "provider_error",
+                "detail": str(exc), "adapter": ADAPTER_FRAMER_TITLE}
+    if not read.get("ok"):
+        return {"ok": False, "outcome": read.get("outcome", "provider_error"),
+                "detail": read.get("detail"), "adapter": ADAPTER_FRAMER_TITLE}
+    data = read.get("data") or {}
+    return {"ok": True, "outcome": "ok",
+            "snapshot": {
+                FRAMER_SNAPSHOT_TITLE_KEY: data.get("title"),
+                FRAMER_SNAPSHOT_DESCRIPTION_KEY: data.get("description"),
+                "page_ref": page_ref,
+            },
+            "adapter": ADAPTER_FRAMER_TITLE}
+
+
+def framer_title_execute(conn, fix_row, config, dry_run=False, client=None):
+    """Apply one framer.title fix: whole-object write -> read-back verify."""
+    client = _client_from_framer_config(config, client)
+    try:
+        page_ref, new_title = _framer_payload_for(
+            fix_row["payload_json"], "title")
+    except WriteAdapterError as exc:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": str(exc), "adapter": ADAPTER_FRAMER_TITLE}
+
+    if dry_run:
+        return {"ok": True, "outcome": "dry_run",
+                "adapter": ADAPTER_FRAMER_TITLE,
+                "detail": {"mutation": "framer.updatePageMeta",
+                           "page_ref": page_ref, "field": "title"}}
+
+    # Whole-object rule: carry the sibling description from the fresh
+    # pickup snapshot (None pre-state = empty meta, preserved as None).
+    sibling = _framer_sibling(fix_row, FRAMER_SNAPSHOT_DESCRIPTION_KEY)
+    if sibling is None:
+        return {"ok": False, "outcome": "no_snapshot",
+                "detail": "framer.title write needs the pickup snapshot's "
+                          "meta.description (Framer meta write replaces "
+                          "the whole object) — refusing a data-destroying "
+                          "write",
+                "adapter": ADAPTER_FRAMER_TITLE}
+    result = _framer_write_and_verify(
+        client, page_ref, new_title, sibling, ADAPTER_FRAMER_TITLE,
+        dry_run=dry_run)
+    if not result.get("ok") or result.get("outcome") == "dry_run":
+        return result
+    state = result.pop("_verify_state")
+    out = _framer_verify_result(state, "title", ADAPTER_FRAMER_TITLE)
+    out["adapter_response"] = {"write": {"ok": True, "outcome": "ok"}}
+    return out
+
+
+def framer_title_restore(conn, fix_row, config, client=None):
+    """Rollback: write back BOTH meta fields from the pickup snapshot.
+
+    A snapshot missing meta.title refuses to guess (typed no_snapshot);
+    None pre-states are preserved as None (empty meta was the real state).
+    """
+    client = _client_from_framer_config(config, client)
+    snapshot = fix_row.get("snapshot_json") or {}
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError):
+            snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    page_ref = snapshot.get("page_ref") or fix_row.get("target_entity_ref")
+    if FRAMER_SNAPSHOT_TITLE_KEY not in snapshot:
+        return {"ok": False, "outcome": "no_snapshot",
+                "adapter": ADAPTER_FRAMER_TITLE,
+                "detail": "snapshot_json missing meta.title — refusing "
+                          "to guess a restore value"}
+    # None pre-state (field was empty) is legitimate and preserved as None.
+    old_title = snapshot.get(FRAMER_SNAPSHOT_TITLE_KEY)
+    old_description = snapshot.get(FRAMER_SNAPSHOT_DESCRIPTION_KEY)
+    try:
+        write = client.update_page_meta(page_ref, title=old_title,
+                                        description=old_description)
+    except Exception as exc:
+        return {"ok": False, "outcome": "provider_error",
+                "detail": str(exc), "adapter": ADAPTER_FRAMER_TITLE}
+    if not write.get("ok"):
+        return {"ok": False,
+                "outcome": write.get("outcome", "provider_error"),
+                "errors": [], "detail": write.get("detail"),
+                "adapter": ADAPTER_FRAMER_TITLE}
+    try:
+        verify = client.read_page_meta(page_ref)
+    except Exception as exc:
+        verify = {"ok": False, "detail": str(exc)}
+    live = (verify.get("data") or {}) if verify.get("ok") else {}
+    restored = (live.get("title") == old_title
+                and live.get("description") == old_description)
+    return {"ok": True, "outcome": "ok", "restored": restored,
+            "live_value": live.get("title"),
+            "adapter": ADAPTER_FRAMER_TITLE,
+            "adapter_response": {"write": {"ok": True, "outcome": "ok"}}}
+
+
+def framer_description_snapshot(conn, fix_row, config, client=None):
+    """FRESH READ pre-state at pickup: BOTH meta fields (whole-object)."""
+    client = _client_from_framer_config(config, client)
+    try:
+        page_ref, _new = _framer_payload_for(
+            fix_row["payload_json"], "description")
+    except WriteAdapterError as exc:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": str(exc), "adapter": ADAPTER_FRAMER_DESCRIPTION}
+    try:
+        read = client.read_page_meta(page_ref)
+    except Exception as exc:
+        return {"ok": False, "outcome": "provider_error",
+                "detail": str(exc), "adapter": ADAPTER_FRAMER_DESCRIPTION}
+    if not read.get("ok"):
+        return {"ok": False, "outcome": read.get("outcome", "provider_error"),
+                "detail": read.get("detail"),
+                "adapter": ADAPTER_FRAMER_DESCRIPTION}
+    data = read.get("data") or {}
+    return {"ok": True, "outcome": "ok",
+            "snapshot": {
+                FRAMER_SNAPSHOT_TITLE_KEY: data.get("title"),
+                FRAMER_SNAPSHOT_DESCRIPTION_KEY: data.get("description"),
+                "page_ref": page_ref,
+            },
+            "adapter": ADAPTER_FRAMER_DESCRIPTION}
+
+
+def framer_description_execute(conn, fix_row, config, dry_run=False,
+                               client=None):
+    """Apply one framer.description fix: whole-object write -> verify."""
+    client = _client_from_framer_config(config, client)
+    try:
+        page_ref, new_description = _framer_payload_for(
+            fix_row["payload_json"], "description")
+    except WriteAdapterError as exc:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": str(exc), "adapter": ADAPTER_FRAMER_DESCRIPTION}
+
+    if dry_run:
+        return {"ok": True, "outcome": "dry_run",
+                "adapter": ADAPTER_FRAMER_DESCRIPTION,
+                "detail": {"mutation": "framer.updatePageMeta",
+                           "page_ref": page_ref, "field": "description"}}
+
+    sibling = _framer_sibling(fix_row, FRAMER_SNAPSHOT_TITLE_KEY)
+    if sibling is None:
+        return {"ok": False, "outcome": "no_snapshot",
+                "detail": "framer.description write needs the pickup "
+                          "snapshot's meta.title (Framer meta write "
+                          "replaces the whole object) — refusing a "
+                          "data-destroying write",
+                "adapter": ADAPTER_FRAMER_DESCRIPTION}
+    result = _framer_write_and_verify(
+        client, page_ref, sibling, new_description,
+        ADAPTER_FRAMER_DESCRIPTION, dry_run=dry_run)
+    if not result.get("ok") or result.get("outcome") == "dry_run":
+        return result
+    state = result.pop("_verify_state")
+    out = _framer_verify_result(state, "description",
+                                ADAPTER_FRAMER_DESCRIPTION)
+    out["adapter_response"] = {"write": {"ok": True, "outcome": "ok"}}
+    return out
+
+
+def framer_description_restore(conn, fix_row, config, client=None):
+    """Rollback: write back BOTH meta fields from the pickup snapshot."""
+    client = _client_from_framer_config(config, client)
+    snapshot = fix_row.get("snapshot_json") or {}
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError):
+            snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    page_ref = snapshot.get("page_ref") or fix_row.get("target_entity_ref")
+    if FRAMER_SNAPSHOT_DESCRIPTION_KEY not in snapshot:
+        return {"ok": False, "outcome": "no_snapshot",
+                "adapter": ADAPTER_FRAMER_DESCRIPTION,
+                "detail": "snapshot_json missing meta.description — "
+                          "refusing to guess a restore value"}
+    old_title = snapshot.get(FRAMER_SNAPSHOT_TITLE_KEY)
+    old_description = snapshot.get(FRAMER_SNAPSHOT_DESCRIPTION_KEY)
+    try:
+        write = client.update_page_meta(page_ref, title=old_title,
+                                        description=old_description)
+    except Exception as exc:
+        return {"ok": False, "outcome": "provider_error",
+                "detail": str(exc), "adapter": ADAPTER_FRAMER_DESCRIPTION}
+    if not write.get("ok"):
+        return {"ok": False,
+                "outcome": write.get("outcome", "provider_error"),
+                "errors": [], "detail": write.get("detail"),
+                "adapter": ADAPTER_FRAMER_DESCRIPTION}
+    try:
+        verify = client.read_page_meta(page_ref)
+    except Exception as exc:
+        verify = {"ok": False, "detail": str(exc)}
+    live = (verify.get("data") or {}) if verify.get("ok") else {}
+    restored = (live.get("title") == old_title
+                and live.get("description") == old_description)
+    return {"ok": True, "outcome": "ok", "restored": restored,
+            "live_value": live.get("description"),
+            "adapter": ADAPTER_FRAMER_DESCRIPTION,
+            "adapter_response": {"write": {"ok": True, "outcome": "ok"}}}
+
+
+ADAPTERS.update({
+    "framer.title": {
+        "execute": framer_title_execute,
+        "restore": framer_title_restore,
+        "snapshot": framer_title_snapshot,
+    },
+    "framer.description": {
+        "execute": framer_description_execute,
+        "restore": framer_description_restore,
+        "snapshot": framer_description_snapshot,
+    },
+})
+
+
+# ------------------------------------------------------------
+# netlify.* (plan/27) — the FIRST Git-PR write path. Static-hosted sites
+# (Netlify/GitHub Pages/any git-backed host) never take live API
+# overwrites: every fix is delivered as ONE pull request against the
+# site's content repo, titled 'fix(seo): [action] for [page-path]'. A
+# human merges; the platform's verification is the committed diff.
+#
+# Same safety bar as the Shopify/Framer adapters:
+#   * snapshot() fresh-reads the file from the repo's base branch at
+#     executor pickup (the stale-diff guard's live-value source AND the
+#     revert's old_content source);
+#   * execute() opens a branch off the base branch, commits the exact
+#     file diff, opens the PR, and records the PR coordinates into
+#     snapshot_patch (the rollback source — reverts CLOSE the PR, never
+#     a force-push);
+#   * restore() closes the recorded PR (typed no_pr refusal when the PR
+#     number was never recorded — never a guessed rollback);
+#   * payload validated BEFORE any network call; dry_run writes nothing;
+#   * never raises — typed dicts everywhere.
+# target_entity_ref = the repo-relative file path (generation contract,
+# plan/27); the client resolves the file by that path at snapshot time.
+# ------------------------------------------------------------
+
+ADAPTER_NETLIFY_TITLE_META = "netlify.title_meta_rewrite"
+ADAPTER_NETLIFY_STRUCTURED_DATA = "netlify.structured_data"
+ADAPTER_NETLIFY_NOINDEX = "netlify.noindex"
+ADAPTER_NETLIFY_CANONICAL = "netlify.canonical_tag"
+
+NETLIFY_SNAPSHOT_PATH_KEY = "file.path"
+NETLIFY_SNAPSHOT_URL_KEY = "page.url"
+
+ACTION_LABELS = {
+    ADAPTER_NETLIFY_TITLE_META: "title-meta-rewrite",
+    ADAPTER_NETLIFY_STRUCTURED_DATA: "structured-data",
+    ADAPTER_NETLIFY_NOINDEX: "noindex-tag",
+    ADAPTER_NETLIFY_CANONICAL: "canonical-tag",
+}
+
+
+def _client_from_netlify_config(config, client=None):
+    """Build the GitHubPRClient from a plan/27 credential dict.
+
+    client: TEST seam (injected fake/mock client) — same pattern as the
+    framer adapters' client seam. When omitted, the real client is built
+    from the resolved config (mode resolved by the connector)."""
+    if client is not None:
+        return client
+    from connectors.github_static import GitHubPRClient
+    return GitHubPRClient(
+        github_token=config.get("github_token"),
+        github_repo=config.get("github_repo"),
+        github_branch=config.get("github_branch"),
+        github_root_dir=config.get("github_root_dir"),
+        api_base=config.get("api_base"),
+    )
+
+
+def _netlify_payload_for(payload_json, sub_type):
+    """Validate the netlify payload BEFORE any network call.
+
+    payload_json (from plan/27 generation):
+      {mutation: 'netlify.gitPr',
+       variables: {page_url, file_path, action: 'title_meta_rewrite'|
+                   'structured_data_inject'|'noindex_tag',
+                   title?, description?, jsonld?, noindex?},
+       surface: 'netlify'}
+    Strict allowlist per action: no drift fields ride the write.
+    """
+    if not isinstance(payload_json, dict):
+        raise WriteAdapterError("payload_json is not an object")
+    if payload_json.get("mutation") != "netlify.gitPr":
+        raise WriteAdapterError(
+            f"unsupported mutation for netlify adapter: "
+            f"{payload_json.get('mutation')!r}")
+    if payload_json.get("surface") != "netlify":
+        raise WriteAdapterError("netlify payload must carry surface='netlify'")
+    variables = payload_json.get("variables") or {}
+    page_url = (variables.get("page_url") or "").strip()
+    file_path = (variables.get("file_path") or "").strip()
+    if not page_url or not file_path:
+        raise WriteAdapterError(
+            "netlify payload must carry variables.page_url + file_path")
+    action = (variables.get("action") or "").strip()
+    expected = {
+        ADAPTER_NETLIFY_TITLE_META: "title_meta_rewrite",
+        ADAPTER_NETLIFY_STRUCTURED_DATA: "structured_data_inject",
+        ADAPTER_NETLIFY_NOINDEX: "noindex_tag",
+        ADAPTER_NETLIFY_CANONICAL: "canonical_tag",
+    }.get(sub_type)
+    if action != expected:
+        raise WriteAdapterError(
+            f"{sub_type} adapter refuses payload action {action!r} "
+            f"(expected {expected!r})")
+    # per-action field allowlist
+    allowed = {"page_url", "file_path", "action"}
+    if action == "canonical_tag":
+        # plan/28: the canonical href = the page's own canonical URL —
+        # always a string (generation mints it from page_url)
+        allowed |= {"canonical_url"}
+        if not isinstance(variables.get("canonical_url"), str) or \
+                not variables["canonical_url"].startswith("https://"):
+            raise WriteAdapterError(
+                "netlify canonical_tag payload must carry an absolute "
+                "https variables.canonical_url")
+    elif action == "title_meta_rewrite":
+        allowed |= {"title", "description"}
+        # title OR description may be a None PLACEHOLDER (generation
+        # contract, plan/27): the executor fills the placeholder from the
+        # pickup snapshot (sibling discipline — the HTML pair is ONE edit
+        # unit). A payload with BOTH None still refuses (nothing to write).
+        title_val = variables.get("title")
+        desc_val = variables.get("description")
+        if not (isinstance(title_val, str) or isinstance(desc_val, str)):
+            raise WriteAdapterError(
+                "netlify title_meta_rewrite payload must carry a string "
+                "variables.title or variables.description (the other may "
+                "be a None placeholder the snapshot fills)")
+        if title_val is not None and not isinstance(title_val, str):
+            raise WriteAdapterError(
+                "netlify title_meta_rewrite variables.title must be a "
+                "string or a None placeholder")
+        if desc_val is not None and not isinstance(desc_val, str):
+            raise WriteAdapterError(
+                "netlify title_meta_rewrite variables.description must be "
+                "a string or a None placeholder")
+    elif action == "structured_data_inject":
+        allowed |= {"jsonld"}
+        if not isinstance(variables.get("jsonld"), str):
+            raise WriteAdapterError(
+                "netlify structured_data_inject payload must carry a "
+                "string variables.jsonld (serialized JSON-LD)")
+        try:
+            parsed = json.loads(variables["jsonld"])
+        except (TypeError, ValueError):
+            raise WriteAdapterError(
+                "netlify structured_data_inject variables.jsonld is not "
+                "valid JSON")
+        if not isinstance(parsed, (dict, list)):
+            raise WriteAdapterError(
+                "netlify structured_data_inject jsonld must be a JSON "
+                "object or array")
+    elif action == "noindex_tag":
+        if "noindex" in variables and variables["noindex"] is not True:
+            raise WriteAdapterError(
+                "netlify noindex_tag variables.noindex must be true")
+    extra = set(variables.keys()) - allowed
+    if extra:
+        raise WriteAdapterError(
+            f"netlify adapter writes ONLY {sorted(allowed)} "
+            f"(drift fields: {sorted(extra)})")
+    return variables
+
+
+def _jsonld_script(value):
+    """One serialized JSON-LD script block (validated at payload level)."""
+    return f'<script type="application/ld+json">\n{value}\n</script>'
+
+
+def apply_netlify_html_edit(content, action, variables):
+    """Pure HTML-text transformer: (content, action, variables) ->
+    (new_content, diff_summary) or (None, reason).
+
+    Rules (plan/27 §2 + plan/28, deterministic, no regex-over-the-void):
+      * title_meta_rewrite — replace/insert <title> and
+        <meta name="description"> inside <head>; an absent <head> refuses
+        (never a guessed insertion point);
+      * structured_data_inject — insert the JSON-LD script before
+        </head>; refuse when an identical @type+name block already exists
+        (idempotency guard);
+      * canonical_tag — inject a self-referencing <link rel="canonical">
+        before </head>; refuses when the page ALREADY carries a canonical
+        (never a second canonical — no-op loop guard); the href is the
+        payload's page_url (verified absolute https);
+      * noindex_tag — insert/replace <meta name="robots"> with
+        content containing noindex; refuses when a robots meta ALREADY
+        says noindex (no-op loop guard).
+    """
+    if content is None:
+        return None, "file_not_found"
+    text = content if isinstance(content, str) else content.decode("utf-8")
+    head_lower = text.lower()
+    if "<head" not in head_lower or "</head>" not in head_lower:
+        return None, "no_head_section"
+    head_start = head_lower.index("<head")
+    head_end = head_lower.index("</head>")
+
+    if action == "title_meta_rewrite":
+        new = text
+        changed = []
+        title_value = variables.get("title")
+        import re as _re
+        title_match = _re.search(r"<title[^>]*>(.*?)</title>", text[head_start:head_end],
+                                 _re.IGNORECASE | _re.DOTALL)
+        if title_match:
+            span_start = head_start + title_match.start(1)
+            span_end = head_start + title_match.end(1)
+            new = new[:span_start] + title_value + new[span_end:]
+            changed.append("title")
+            head_end = head_end + (len(title_value)
+                                   - (title_match.end(1) - title_match.start(1)))
+        else:
+            insert_at = new.lower().index("</head>")
+            new = new[:insert_at] + f"    <title>{title_value}</title>\n" \
+                  + new[insert_at:]
+            changed.append("title")
+        desc_value = variables.get("description")
+        import re as _re2
+        head_lower2 = new.lower()
+        h2s = head_lower2.index("<head")
+        h2e = head_lower2.index("</head>")
+        desc_match = _re2.search(
+            r'<meta\s+name=["\']description["\'][^>]*>',
+            new[h2s:h2e], _re2.IGNORECASE)
+        if desc_match:
+            tag = desc_match.group(0)
+            if desc_value and desc_value in tag:
+                # plan/27 no-op guard: the new description EQUALS the live
+                # value (e.g. the title fix carries an unchanged sibling) —
+                # skip the desc edit and keep the title change; refusing
+                # the whole transform here would kill valid title fixes.
+                pass
+            else:
+                new_tag = _re2.sub(r'content=["\'].*?["\']',
+                                   lambda m: f'content="{desc_value}"'
+                                   if not m.group(0).startswith("content='")
+                                   else f"content='{desc_value}'", tag,
+                                   flags=_re2.IGNORECASE | _re2.DOTALL)
+                if new_tag == tag:
+                    return None, "meta_description_transform_failed"
+                span = (h2s + desc_match.start(), h2s + desc_match.end())
+                new = new[:span[0]] + new_tag + new[span[1]:]
+                changed.append("meta_description")
+        else:
+            insert_at = h2e
+            new = new[:insert_at] + \
+                f'    <meta name="description" content="{desc_value}">\n' \
+                + new[insert_at:]
+            changed.append("meta_description")
+        if not changed:
+            return None, "no_changes"
+        return new, {"fields": changed}
+
+    if action == "structured_data_inject":
+        script = _jsonld_script(variables.get("jsonld"))
+        if script in text:
+            return None, "already_present"
+        # idempotency guard: an existing JSON-LD block with the same @type
+        # + name is treated as already-present
+        import re as _re3
+        try:
+            new_obj = json.loads(variables["jsonld"])
+        except (TypeError, ValueError):
+            return None, "jsonld_invalid"
+        for match in _re3.finditer(
+                r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>'
+                r'(.*?)</script>', text, _re3.IGNORECASE | _re3.DOTALL):
+            try:
+                existing = json.loads(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if (isinstance(existing, dict) and isinstance(new_obj, dict)
+                    and existing.get("@type") == new_obj.get("@type")
+                    and existing.get("name") == new_obj.get("name")):
+                return None, "already_present"
+        insert_at = text.lower().index("</head>")
+        return text[:insert_at] + f"    {script}\n" + text[insert_at:], \
+            {"fields": ["jsonld"]}
+
+    if action == "noindex_tag":
+        import re as _re4
+        h2s = head_lower.index("<head")
+        h2e = head_lower.index("</head>")
+        robots_match = _re4.search(
+            r'<meta\s+name=["\']robots["\'][^>]*>',
+            text[h2s:h2e], _re4.IGNORECASE)
+        if robots_match:
+            tag = robots_match.group(0)
+            if "noindex" in tag.lower():
+                return None, "already_noindex"
+            new_tag = _re4.sub(r'content=["\'].*?["\']',
+                               'content="noindex, follow"', tag,
+                               flags=_re4.IGNORECASE | _re4.DOTALL)
+            span = (h2s + robots_match.start(), h2s + robots_match.end())
+            return text[:span[0]] + new_tag + text[span[1]:], \
+                {"fields": ["robots_meta"]}
+        insert_at = h2e
+        return text[:insert_at] + \
+            '    <meta name="robots" content="noindex, follow">\n' \
+            + text[insert_at:], {"fields": ["robots_meta"]}
+
+    if action == "canonical_tag":
+        import re as _re5
+        h2s = head_lower.index("<head")
+        h2e = head_lower.index("</head>")
+        # no-op loop guard: a page with ANY canonical must never get a
+        # second one (a duplicate canonical is worse than none)
+        existing_match = _re5.search(
+            r'<link[^>]*rel=["\']canonical["\'][^>]*>',
+            text[h2s:h2e], _re5.IGNORECASE)
+        if existing_match:
+            return None, "already_has_canonical"
+        href = (variables.get("canonical_url") or "").strip()
+        if not href.startswith("https://"):
+            return None, "canonical_url_not_https"
+        insert_at = h2e
+        return text[:insert_at] + \
+            f'    <link rel="canonical" href="{href}">\n' \
+            + text[insert_at:], {"fields": ["canonical_link"]}
+
+    return None, f"unknown action {action!r}"
+
+
+def _pr_branch_name(fix_row):
+    fix_id = str(fix_row.get("fix_id") or "unknown")
+    return f"openseo/fix-{fix_id[:8]}"
+
+
+def _pr_title(fix_row, sub_type):
+    from connectors.github_static import PR_TITLE_FORMAT
+    action_label = ACTION_LABELS.get(
+        sub_type, (fix_row.get("sub_type") or "fix").replace(".", "-"))
+    page_label = (fix_row.get("target_url") or "").split("://", 1)[-1] \
+        .rstrip("/")
+    return PR_TITLE_FORMAT.format(action_label=action_label,
+                                  page_label=page_label)
+
+
+def _pr_body(fix_row):
+    from connectors.github_static import (PR_BODY_RECOMMENDATION_LINE,
+                                          PR_BODY_FIX_LINE)
+    rec_id = str(fix_row.get("recommendation_id") or "")
+    fix_id = str(fix_row.get("fix_id") or "")
+    return (
+        "Automated SEO fix generated by OpenSEO.\n\n"
+        f"{PR_BODY_RECOMMENDATION_LINE.format(recommendation_id=rec_id)}\n"
+        f"{PR_BODY_FIX_LINE.format(fix_id=fix_id)}\n\n"
+        "Revert path: close this PR (the platform's /fixes/{id}/revert "
+        "does exactly that; rollback links back to the recommendation "
+        "in Supabase)."
+    )
+
+
+def _netlify_changes_for(fix_row, sub_type, new_content, old_content):
+    variables = (fix_row.get("payload_json") or {}).get("variables") or {}
+    return [{
+        "path": variables.get("file_path"),
+        "old_content": old_content,
+        "new_content": new_content,
+    }]
+
+
+def _netlify_common_snapshot(conn, fix_row, config, client, sub_type):
+    """Shared fresh read: the CURRENT file content from the base branch.
+
+    The snapshot stores the full file (the revert source) + the parsed
+    live values the stale-diff guard reads (head/meta.title,
+    meta/meta.description).
+    """
+    try:
+        payload_vars = _netlify_payload_for(fix_row.get("payload_json"),
+                                            sub_type)
+    except WriteAdapterError as exc:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": str(exc), "adapter": sub_type}
+    try:
+        read = client.read_file(payload_vars["file_path"])
+    except Exception as exc:
+        return {"ok": False, "outcome": "provider_error",
+                "detail": str(exc), "adapter": sub_type}
+    if not read.get("ok"):
+        return {"ok": False, "outcome": read.get("outcome", "provider_error"),
+                "detail": read.get("detail"), "adapter": sub_type}
+    content = (read.get("data") or {}).get("content")
+    live = _parse_live_meta(content)
+    snapshot = {
+        NETLIFY_SNAPSHOT_PATH_KEY: payload_vars["file_path"],
+        NETLIFY_SNAPSHOT_URL_KEY: payload_vars["page_url"],
+        "file.content": content,
+        "meta.title": live.get("title"),
+        "meta.description": live.get("description"),
+        "meta.robots": live.get("robots"),
+    }
+    return {"ok": True, "outcome": "ok", "snapshot": snapshot,
+            "adapter": sub_type}
+
+
+def _parse_live_meta(content):
+    """(title, description, robots) from raw HTML; None-tolerant."""
+    out = {"title": None, "description": None, "robots": None}
+    if not isinstance(content, str):
+        return out
+    import re
+    m = re.search(r"<title[^>]*>(.*?)</title>", content,
+                  re.IGNORECASE | re.DOTALL)
+    if m:
+        out["title"] = m.group(1).strip()
+    m = re.search(r'<meta\s+name=["\']description["\'][^>]*>', content,
+                  re.IGNORECASE)
+    if m:
+        cm = re.search(r'content=["\'](.*?)["\']', m.group(0),
+                       re.IGNORECASE | re.DOTALL)
+        if cm:
+            out["description"] = cm.group(1)
+    m = re.search(r'<meta\s+name=["\']robots["\'][^>]*>', content,
+                  re.IGNORECASE)
+    if m:
+        cm = re.search(r'content=["\'](.*?)["\']', m.group(0),
+                       re.IGNORECASE)
+        if cm:
+            out["robots"] = cm.group(1)
+    return out
+
+
+def _netlify_common_execute(conn, fix_row, config, dry_run, client,
+                            sub_type):
+    """Shared execute: transform -> open ONE PR -> record PR coordinates."""
+    client = _client_from_netlify_config(config, client)
+    snapshot = fix_row.get("snapshot_json") or {}
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError):
+            snapshot = {}
+    if not isinstance(snapshot, dict) or \
+            NETLIFY_SNAPSHOT_PATH_KEY not in snapshot or \
+            "file.content" not in snapshot:
+        return {"ok": False, "outcome": "no_snapshot",
+                "detail": "netlify execute needs the pickup snapshot's "
+                          "file.content + file.path — refusing to write "
+                          "from a guessed base state",
+                "adapter": sub_type}
+    try:
+        variables = _netlify_payload_for(fix_row.get("payload_json"),
+                                         sub_type)
+    except WriteAdapterError as exc:
+        return {"ok": False, "outcome": "payload_invalid",
+                "detail": str(exc), "adapter": sub_type}
+
+    # plan/27 sibling discipline: a None placeholder field is filled from
+    # the fresh pickup snapshot (the live HTML pair is ONE edit unit — the
+    # placeholder must never ride a write as None, which would blank the
+    # sibling field). A snapshot missing the sibling key refuses (typed).
+    if variables.get("action") == "title_meta_rewrite":
+        live_meta = _parse_live_meta(snapshot.get("file.content"))
+        if variables.get("title") is None:
+            filled = live_meta.get("title")
+            if not isinstance(filled, str):
+                return {"ok": False, "outcome": "no_snapshot",
+                        "detail": "payload carries a None title placeholder "
+                                  "but the pickup snapshot has no live "
+                                  "<title> — refusing a guessed write",
+                        "adapter": sub_type}
+            variables["title"] = filled
+        if variables.get("description") is None:
+            filled = live_meta.get("description")
+            if not isinstance(filled, str):
+                return {"ok": False, "outcome": "no_snapshot",
+                        "detail": "payload carries a None description "
+                                  "placeholder but the pickup snapshot has "
+                                  "no live meta description — refusing a "
+                                  "blanking write",
+                        "adapter": sub_type}
+            variables["description"] = filled
+
+    old_content = snapshot.get("file.content")
+    action = variables["action"]
+    new_content, summary = apply_netlify_html_edit(old_content, action,
+                                                   variables)
+    if new_content is None:
+        return {"ok": False, "outcome": "transform_refused",
+                "detail": f"HTML transform refused: {summary}",
+                "adapter": sub_type}
+    if new_content == old_content:
+        return {"ok": False, "outcome": "no_change",
+                "detail": "transform produced an identical file — refusing "
+                          "an empty PR",
+                "adapter": sub_type}
+
+    if dry_run:
+        return {"ok": True, "outcome": "dry_run", "adapter": sub_type,
+                "detail": {"mutation": "netlify.gitPr",
+                           "file_path": variables["file_path"],
+                           "action": action,
+                           "diff_summary": summary,
+                           "pr_title": _pr_title(fix_row, sub_type)}}
+
+    head = _pr_branch_name(fix_row)
+    pr = client.open_pr(
+        _pr_title(fix_row, sub_type), _pr_body(fix_row), head,
+        config.get("github_branch") or "main",
+        _netlify_changes_for(fix_row, sub_type, new_content, old_content))
+    if not pr.get("ok"):
+        return {"ok": False, "outcome": pr.get("outcome", "provider_error"),
+                "errors": [], "detail": pr.get("detail"), "adapter": sub_type}
+    data = pr.get("data") or {}
+    out = {
+        "ok": True, "outcome": "ok",
+        "verified": True,  # the PR diff IS the verification (plan/27 §3)
+        "verification_status": "verified",
+        "live_value": data.get("pr_url"),
+        "adapter": sub_type,
+        "adapter_response": {
+            "pr_number": data.get("pr_number"),
+            "pr_url": data.get("pr_url"),
+            "branch": data.get("branch"),
+            "files": data.get("files"),
+            "diff_summary": summary,
+        },
+        # the rollback source: reverts CLOSE this PR; pr.repo feeds the
+        # merge-sync endpoint (polls GitHub for the merged state)
+        "snapshot_patch": {
+            "pr.number": data.get("pr_number"),
+            "pr.url": data.get("pr_url"),
+            "pr.branch": data.get("branch"),
+            "pr.repo": config.get("github_repo"),
+        },
+    }
+    return out
+
+
+def _netlify_common_restore(conn, fix_row, config, client, sub_type):
+    """Rollback = CLOSE the recorded PR (never a force-push, never a
+    guessed branch). A snapshot without pr.number refuses (typed)."""
+    client = _client_from_netlify_config(config, client)
+    snapshot = fix_row.get("snapshot_json") or {}
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError):
+            snapshot = {}
+    if not isinstance(snapshot, dict) or snapshot.get("pr.number") is None:
+        return {"ok": False, "outcome": "no_pr_recorded",
+                "detail": "snapshot_json carries no pr.number — refusing "
+                          "to guess a rollback target (close the PR "
+                          "manually or re-derive from change_log)",
+                "adapter": sub_type}
+    try:
+        result = client.close_pr(snapshot["pr.number"])
+    except Exception as exc:
+        return {"ok": False, "outcome": "provider_error",
+                "detail": str(exc), "adapter": sub_type}
+    if not result.get("ok"):
+        return {"ok": False, "outcome": result.get("outcome", "provider_error"),
+                "detail": result.get("detail"), "adapter": sub_type}
+    return {"ok": True, "outcome": "ok", "restored": True,
+            "live_value": None, "adapter": sub_type,
+            "adapter_response": {"closed_pr": snapshot.get("pr.number")}}
+
+
+def _netlify_adapter(sub_type):
+    def snapshot(conn, fix_row, config, client=None):
+        client = _client_from_netlify_config(config, client)
+        return _netlify_common_snapshot(conn, fix_row, config, client,
+                                        sub_type)
+
+    def execute(conn, fix_row, config, dry_run=False, client=None):
+        return _netlify_common_execute(conn, fix_row, config, dry_run,
+                                       client, sub_type)
+
+    def restore(conn, fix_row, config, client=None):
+        return _netlify_common_restore(conn, fix_row, config, client,
+                                       sub_type)
+
+    return {"execute": execute, "restore": restore, "snapshot": snapshot}
+
+
+def netlify_title_meta_rewrite_snapshot(conn, fix_row, config, client=None):
+    """Named export (tests/console): fresh repo read for the title/meta PR."""
+    return _netlify_common_snapshot(conn, fix_row, config,
+                                    _client_from_netlify_config(config,
+                                                                client),
+                                    ADAPTER_NETLIFY_TITLE_META)
+
+
+def netlify_title_meta_rewrite_execute(conn, fix_row, config, dry_run=False,
+                                       client=None):
+    """Named export: transform -> ONE PR -> verify (plan/27 §3)."""
+    return _netlify_common_execute(conn, fix_row, config, dry_run,
+                                   _client_from_netlify_config(config,
+                                                               client),
+                                   ADAPTER_NETLIFY_TITLE_META)
+
+
+def netlify_title_meta_rewrite_restore(conn, fix_row, config, client=None):
+    """Named export: rollback = close the recorded PR."""
+    return _netlify_common_restore(conn, fix_row, config,
+                                   _client_from_netlify_config(config,
+                                                               client),
+                                   ADAPTER_NETLIFY_TITLE_META)
+
+
+ADAPTERS.update({
+    ADAPTER_NETLIFY_TITLE_META: _netlify_adapter(ADAPTER_NETLIFY_TITLE_META),
+    ADAPTER_NETLIFY_STRUCTURED_DATA: _netlify_adapter(
+        ADAPTER_NETLIFY_STRUCTURED_DATA),
+    ADAPTER_NETLIFY_NOINDEX: _netlify_adapter(ADAPTER_NETLIFY_NOINDEX),
+    ADAPTER_NETLIFY_CANONICAL: _netlify_adapter(ADAPTER_NETLIFY_CANONICAL),
 })

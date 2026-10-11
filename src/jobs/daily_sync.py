@@ -65,30 +65,24 @@ def run(site_id=None, reference_date=None, force_refresh=False):
 
         sites = _load_sites(conn, site_id)
         if not sites:
-            # No configured sites: run_sync falls back to the sandbox mock site
-            # so the empty-database demo keeps working.
-            summary = {}
-            with job_lock(conn, LOCK_KEYS["daily_sync"], site_id=None) as got:
+            # plan/31: no default-site fallback — an unknown/empty site request
+            # fails loudly instead of silently syncing the oldest (mock) site.
+            return {"status": "no_sites", "detail": f"no site_config row for site_id={site_id}"}
+        summary = {}
+        for site in sites:
+            # Per-site advisory lock: overlapping runs for the same site are
+            # impossible; other sites proceed unaffected.
+            with job_lock(conn, LOCK_KEYS["daily_sync"], site_id=site.get("site_id")) as got:
                 if not got:
-                    return already_running("daily_sync")
-                summary = run_sync(site=None, reference_date=reference_date,
-                                   force_refresh=force_refresh)
-        else:
-            summary = {}
-            for site in sites:
-                # Per-site advisory lock: overlapping runs for the same site are
-                # impossible; other sites proceed unaffected.
-                with job_lock(conn, LOCK_KEYS["daily_sync"], site_id=site.get("site_id")) as got:
-                    if not got:
-                        summary[site.get("domain")] = already_running("daily_sync", site.get("site_id"))
-                        continue
-                    try:
-                        per_site = run_sync(site=site, reference_date=reference_date,
-                                            force_refresh=force_refresh)
-                    except Exception as exc:
-                        print(f"[daily_sync] site {site.get('domain')}: sync failed ({exc})", flush=True)
-                        per_site = {"error": str(exc)}
-                    summary[site.get("domain")] = per_site
+                    summary[site.get("domain")] = already_running("daily_sync", site.get("site_id"))
+                    continue
+                try:
+                    per_site = run_sync(site=site, reference_date=reference_date,
+                                        force_refresh=force_refresh)
+                except Exception as exc:
+                    print(f"[daily_sync] site {site.get('domain')}: sync failed ({exc})", flush=True)
+                    per_site = {"error": str(exc)}
+                summary[site.get("domain")] = per_site
     finally:
         conn.close()
     send_summary("daily_sync", summary)

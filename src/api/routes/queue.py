@@ -27,6 +27,80 @@ logger = logging.getLogger("api.queue")
 
 router = APIRouter(prefix="/queue", tags=["queue"])
 
+# Active-window cap (operator request 2026-09-27): the Action Queue surfaces
+# at most MAX_ACTIVE_QUEUE proposed cards at a time; the rest of the backlog
+# sits in status 'pending' until the active set drains below the cap.
+MAX_ACTIVE_QUEUE = 5
+
+
+def promote_pending_to_queue(conn, site_id, cap=MAX_ACTIVE_QUEUE):
+    """Refill the active window from the 'pending' backlog (idempotent).
+
+    Promotes the highest-priority pending rows to 'proposed' until the site
+    has `cap` proposed rows again. Called by the decisions routes after
+    every approve/reject (the window refills immediately) and by the
+    maintenance endpoint. Never raises on an empty backlog.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM recommendations "
+            "WHERE site_id = %s AND status = 'proposed'", (site_id,))
+        active = cur.fetchone()[0]
+    slots = max(cap - active, 0)
+    if slots <= 0:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE recommendations
+            SET status = 'proposed'
+            WHERE recommendation_id IN (
+                SELECT recommendation_id FROM recommendations
+                WHERE site_id = %s AND status = 'pending'
+                ORDER BY CASE impact WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+                          ELSE 3 END,
+                          created_at ASC
+                LIMIT %s
+            )
+            """,
+            (site_id, slots),
+        )
+        promoted = cur.rowcount
+    conn.commit()
+    return promoted
+
+
+def demote_backlog_to_pending(conn, site_id, cap=MAX_ACTIVE_QUEUE):
+    """Gate the proposed backlog beyond the cap to 'pending' (idempotent).
+
+    One-time normalization for sites whose queue predates the active
+    window: keeps the top `cap` proposed rows, moves the rest to 'pending'
+    (surfaced again by promote_pending_to_queue as the active set drains)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE recommendations
+            SET status = 'pending'
+            WHERE recommendation_id IN (
+                SELECT recommendation_id FROM (
+                    SELECT recommendation_id,
+                           row_number() OVER (
+                               ORDER BY CASE impact WHEN 'high' THEN 1
+                                        WHEN 'medium' THEN 2 ELSE 3 END,
+                                        created_at ASC
+                           ) AS rn
+                    FROM recommendations
+                    WHERE site_id = %s AND status = 'proposed'
+                ) ranked
+                WHERE rn > %s
+            )
+            """,
+            (site_id, cap),
+        )
+        demoted = cur.rowcount
+    conn.commit()
+    return demoted
+
 # Task text patterns the fix engine can execute end-to-end (generated_fixes
 # rows exist for these sub_types: 'seo.title', 'seo.description',
 # 'redirect', 'collection_description', 'collection_create'). Anything
@@ -43,72 +117,177 @@ _AUTOMATED_TASK_PATTERNS = (
     "create page",
 )
 
+# plan/27+28: netlify-platform auto-fix surfaces (the GitHub-PR engine).
+# Tasks on netlify sites mentioning these are executable end-to-end;
+# canonical tags ARE now auto-fixable too (plan/28 netlify.canonical_tag).
+# plan/29: locality/SERP-gap tasks whose copy carries title/meta phrasing
+# ("title/meta phrasing, one H2") are ALSO executable — the title/meta
+# portion of the fix routes to netlify.title_meta_rewrite; the H2/content
+# portion stays in the task text as operator context (the diff preview
+# scopes itself to what the engine writes).
+_NETLIFY_AUTOMATED_PATTERNS = (
+    "structured data",
+    "json-ld",
+    "jsonld",
+    # the title/meta rewrite surface (PR #3 family): title/meta rewrites
+    # on netlify sites route to netlify.title_meta_rewrite
+    "meta description",
+    "title",
+    # plan/28: canonical-tag injection (self-referencing canonical)
+    "canonical",
+    # plan/29: locality/SERP-gap tasks bundle title/meta phrasing with
+    # content asks; the title/meta portion is auto-fixable
+    "title/meta phrasing",
+    "locality signals",
+    "serp gap",
+)
+NETLIFY_STRUCTURED_SUB_TYPE = "netlify.structured_data"
+NETLIFY_TITLE_META_SUB_TYPE = "netlify.title_meta_rewrite"
+NETLIFY_CANONICAL_SUB_TYPE = "netlify.canonical_tag"
 
-def _classify_execution_type(task: str) -> str:
+
+def _site_platform(conn, site_id):
+    """site_config.platform for the site (legacy rows resolve as 'shopify')."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(platform, 'shopify') "
+            "FROM site_config WHERE site_id = %s",
+            (site_id,),
+        )
+        row = cur.fetchone()
+    return (row[0] if row else "shopify") or "shopify"
+
+
+def _classify_execution_type(task: str, platform: str = "shopify") -> str:
     lowered = (task or "").lower()
+    if platform == "netlify":
+        if any(p in lowered for p in _NETLIFY_AUTOMATED_PATTERNS):
+            return "automated"
+        return "manual"
     return "automated" if any(p in lowered for p in _AUTOMATED_TASK_PATTERNS) else "manual"
 
 
-def _sub_type_for_task(lowered):
-    """Task text -> fix sub_type (plan/25 §4). The create-page branch is
-    evaluated FIRST: 'Create a collection page at /collections/x … meta
-    description…' mentions description phrases that would otherwise
-    shadow the create semantics."""
+def _sub_types_for_task(lowered, platform: str = "shopify"):
+    """Task text -> ALL fix sub_types the task bundles (plan/25 §4 +
+    plan/28). A single task can bundle multiple engine surfaces — "rewrite
+    title tag and meta description" maps to BOTH seo.title and
+    seo.description, and each gets its own diff preview. Ordered:
+    specific-match first, create-page precedence preserved."""
     lowered = lowered or ""
+    if platform == "netlify":
+        if not any(p in lowered for p in _NETLIFY_AUTOMATED_PATTERNS):
+            return []
+        if "structured" in lowered or "json" in lowered:
+            return [NETLIFY_STRUCTURED_SUB_TYPE]
+        if "canonical" in lowered:
+            return [NETLIFY_CANONICAL_SUB_TYPE]
+        return [NETLIFY_TITLE_META_SUB_TYPE]
     if ("create a collection" in lowered
             or "create page" in lowered
             or "missing page" in lowered
             or ("/collections/" in lowered and "create" in lowered)):
-        return "collection_create"
+        return ["collection_create"]
     if "redirect" in lowered or "301" in lowered:
-        return "redirect"
+        return ["redirect"]
+    # Title/meta bundle: a task mentioning either (or both) links to every
+    # matching fix row so each field's before/after renders in the drawer.
+    sub_types = []
+    if "title" in lowered:
+        sub_types.append("seo.title")
     if "meta description" in lowered or "description" in lowered:
-        return "seo.description"
-    return "seo.title"
+        sub_types.append("seo.description")
+    if not sub_types:
+        sub_types.append("seo.title")
+    return sub_types
 
 
-def enrich_work_tasks(work, fix_rows):
+def _sub_type_for_task(lowered, platform: str = "shopify"):
+    """First fix sub_type for a task (legacy single-match callers)."""
+    subs = _sub_types_for_task(lowered, platform)
+    return subs[0] if subs else None
+
+
+def enrich_work_tasks(work, fix_rows, platform: str = "shopify"):
     """Attach execution_type + fix linkage to work_required_json tasks.
 
-    fix_rows: (fix_id, sub_type, status) tuples of this recommendation's
-    generated_fixes rows. A task classified 'automated' links to the row by
-    sub_type (title task -> seo.title, description task -> seo.description,
-    redirect task -> redirect); unmatched automated tasks stay fix-less and
-    the UI shows Drafted as the implicit default.
+    fix_rows: (fix_id, sub_type, status, pr_url) tuples of this
+    recommendation's generated_fixes rows. A task classified 'automated'
+    links to EVERY row whose sub_type the task bundles (title+meta tasks
+    link to both seo.title and seo.description rows) — fix_id/fix_status
+    stay the primary match for backwards compatibility, fix_refs carries
+    the full list so the drawer renders one diff block per field.
+    Unmatched automated tasks stay fix-less and the UI shows Drafted as
+    the implicit default.
     """
     if not isinstance(work, list):
         return work
     by_sub_type = {}
-    for fix_id, sub_type, status in fix_rows or []:
-        by_sub_type.setdefault(sub_type, (fix_id, status))
+    for fix_id, sub_type, status, pr_url in fix_rows or []:
+        by_sub_type.setdefault(str(sub_type), []).append(
+            (fix_id, status, pr_url))
     enriched = []
     for task in work:
         if not isinstance(task, dict):
             enriched.append(task)
             continue
         item = dict(task)
-        item["execution_type"] = _classify_execution_type(item.get("task") or "")
+        item["execution_type"] = _classify_execution_type(
+            item.get("task") or "", platform)
         if item["execution_type"] == "automated":
-            sub_type = _sub_type_for_task((item.get("task") or "").lower())
-            fix = by_sub_type.get(sub_type)
-            if fix:
-                item["fix_id"], item["fix_status"] = str(fix[0]), fix[1]
+            sub_types = _sub_types_for_task((item.get("task") or "").lower(),
+                                            platform)
+            matches = [fix for st in sub_types
+                       for fix in by_sub_type.get(st, [])]
+            if matches:
+                # Primary = highest-priority ACTIVE row across the bundle
+                # (applied > queued > others; _load_fix_rows already sorts
+                # applied first). Keeps fix_id/fix_status semantics identical
+                # to the single-match behaviour every consumer relies on.
+                def _rank(match):
+                    status = match[1]
+                    if status == "applied":
+                        return 0
+                    if status == "queued":
+                        return 1
+                    if status == "generated":
+                        return 2
+                    return 3
+
+                primary = min(matches, key=_rank)
+                item["fix_id"], item["fix_status"] = (
+                    str(primary[0]), primary[1])
+                if primary[2]:
+                    item["fix_pr_url"] = primary[2]
+                if len(matches) > 1:
+                    item["fix_refs"] = [
+                        {"fix_id": str(m[0]), "status": m[1],
+                         "sub_type": st, **({"pr_url": m[2]} if m[2] else {})}
+                        for st in sub_types
+                        for m in by_sub_type.get(st, [])
+                    ]
         enriched.append(item)
     return enriched
 
 
 def _load_fix_rows(conn, recommendation_id):
-    """(fix_id, sub_type, status) rows for a recommendation.
+    """(fix_id, sub_type, status, pr_url) rows for a recommendation.
 
-    Degrades to [] when the stage-2 schema (generated_fixes) has not been
-    applied to the database — task enrichment then renders tasks without
-    fix linkage instead of failing the whole endpoint.
+    pr_url rides from the netlify adapter's snapshot (the GitHub PR the fix
+    opened) so pipeline/detail drawers can link directly. Degrades to []
+    when the stage-2 schema (generated_fixes) has not been applied to the
+    database — task enrichment then renders tasks without fix linkage
+    instead of failing the whole endpoint.
     """
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT fix_id, sub_type, status FROM generated_fixes "
-                "WHERE recommendation_id = %s ORDER BY created_at",
+                """
+                SELECT fix_id, sub_type, status,
+                       COALESCE(snapshot_json->>'pr.url', NULL) pr_url
+                FROM generated_fixes
+                WHERE recommendation_id = %s
+                ORDER BY (status = 'applied') DESC, created_at
+                """,
                 (recommendation_id,),
             )
             return cur.fetchall()
@@ -195,6 +374,29 @@ def list_sites(conn=Depends(get_conn)):
     return {"sites": sites}
 
 
+@router.post("/sites/{site_id}/normalize-active-window")
+def normalize_active_window(site_id, conn=Depends(get_conn)):
+    """One-time normalization for the active-window cap (2026-09-27).
+
+    Demotes the proposed backlog beyond MAX_ACTIVE_QUEUE to 'pending'
+    (surfaced again as the active set drains). Safe to re-run: a compliant
+    site demotes 0 rows. Returns the counts for the operator log.
+    """
+    demoted = demote_backlog_to_pending(conn, site_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM recommendations "
+            "WHERE site_id = %s AND status = 'proposed'", (site_id,))
+        active = cur.fetchone()[0]
+        cur.execute(
+            "SELECT count(*) FROM recommendations "
+            "WHERE site_id = %s AND status = 'pending'", (site_id,))
+        pending = cur.fetchone()[0]
+    conn.rollback()
+    return {"site_id": site_id, "demoted": demoted,
+            "active_proposed": active, "pending_backlog": pending}
+
+
 @router.get("", response_model=QueueOut)
 def get_queue(
     site_id,
@@ -207,15 +409,25 @@ def get_queue(
     limit: int = Query(5, ge=1, le=100),
     conn=Depends(get_conn),
 ):
-    """Operator queue: proposed recommendations for one site.
+    """Operator queue: ACTIVE proposed recommendations for one site.
 
-    Ordering: agent-priority order — impact (high first), then the
-    recommendation's search volume evidence carried in evidence_json when
-    present, else creation recency. total_proposed enables "5 of N" display.
+    Active-window cap (operator request 2026-09-27): at most
+    MAX_ACTIVE_QUEUE proposed cards are ever served. The cap is a server-side
+    invariant, not a client hint — any requested `limit` above it is clamped,
+    so a caller cannot walk the backlog by asking for more. The overflow is
+    parked in status 'pending' by the demote sweep below and re-enters the
+    window through promote_pending_to_queue as the active set drains.
 
-    `owner` and `action_type` are optional filters; the literal "all" is the
-    UI's explicit no-filter sentinel and is treated as absent.
+    `total_proposed` is the ACTIVE card count, so the "N of M" counter reads
+    "5 of 5" while backlog rows wait in 'pending'.
     """
+    # Enforce the window before reading: a site that accumulated proposed rows
+    # before this invariant (or via any other writer) is normalised here, so
+    # promote_pending_to_queue on approve/reject has a 'pending' backlog to
+    # draw from. Idempotent; commits its own demotion.
+    demote_backlog_to_pending(conn, site_id)
+    limit = min(limit, MAX_ACTIVE_QUEUE)
+
     with conn.cursor() as cur:
         sql = (
             "SELECT r.recommendation_id, r.site_id, r.generator, r.action_type, "
@@ -284,6 +496,11 @@ def get_queue(
         total = cur.fetchone()[0]
     conn.rollback()
 
+    # The window is capped at MAX_ACTIVE_QUEUE unconditionally, so report at
+    # most that many regardless of the limit the caller sent.
+    if total > MAX_ACTIVE_QUEUE:
+        total = MAX_ACTIVE_QUEUE
+
     for r in rows:
         # Belt-and-braces integrity check (plan/16 §1.6): a 'proposed' row the
         # agent "validated" but never actually enriched must never reach the
@@ -351,8 +568,9 @@ def get_queue_detail(recommendation_id, conn=Depends(get_conn)):
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT cluster_id, primary_keyword, keywords, intent, search_volume, "
-                "commercial_value FROM keyword_clusters WHERE cluster_id = %s",
-                (rec["cluster_id"],),
+                "commercial_value FROM keyword_clusters "
+                "WHERE cluster_id = %s AND site_id = %s",
+                (rec["cluster_id"], rec["site_id"]),
             )
             crow = cur.fetchone()
         if crow:
@@ -428,10 +646,10 @@ def get_queue_detail(recommendation_id, conn=Depends(get_conn)):
                        oss.query, oss.result_url, oss.result_domain,
                        oss.position, oss.is_self, oss.snapshot_date
                 FROM openseo_serp_snapshots oss
-                WHERE oss.cluster_id = %s
+                WHERE oss.cluster_id = %s AND oss.site_id = %s
                 ORDER BY oss.result_url, oss.snapshot_date DESC
                 """,
-                (rec["cluster_id"],),
+                (rec["cluster_id"], rec["site_id"]),
             )
             columns = [d[0] for d in cur.description]
             serp_rows = [dict(zip(columns, r)) for r in cur.fetchall()]
@@ -459,7 +677,13 @@ def get_queue_detail(recommendation_id, conn=Depends(get_conn)):
     # Execution split (automated vs manual) + fix linkage per task: the UI
     # renders Auto-fix badges / fix statuses for engine-supported tasks and a
     # manual checklist for the rest. Cheap sub_type lookup on generated_fixes.
-    parsed_work = enrich_work_tasks(parsed_work, _load_fix_rows(conn, rec["recommendation_id"]))
+    # plan/27: classification is platform-aware (netlify structured-data
+    # tasks route to the PR engine; canonical tags stay manual everywhere).
+    parsed_work = enrich_work_tasks(
+        parsed_work,
+        _load_fix_rows(conn, rec["recommendation_id"]),
+        _site_platform(conn, rec["site_id"]),
+    )
 
     conn.rollback()
     return QueueDetailOut(
@@ -565,6 +789,7 @@ def get_pipeline(
             work_tasks=enrich_work_tasks(
                 _parse_jsonb_queue(r.get("work_required_json")),
                 _load_fix_rows(conn, r["recommendation_id"]),
+                _site_platform(conn, r["site_id"]),
             ),
         ))
 

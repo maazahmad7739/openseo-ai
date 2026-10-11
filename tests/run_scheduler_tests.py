@@ -25,6 +25,7 @@ bodies are executed.
 import os
 import sys
 import json
+import re
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
@@ -84,10 +85,40 @@ def main():
         allok &= check("fix_executor in SCHEDULE (daily)",
                        sched.SCHEDULE.get("fix_executor") == {"cadence": "daily", "hour_utc": 3},
                        str(sched.SCHEDULE.get("fix_executor")))
+        allok &= check("audit_ttl_sweep in SCHEDULE (daily, off-peak hour)",
+                       sched.SCHEDULE.get("audit_ttl_sweep") == {"cadence": "daily", "hour_utc": 6},
+                       str(sched.SCHEDULE.get("audit_ttl_sweep")))
+        allok &= check("offpage_discovery in SCHEDULE (daily, 07:00, after "
+                       "audit_ttl_sweep)",
+                       sched.SCHEDULE.get("offpage_discovery")
+                       == {"cadence": "daily", "hour_utc": 7},
+                       str(sched.SCHEDULE.get("offpage_discovery")))
+        allok &= check("audit_ttl_sweep slot after stale_approvals, an hour "
+                       "clear of other daily slots",
+                       sched.SCHEDULE["audit_ttl_sweep"]["hour_utc"]
+                       > sched.SCHEDULE["stale_approvals"]["hour_utc"]
+                       and sched.SCHEDULE["offpage_discovery"]["hour_utc"]
+                       > sched.SCHEDULE["audit_ttl_sweep"]["hour_utc"]
+                       and {spec["hour_utc"] for spec in sched.SCHEDULE.values()
+                            if spec["cadence"] == "daily"}
+                       == {1, 2, 3, 5, 6, 7},
+                       str({n: s["hour_utc"] for n, s in sched.SCHEDULE.items()
+                            if s["cadence"] == "daily"}))
+        allok &= check("audit_ttl_sweep module importable + exposes run()",
+                       callable(getattr(sched._job_module("audit_ttl_sweep"),
+                                        "run", None)))
+        allok &= check("offpage_discovery module importable + exposes run()",
+                       callable(getattr(sched._job_module("offpage_discovery"),
+                                        "run", None)))
+        allok &= check("offpage_discovery lock key registered",
+                       "offpage_discovery"
+                       in __import__("jobs.locks", fromlist=["LOCK_KEYS"]).LOCK_KEYS)
         allok &= check("every scheduled job has a run() entry point",
                        all(callable(getattr(sched._job_module(j), "run", None))
                            for j in sched.SCHEDULE),
                        "missing run() in some module")
+        allok &= check("audit_ttl_sweep lock key registered",
+                       "audit_ttl_sweep" in __import__("jobs.locks", fromlist=["LOCK_KEYS"]).LOCK_KEYS)
         allok &= check("scheduler lock key registered",
                        "scheduler" in __import__("jobs.locks", fromlist=["LOCK_KEYS"]).LOCK_KEYS)
 
@@ -153,7 +184,8 @@ def main():
             sched._dispatch = real_dispatch
         allok &= check("all daily slots dispatched (first run, past hours)",
                        {d["job"] for d in dispatched} >= {"daily_sync", "measurements",
-                                                          "fix_executor", "stale_approvals"},
+                                                           "fix_executor", "stale_approvals",
+                                                           "audit_ttl_sweep"},
                        str(dispatched))
         allok &= check("crashing job captured, rest still ran",
                        results["measurements"]["status"] == "failed"
@@ -169,7 +201,8 @@ def main():
                        not any(d["job"].startswith("weekly_") for d in dispatched))
         lastruns = sched._load_last_runs(conn)
         allok &= check("last-run recorded for successful jobs",
-                       set(lastruns) >= {"daily_sync", "fix_executor", "stale_approvals"},
+                       set(lastruns) >= {"daily_sync", "fix_executor", "stale_approvals",
+                                          "audit_ttl_sweep"},
                        str(lastruns))
         allok &= check("failed job does NOT record last-run for THIS run",
                        lastruns.get("measurements") is None
@@ -220,6 +253,97 @@ def main():
         allok &= check("fix_executor slot before stale_approvals (writes "
                        "complete before the daily housekeeping)",
                        sched.SCHEDULE["fix_executor"]["hour_utc"] < 5)
+
+        # 6: minutes cadence (offpage_verify)
+        print("\n== minutes cadence (offpage_verify) ==")
+        allok &= check("offpage_verify in SCHEDULE (every 15m)",
+                       sched.SCHEDULE["offpage_verify"]
+                       == {"cadence": "minutes", "interval_minutes": 15},
+                       str(sched.SCHEDULE.get("offpage_verify")))
+        import inspect
+        from jobs import offpage_verify as ov_mod
+        ov_sig = inspect.signature(ov_mod.run)
+        allok &= check("offpage_verify.run accepts (now, conn, fetcher)",
+                       all(p in ov_sig.parameters
+                           for p in ("now", "conn", "fetcher")))
+        allok &= check("offpage_verify lock key registered",
+                       "offpage_verify"
+                       in __import__("jobs.locks", fromlist=["LOCK_KEYS"]).LOCK_KEYS)
+
+        ov_spec = sched.SCHEDULE["offpage_verify"]
+        tue_0020 = datetime(2026, 9, 22, 0, 20)      # before EVERY daily hour
+        tue_0005 = datetime(2026, 9, 22, 0, 5)
+        allok &= check("minutes fires when never run (no hour gate needed)",
+                       sched.is_due("offpage_verify", tue_0005, ov_spec, None))
+        allok &= check("minutes silent while beneath the interval",
+                       not sched.is_due("offpage_verify", tue_0020, ov_spec,
+                                        datetime(2026, 9, 22, 0, 10)))
+        allok &= check("minutes fires at exactly interval_minutes elapsed",
+                       sched.is_due("offpage_verify", tue_0020, ov_spec,
+                                    datetime(2026, 9, 22, 0, 5)))
+        allok &= check("minutes fires past the interval even before any daily hour",
+                       sched.is_due("offpage_verify", tue_0020, ov_spec,
+                                    datetime(2026, 9, 22, 0, 0)))
+        allok &= check("minutes handles naive last_run (stored isoformat)",
+                       sched.is_due("offpage_verify",
+                                    datetime(2026, 9, 22, 0, 20).replace(
+                                        tzinfo=timezone.utc),
+                                    ov_spec,
+                                    datetime(2026, 9, 22, 0, 0)))
+
+        allok &= check("minutes period key is informational bucket",
+                       len(re.findall(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}\|\d+$",
+                                      sched.slot_period_key("offpage_verify",
+                                                            tue_0020, ov_spec)))
+                       == 1, sched.slot_period_key("offpage_verify", tue_0020,
+                                                   ov_spec))
+        k_bucket = lambda t: int(sched.slot_period_key("offpage_verify", t, ov_spec)
+                                 .rsplit("|", 1)[1])
+        allok &= check("bucket advances exactly one per interval",
+                       k_bucket(tue_0020) == k_bucket(tue_0005) + 1
+                       and k_bucket(tue_0020 + timedelta(minutes=15))
+                       == k_bucket(tue_0020) + 1,
+                       f"{k_bucket(tue_0005)}/{k_bucket(tue_0020)}")
+
+        # end-to-end with stubbed dispatch: a 20-minute-elapsed clock must
+        # fire offpage_verify even before any daily hour; a 5-minute later
+        # tick must stay silent.
+        dispatched.clear()
+        sched._dispatch = fake_dispatch
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO system_config (config_key, config_value) "
+                    "VALUES ('scheduler.lastrun.offpage_verify', %s) "
+                    "ON CONFLICT (config_key) DO UPDATE "
+                    "SET config_value = EXCLUDED.config_value",
+                    (datetime(2026, 9, 22, 0, 0).isoformat(),))
+            conn.commit()
+            res_a = sched.run_due_jobs(now_utc=tue_0020, conn=conn)
+            res_b = sched.run_due_jobs(now_utc=datetime(2026, 9, 22, 0, 25),
+                                       conn=conn)
+            res_c = sched.run_due_jobs(now_utc=datetime(2026, 9, 22, 0, 40),
+                                       conn=conn)
+        finally:
+            sched._dispatch = real_dispatch
+        ov_calls = [d for d in dispatched if d["job"] == "offpage_verify"]
+        allok &= check("minutes slot dispatches after 20m elapsed",
+                       "offpage_verify" in res_a and
+                       res_a["offpage_verify"]["status"] == "ran"
+                       and len(ov_calls) == 2,
+                       str(ov_calls))
+        allok &= check("minutes slot silent at +5m since last run",
+                       res_b == {}, str(res_b))
+        allok &= check("minutes slot re-fires at another interval",
+                       "offpage_verify" in res_c,
+                       str(list(res_c)))
+        allok &= check("minutes slot fired before every daily hour "
+                       "(00:20 < 01:00, no daily leaked)",
+                       not any(j.startswith("weekly_") or j in
+                               ("daily_sync", "measurements", "fix_executor",
+                                "stale_approvals", "audit_ttl_sweep")
+                               for j in list(res_a) + list(res_c)),
+                       str(list(res_a) + list(res_c)))
     finally:
         cleanup_last_runs(conn, saved_lastruns)
         conn.close()

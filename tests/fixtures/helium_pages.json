@@ -1,0 +1,68 @@
+{
+  "_comment": [
+    "Helium (gethelium.co) page fixtures for the day-in-the-life test.",
+    "These replace the abandoned example.com wireless-* targets: the",
+    "measurement stage hard-fails when a recommendation's target_url is",
+    "absent from `pages`, and generator 01 ('missing pages') emits exactly",
+    "those URLs, so generator output was never measurable. Seeding a real",
+    "page inventory for one tenant lets the generators target pages that",
+    "actually exist, so baseline and post windows both resolve.",
+    "",
+    "body_html must survive body_to_text() at >= CORPUS_MIN_BODY_CHARS (120)",
+    "or the off-page grounding corpus is rejected as unusable.",
+    "",
+    "page_type matters: offpage_grounding.load_brand_corpus only ingests",
+    "'product' and 'collection' pages, because those are the ones that state",
+    "what the client actually offers. /features and /pricing are exactly that",
+    "for Helium, so they are typed 'collection'. Typing them 'landing' leaves",
+    "the drafting stage with an empty corpus and the drafter correctly",
+    "refuses to answer blind."
+  ],
+  "domain": "gethelium.co",
+  "pages": [
+    {
+      "url": "https://gethelium.co/features",
+      "page_type": "collection",
+      "title": "Helium Features - Growth Platform for App Teams",
+      "h1": "Everything your app team needs to grow",
+      "meta_description": "Helium unifies acquisition, merchandising and retention for app-first brands.",
+      "body_html": "<p>Helium is the growth platform built for app-first consumer brands. It brings paid acquisition, merchandising and lifecycle retention into one workspace so a small team can run experiments without stitching five vendors together.</p><p>Ad Stack connects directly to the networks your team already buys from, so budgets move without a spreadsheet. Impulse captures in-app events and triggers merchandising surfaces at the moment intent is highest, rather than waiting for a weekly campaign calendar. Merchandising keeps collection, ranking and creative in the same place, and every change is attributed back to the SKU it moved.</p><p>Teams typically start with Ad Stack, prove payback on one acquisition channel, then switch on retention workflows once the install base is large enough for cohort analysis to be meaningful.</p>",
+      "indexable": true,
+      "status_code": 200,
+      "crawl_depth": 1
+    },
+    {
+      "url": "https://gethelium.co/pricing",
+      "page_type": "collection",
+      "title": "Helium Pricing - Plans for App Teams",
+      "h1": "Pricing that scales with your install base",
+      "meta_description": "Transparent Helium pricing based on monthly active users, not on ad spend.",
+      "body_html": "<p>Helium prices on monthly active users rather than on ad spend, so a team that spends aggressively during a promotion is not punished for it. Three plans cover the common cases: Launch for teams validating a first channel, Growth for teams running paid acquisition every week, and Scale for brands with an established install base and a dedicated growth team.</p><p>Every plan includes the full Ad Stack integration and the merchandising workspace. Lifecycle retention workflows, cohort analysis and the experimentation suite sit on Growth and above. There is no implementation fee, and the migration off an existing platform is handled by our team at no cost.</p><p>Because billing follows active users, the practical effect is that spend stays uncapped and only genuine adoption changes the invoice.</p>",
+      "indexable": true,
+      "status_code": 200,
+      "crawl_depth": 1
+    },
+    {
+      "url": "https://gethelium.co/",
+      "page_type": "home",
+      "title": "Helium - Growth Platform for App-First Brands",
+      "h1": "The growth platform for app-first brands",
+      "meta_description": "Acquisition, merchandising and retention for consumer app teams.",
+      "body_html": "<p>Helium helps consumer app teams grow without a dedicated growth department. Acquisition, merchandising and retention live in one workspace, and every decision is traced back to the SKU and the cohort it affected.</p><p>The platform was built for brands whose customers live in an app first and return to the web only when they need to. That shapes the product: merchandising surfaces are designed to be triggered by in-app behaviour, and reporting is cohort-based by default rather than click-based.</p>",
+      "indexable": true,
+      "status_code": 200,
+      "crawl_depth": 0
+    },
+    {
+      "url": "https://gethelium.co/helium-case-studies",
+      "page_type": "blog",
+      "title": "Case Studies - Helium Customer Results",
+      "h1": "How app teams grow with Helium",
+      "meta_description": "Measured results from consumer brands running Helium in production.",
+      "body_html": "<p>These case studies document measured outcomes rather than headline metrics. Each entry states the starting install base, the channel mix before Helium, the change made, and the observation window, so the result can be compared against a similar baseline.</p><p>The apparel, home goods and pet categories are represented here. Where a team changed only one variable we say so explicitly, because a merchandising change and an acquisition change rarely produce the same uplift.</p>",
+      "indexable": true,
+      "status_code": 200,
+      "crawl_depth": 2
+    }
+  ]
+}

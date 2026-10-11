@@ -139,6 +139,15 @@ def main():
         allok &= check("agent input carries seeded raw candidates", len(seed_in_payload) >= 2,
                        f"found {len(seed_in_payload)} of {len(seed_ids)}")
         approved_ids = [c["candidate_id"] for c in seed_in_payload[:2]]
+        # The agent only offers the free active-window slots
+        # (MAX_RECOMMENDATIONS - already-proposed), so it may legitimately
+        # leave seeded raw rows untouched; the batch it was given is what the
+        # agent is answerable for.
+        offered = len(payload_ids)
+        max_recs = payload["config"]["max_recommendations"]
+        allok &= check("agent caps the batch to the free window slots",
+                       offered <= max_recs,
+                       f"offered {offered} > budget {max_recs}")
 
         summary = run_agent(site_id, conn, client=_FakeClient(_fake_agent_output(payload_ids)))
         allok &= check("agent returns ok", summary.get("status") == "ok", str(summary)[:200])
@@ -151,7 +160,8 @@ def main():
             states = {r[0]: r[1] for r in cur.fetchall()}
         allok &= check("agent promoted first 2 to proposed", states.get("proposed", 0) == 2,
                        str(states))
-        allok &= check("remaining seeds rejected by agent", states.get("rejected", 0) == len(seed_ids) - 2,
+        allok &= check("remaining offered candidates rejected by agent",
+                       states.get("rejected", 0) == offered - 2,
                        str(states))
         conn.commit()
 
@@ -171,7 +181,7 @@ def main():
                 (site_id, seed_ids))
             rej_logged = cur.fetchone()[0]
         allok &= check("agent rejections logged for rejection_context",
-                       rej_logged == len(seed_ids) - 2, f"logged={rej_logged}")
+                       rej_logged == offered - 2, f"logged={rej_logged}")
 
         # --- detail: enriched + metric ---
         print("\n== detail surface ==")
@@ -227,10 +237,17 @@ def main():
                 # The invariant under test: the migration predicates never
                 # corrupt a consolidate row's evidence_json. Lifecycle status
                 # is data-dependent (the sandbox seed row sits at 'proposed');
-                # only assert the evidence payload survived intact.
+                # only assert the evidence payload survived intact. The
+                # generator (plan/04) writes consolidate evidence as an
+                # OBJECT carrying competing_urls (jsonb_build_object, and the
+                # consolidate-sharpen suite seeds the same shape); legacy
+                # measured rows are arrays. Both are intact shapes.
+                evidence_text = measured_row[1] or ""
+                intact = (evidence_text.startswith("[")
+                          or '"competing_urls"' in evidence_text)
                 allok &= check("consolidate row evidence intact (migration didn't corrupt)",
-                               measured_row[1].startswith("["),
-                               f"status={measured_row[0]}")
+                               intact,
+                               f"status={measured_row[0]} evidence={evidence_text[:80]}")
             cur.execute(
                 "SELECT count(*) FROM ("
                 "  SELECT site_id, generator, action_type,"

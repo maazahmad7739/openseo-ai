@@ -1,0 +1,18 @@
+{
+  "_comment": "plan/26 Phase 3 fixture — Framer page meta state keyed by canonical URL (the page_ref the adapters resolve). The mock store mutates this file on update_page_meta so read-back verify has a real state machine.",
+  "site_ref": "framer-site-fixture",
+  "pages": {
+    "https://phase3-framer.example.com/blog/field-cameras": {
+      "title": "Updated title",
+      "description": "Field cameras fixture meta description."
+    },
+    "https://phase3-framer.example.com/blog/trail-cameras": {
+      "title": "Trail cameras fixture title",
+      "description": "Trail cameras fixture meta description."
+    },
+    "https://phase3-framer.example.com/empty-meta": {
+      "title": null,
+      "description": null
+    }
+  }
+}

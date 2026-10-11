@@ -350,6 +350,14 @@ def run_audit(conn, raw_url, depth=None, refresh=False, location_code=None,
     if page:
         persist_page_snapshot(conn, session_id, page)
         _set_fetch_status(conn, session_id, "fetched")
+        # plan/31: link-graph ingestion for connected sites (fail-soft;
+        # suggestion-only surface — never blocks the audit).
+        if mode == "connected" and resolution.get("site_id") \
+                and page.get("links") is not None:
+            from audit.link_ingest import ingest_page_links
+            result["link_ingest"] = ingest_page_links(
+                conn, resolution["site_id"], page.get("url") or raw_url,
+                page)
     inference = keyword_infer.infer(
         raw_url,
         title=(page or {}).get("title"),

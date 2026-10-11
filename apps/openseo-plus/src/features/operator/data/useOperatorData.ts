@@ -147,13 +147,51 @@ export const EMPTY_STATS: Record<string, RecommendationStats> = {};
 export const EMPTY_MEASURED: MeasuredResult[] = [];
 export const EMPTY_RUNS: CandidateRun[] = [];
 
+export const API_TOKEN_STORAGE_KEY = "openseo_api_token";
+export const UNAUTHORIZED_EVENT = "openseo:unauthorized";
+
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export function getStoredToken(): string {
+  // Runtime token (localStorage) wins over the build-time VITE_API_TOKEN —
+  // the recovery gate can refresh a dead token WITHOUT a new build.
+  try {
+    return localStorage.getItem(API_TOKEN_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { accept: "application/json" };
   if (init?.body) headers["content-type"] = "application/json";
-  const token = import.meta.env.VITE_API_TOKEN as string | undefined;
+  const token = getStoredToken() || (import.meta.env.VITE_API_TOKEN as string | undefined);
   if (token) headers.authorization = `Bearer ${token}`;
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  } catch (err) {
+    // Network-level failure (offline, DNS, CORS): typed so callers can
+    // distinguish it from an HTTP error status.
+    throw new ApiError(`network error: ${String(err)}`, 0);
+  }
   if (!res.ok) {
+    if (res.status === 401) {
+      // Dead/expired token: clear storage and notify the root-level auth
+      // gate so it can show the token form (no white screen).
+      try {
+        localStorage.removeItem(API_TOKEN_STORAGE_KEY);
+      } catch {
+        /* storage unavailable (private mode) — gate still shows via event */
+      }
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    }
     // Include the API's detail message (FastAPI {"detail": …}) so callers
     // can surface WHY a mutation was rejected (409 policy/cap blocks etc.).
     let detail = "";
@@ -163,7 +201,10 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* non-JSON error body — fall through to the generic message */
     }
-    throw new Error(detail ? `${detail} (HTTP ${res.status})` : `API ${res.status} ${path}`);
+    throw new ApiError(
+      detail ? `${detail} (HTTP ${res.status})` : `API ${res.status} ${path}`,
+      res.status,
+    );
   }
   return (await res.json()) as T;
 }
@@ -293,15 +334,33 @@ export function taskProgress(
 }
 
 /** Defensive parse of an evidence_json-ish value into typed items.
- * Returns [] on anything malformed — chips simply hide, never crash. */
-function parseEvidence(value: unknown): EvidenceItem[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter(
-    (item): item is EvidenceItem =>
-      item != null &&
-      typeof item === "object" &&
-      typeof (item as EvidenceItem).finding === "string",
-  );
+ * Accepts the array form AND the single-object form (audit/technical
+ * evidence arrives as a dict: {issue, issue_type, ...}) — an object is
+ * normalized into one renderable finding. Returns [] on anything malformed
+ * — chips simply hide, never crash. */
+export function parseEvidence(value: unknown): EvidenceItem[] {
+  if (Array.isArray(value)) {
+    return value.filter(
+      (item): item is EvidenceItem =>
+        item != null &&
+        typeof item === "object" &&
+        typeof (item as EvidenceItem).finding === "string",
+    );
+  }
+  if (value != null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v != null)
+      .map(([k, v]) => `${k}: ${String(v)}`);
+    if (entries.length === 0) return [];
+    const source = typeof (value as Record<string, unknown>).source === "string"
+      ? (value as { source: string }).source
+      : "crawl";
+    const finding = typeof (value as Record<string, unknown>).issue === "string"
+      ? (value as { issue: string }).issue
+      : entries.join(" · ");
+    return [{ source: source as EvidenceItem["source"], finding }];
+  }
+  return [];
 }
 
 /** Extract a rank position from evidence values or diagnosis text. Tolerant of
@@ -445,9 +504,10 @@ function mapRecentItem(item: ApiRecentItem): MeasuredResult {
 }
 
 async function loadQueue(siteId: string) {
-  const out = await api<ApiQueueOut>(
-    `/queue?site_id=${encodeURIComponent(siteId)}&limit=100`,
-  );
+  // No `limit` override: the server clamps every request to
+  // MAX_ACTIVE_QUEUE and parks the overflow in 'pending'. Asking for more
+  // used to bypass the cap and let the client slice the backlog itself.
+  const out = await api<ApiQueueOut>(`/queue?site_id=${encodeURIComponent(siteId)}`);
   const recommendations: Recommendation[] = [];
   const stats: Record<string, RecommendationStats> = {};
   for (const item of out.recommendations) {
@@ -633,8 +693,12 @@ export function useOperatorData(siteId: string) {
     error: queue.error ?? pipeline.error ?? results.error,
     data,
     patchRecommendation,
-    approve: (id: string) => approveMutation.mutate(id),
-    reject: (id: string, reason?: string) => rejectMutation.mutate({ id, reason }),
+    // mutateAsync (not mutate): callers await these so a failed approval
+    // surfaces as an error instead of a silent no-op. onSettled still
+    // invalidates on both paths, so the optimistic patch is corrected by a
+    // refetch either way — what was missing was telling the operator.
+    approve: (id: string) => approveMutation.mutateAsync(id),
+    reject: (id: string, reason?: string) => rejectMutation.mutateAsync({ id, reason }),
     implement: (id: string) => implementMutation.mutate(id),
     markLive: (id: string) => markLiveMutation.mutate(id),
   };

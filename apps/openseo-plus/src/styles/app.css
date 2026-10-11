@@ -163,6 +163,14 @@ body {
   color: var(--color-primary);
 }
 
+/* Native <select> popup lists don't follow the page theme — they use the OS
+   color scheme, so a dark-mode page gets a light option list. Force themed
+   option colors so the popup matches the active theme. */
+select option {
+  background-color: var(--color-base-100);
+  color: var(--color-base-content);
+}
+
 /* Focus styling matching the main app: primary border + subtle fill. */
 .input:focus,
 .input:focus-visible,

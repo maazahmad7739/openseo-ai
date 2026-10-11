@@ -188,12 +188,73 @@ def _cannibalization_row(r, impact_threshold=None):
     }
 
 
+def _internal_link_row(r, impact_threshold=None):
+    """plan/31 Generator 5 row: internal-link placement SUGGESTION.
+
+    Suggestion-only discipline (plan/31 §3): the row enters the queue as
+    status='proposed' (operator-visible immediately — the agent stage has
+    no skill file for internal links and raw rows are invisible), and NO
+    write adapter exists for issue_type 'internal_link_gap' — fixes/
+    generator refuses typed, so approval can never mint a write. The
+    evidence carries suggestion_only=True for the operator UI.
+    """
+    return {
+        "generator": "internal_link",
+        "action_type": "improve_page",
+        "target_url": r.get("target_url"),
+        "proposed_url": r.get("proposed_url"),
+        "cluster_id": r.get("cluster_id"),
+        "diagnosis": r.get("diagnosis"),
+        "evidence_json": _to_jsonb(r.get("evidence")),
+        "work_required_json": _to_jsonb(r.get("work_required")),
+        "impact": r.get("impact") or "medium",
+        "confidence": r.get("confidence") or "medium",
+        "effort": r.get("effort") or "hours",
+        "owner": r.get("owner") or "SEO",
+        "_status": "proposed",
+    }
+
+
 ROW_BUILDERS = {
     "01-generator-missing-pages": _missing_page_row,
     "02-generator-existing-opportunities": _existing_opportunity_row,
     "03-generator-technical-root-causes": _technical_fix_row,
     "04-generator-cannibalization": _cannibalization_row,
+    # plan/31 Phase 5 closure: internal-link suggestions from page_links.
+    # Generator 5 runs on ALL platforms (it is crawl-evidence based, not
+    # catalogue-gated) but is SUGGESTION-ONLY: no write adapter exists for
+    # issue_type 'internal_link_gap' (fixes/generator refuses, typed), so
+    # the candidate must be able to leave 'proposed' only via operator
+    # review — see _internal_link_row's status override.
+    "05-generator-internal-links": _internal_link_row,
 }
+
+# plan/26 Phase 2: platform-aware generator mix. Generator 1 (missing
+# commercial pages) is commercial_intent + in_stock_product_count gated —
+# a catalogue_coverage surface that only Shopify sites populate. Content
+# platforms (framer) run the GSC-evidence generators (2, 3, 4) only;
+# their create_page candidates would be plan_only anyway.
+GENERIC_PLATFORM_GENERATORS = (
+    "02-generator-existing-opportunities",
+    "03-generator-technical-root-causes",
+    "04-generator-cannibalization",
+)
+
+
+def _site_platform(conn, site_id):
+    """site_config.platform (legacy rows resolve as 'shopify')."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(platform, 'shopify') "
+                "FROM site_config WHERE site_id = %s",
+                (site_id,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        conn.rollback()
+        return "shopify"
+    return (row[0] if row else "shopify") or "shopify"
 
 
 def _validate_action_types(conn, rows):
@@ -219,13 +280,17 @@ def _insert_recommendations(conn, site_id, rows):
     inserted = 0
     with conn.cursor() as cur:
         for r in rows:
+            # plan/31: internal-link suggestions enter as status='proposed'
+            # (suggestion-only, operator-visible); every other generator
+            # keeps the raw -> agent pipeline default.
+            status = r.get("_status") or "raw"
             cur.execute(
                 """
                 INSERT INTO recommendations
                     (site_id, generator, action_type, target_url, proposed_url,
                      cluster_id, diagnosis, evidence_json, work_required_json,
                      impact, confidence, effort, owner, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'raw')
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (site_id, generator, action_type,
                              COALESCE(cluster_id, '00000000-0000-0000-0000-000000000000'::uuid),
                              COALESCE(target_url, ''), COALESCE(proposed_url, ''))
@@ -235,7 +300,7 @@ def _insert_recommendations(conn, site_id, rows):
                  r.get("proposed_url"), r.get("cluster_id"), r["diagnosis"],
                  _to_jsonb(r.get("evidence_json")) or "[]",
                  _to_jsonb(r.get("work_required_json")) or "[]",
-                 r["impact"], r["confidence"], r["effort"], r["owner"]),
+                 r["impact"], r["confidence"], r["effort"], r["owner"], status),
             )
             inserted += cur.rowcount
     return inserted
@@ -257,7 +322,19 @@ def run_candidate_generation(site_id, conn=None, reference_date=None):
         impact_threshold = _impact_volume_threshold(conn, site_id)
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'UTC'")
-        for generator_file in ROW_BUILDERS:
+        # plan/26 Phase 2: framer/wordpress/headless sites skip the
+        # catalogue-gated missing-pages generator (typed skip, recorded
+        # in counts so the run summary stays honest).
+        # plan/31: Generator 5 (internal links) is crawl-evidence based —
+        # it runs on EVERY platform.
+        platform = _site_platform(conn, site_id)
+        generator_files = [f for f in ROW_BUILDERS
+                           if f != "05-generator-internal-links"] \
+            if platform == "shopify" else list(GENERIC_PLATFORM_GENERATORS)
+        if platform != "shopify":
+            counts["skipped_platform"] = "01-generator-missing-pages"
+        generator_files.append("05-generator-internal-links")
+        for generator_file in generator_files:
             limit = _generator_limit(generator_file)
             candidates = run_generator(conn, generator_file, site_id, limit,
                                        reference_date=reference_date)
@@ -283,6 +360,10 @@ def run_candidate_generation(site_id, conn=None, reference_date=None):
         run_id = uuid.uuid4()
         with conn.cursor() as cur:
             for generator_file, count in counts.items():
+                # plan/26: 'skipped_platform' is a typed skip marker, not a
+                # generator run — never bookkeeped into candidate_runs.
+                if generator_file not in ROW_BUILDERS:
+                    continue
                 # candidate_runs PK is run_id alone: one row per generator run
                 cur.execute(
                     "INSERT INTO candidate_runs (run_id, site_id, generator, candidate_count, mode) "

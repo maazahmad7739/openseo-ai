@@ -33,7 +33,11 @@ def approve(recommendation_id, conn=Depends(get_conn)):
             (recommendation_id,),
         )
     conn.commit()
-    return ApproveOut(recommendation_id=recommendation_id, status="approved")
+    # Active-window refill: a slot just freed — promote the next pending row.
+    from api.routes.queue import promote_pending_to_queue
+    promoted = promote_pending_to_queue(conn, rec["site_id"])
+    return ApproveOut(recommendation_id=recommendation_id, status="approved",
+                      promoted_from_backlog=promoted)
 
 
 @router.post("/{recommendation_id}/reject", response_model=RejectOut)
@@ -44,8 +48,9 @@ def reject(recommendation_id, body: RejectRequest, conn=Depends(get_conn)):
         primary_keyword = None
         if rec.get("cluster_id"):
             cur.execute(
-                "SELECT primary_keyword FROM keyword_clusters WHERE cluster_id = %s",
-                (rec["cluster_id"],),
+                "SELECT primary_keyword FROM keyword_clusters "
+                "WHERE cluster_id = %s AND site_id = %s",
+                (rec["cluster_id"], rec["site_id"]),
             )
             krow = cur.fetchone()
             primary_keyword = krow[0] if krow else None
@@ -63,6 +68,9 @@ def reject(recommendation_id, body: RejectRequest, conn=Depends(get_conn)):
         )
         log_id = cur.fetchone()[0]
     conn.commit()
+    # Active-window refill: the rejected row freed a slot.
+    from api.routes.queue import promote_pending_to_queue
+    promoted = promote_pending_to_queue(conn, rec["site_id"])
     return RejectOut(recommendation_id=recommendation_id, status="rejected",
                      rejection_log_id=log_id)
 

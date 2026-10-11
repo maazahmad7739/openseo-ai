@@ -1,6 +1,6 @@
 import { Link, useMatchRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import { BarChart3, ChevronDown, ClipboardList, GitBranch, Globe, Moon, Sun } from "lucide-react";
+import { BarChart3, ChevronDown, ClipboardList, GitBranch, Globe, MessageSquareText, Moon, Sun } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
 import { API_BASE } from "../data/useOperatorData";
 
@@ -47,6 +47,11 @@ const OPERATOR_TABS = [
     to: "/p/$projectId/results" as const,
     label: "Results",
     icon: BarChart3,
+  },
+  {
+    to: "/p/$projectId/offpage-queue" as const,
+    label: "Off-page",
+    icon: MessageSquareText,
   },
 ];
 

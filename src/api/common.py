@@ -5,10 +5,13 @@ duplicate secret handling (brief §1.1). Endpoints are site-scoped; unknown
 transitions/values fail loudly (409/422).
 """
 
+import hashlib
+import hmac
 import os
 
 import fastapi
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import db as database
@@ -18,11 +21,41 @@ API_TOKEN_ENV = "API_AUTH_TOKEN"
 
 
 def get_conn():
-    return database.get_connection()
+    """Pooled connection generator dependency (P3, item 2.2).
+
+    Yields a pooled connection and GUARANTEES rollback + release in
+    finally — even when a route handler raises. All 32 Depends(get_conn)
+    sites keep their signature: FastAPI treats a generator dependency
+    identically at the call sites.
+
+    Rollback-before-release means an aborted handler's open transaction
+    (locks, vacuum debris, idle-in-transaction) never leaks into the next
+    borrower.
+    """
+    conn = database.get_pooled_connection()
+    try:
+        yield conn
+    finally:
+        database.release_pooled_connection(conn)
 
 
 def ensure_env_loaded():
     env_loader.load_env_file(quiet=True)
+
+
+def auth_required_response():
+    """The canonical 401 response for the auth middleware.
+
+    The middleware sits OUTSIDE the ExceptionMiddleware, so an HTTPException
+    raised there escapes to ServerErrorMiddleware and renders as a bare 500
+    (never the promised 401). Middleware therefore RETURNS this response
+    instead of raising.
+    """
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "invalid or missing API token"},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 def require_auth(token_header):
@@ -30,12 +63,27 @@ def require_auth(token_header):
 
     When API_AUTH_TOKEN is unset, auth is disabled (local dev default).
     Set the env var to enforce the Bearer token check.
+
+    Comparison is timing-safe (hmac.compare_digest on both sides): never
+    `!=`/`==` on secrets — string equality short-circuits on the first
+    differing byte, leaking the token length/prefix through response-time
+    deltas.
+
+    Returns the 401 JSONResponse on failure (never raises — the caller is
+    the @app.middleware handler, outside the exception middleware).
     """
     expected = os.environ.get(API_TOKEN_ENV)
     if not expected:
-        return
-    if token_header != f"Bearer {expected}":
-        raise HTTPException(status_code=401, detail="invalid or missing API token")
+        return None
+    supplied = token_header or ""
+    # compare_digest needs same-type args; len-difference is not a secret
+    # (header sizes are visible anyway), so prefix-compare is safe here.
+    expected_bytes = f"Bearer {expected}".encode("utf-8")
+    supplied_bytes = supplied.encode("utf-8")[:len(expected_bytes)]
+    if not hmac.compare_digest(expected_bytes, supplied_bytes) or \
+            len(supplied_bytes) != len(expected_bytes):
+        return auth_required_response()
+    return None
 
 
 class StatusTransitionError(HTTPException):

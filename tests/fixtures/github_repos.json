@@ -1,0 +1,13 @@
+{
+  "repos": {
+    "demo-owner/demo-static-site": {
+      "base_branch": "main",
+      "files": {
+        "index.html": "<!DOCTYPE html>\n<html>\n<head>\n    <title>Home - Demo Static</title>\n    <meta name=\"description\" content=\"Demo static homepage.\">\n</head>\n<body><h1>Demo</h1></body>\n</html>",
+        "services.html": "<!DOCTYPE html>\n<html>\n<head>\n    <title>Services - Demo Static</title>\n    <meta name=\"description\" content=\"Demo services page.\">\n</head>\n<body><h1>Services</h1></body>\n</html>"
+      },
+      "prs": [],
+      "next_pr_number": 1
+    }
+  }
+}

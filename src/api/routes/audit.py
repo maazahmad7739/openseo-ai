@@ -22,7 +22,7 @@ import os
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
 
@@ -89,13 +89,36 @@ TEST_ADAPTER = None
 TEST_FETCH = None
 
 
-def _resolve_adapter():
+def _resolve_adapter(url=None):
     """The adapter for this request: the injected test double when set,
-    else the real OpenSEO facade (mock mode inside the adapter)."""
+    else the real OpenSEO facade.
+
+    plan/31: when the URL resolves to a connected site, the adapter honors
+    that site's site_config.integration_mode — a live/sandbox site audits
+    with real SERP calls while the rest of the deployment stays mocked.
+    An unresolved URL (checklist mode) keeps the env-driven default.
+    """
     if TEST_ADAPTER is not None:
         return TEST_ADAPTER
     from connectors.openseo import get_openseo_adapter
-    return get_openseo_adapter()
+    from connectors.mode import resolve_site_mode, adapter_mode
+    from audit.site_resolution import resolve_site
+    config = None
+    if url:
+        try:
+            from api.common import get_conn
+            conn = get_conn()
+            try:
+                resolution = resolve_site(conn, url)
+                if resolution.get("site_id"):
+                    config = {"openseo.mode": adapter_mode(
+                        resolve_site_mode(conn, resolution["site_id"]))}
+            finally:
+                conn.rollback()
+                conn.close()
+        except Exception:
+            pass
+    return get_openseo_adapter(config=config)
 
 
 def _resolve_fetch():
@@ -232,8 +255,12 @@ def engine_host(conn, url):
 
 
 @router.post("/audit/live-url")
-def live_url_audit(body: LiveAuditRequest, request=None,
+def live_url_audit(body: LiveAuditRequest, request: Request,
                    conn=Depends(get_conn)):
+    # request: Request (NOT request=None) — FastAPI injects the real
+    # request object here, which is what makes the per-IP token bucket
+    # below actually fire. A `= None` default silently disabled the
+    # limiter (10/hour cap never enforced → unlimited paid SERP calls).
     if RATE_LIMIT_ENABLED and request is not None:
         ip = _client_ip(request)
         if not _rate_limiter.allow(ip):
@@ -245,7 +272,7 @@ def live_url_audit(body: LiveAuditRequest, request=None,
                             refresh=body.refresh,
                             location_code=body.location_code,
                             language_code=body.language_code,
-                            adapter=_resolve_adapter(),
+                            adapter=_resolve_adapter(url=body.url.strip()),
                             fetch_page=_resolve_fetch())
     # normalize the engine's typed errors into the §4.1 contract
     if not result.get("ok"):

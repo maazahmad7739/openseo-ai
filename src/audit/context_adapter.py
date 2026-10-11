@@ -56,29 +56,19 @@ from fixes.generator import (
 
 AUDIT_MODES = ("audit_checklist", "connected")
 
-URL_PATTERN_PAGE_TYPES = (
-    ("/products/", "product"),
-    ("/collections/", "collection"),
-    ("/blog/", "blog"),
-    ("/guides/", "blog"),
-    ("/pages/", "page"),
-    ("/articles/", "blog"),
-)
+# URL-pattern table moved to audit/url_pattern.py (plan/26 Phase 1: the
+# generic sitemap ingestion shares it) — re-exported so every existing
+# importer keeps working unchanged.
+from audit.url_pattern import (URL_PATTERN_PAGE_TYPES,  # noqa: E402,F401
+                               page_type_from_url,
+                               template_from_url)  # noqa: E402,F401
+from audit.structured_data import (  # noqa: E402
+    detect_structured_data_syntax, html_has_structured_data)
 
 
 # ------------------------------------------------------------
 # rec construction (the pinned contract shape)
 # ------------------------------------------------------------
-
-def page_type_from_url(url):
-    """Deterministic page_type from the URL archetype (plan/23 §3.2:
-    '/products/' → 'product'). Unknown patterns -> 'unknown'."""
-    path = (url or "").split("://", 1)[-1]
-    path = path.split("?", 1)[0].split("#", 1)[0].lower()
-    for pattern, page_type in URL_PATTERN_PAGE_TYPES:
-        if pattern in path:
-            return page_type
-    return "unknown"
 
 
 def build_competitor_context(serp_rows):
@@ -341,21 +331,26 @@ def upsert_page_for_site(conn, site_id, snapshot):
             """
             INSERT INTO pages (site_id, url, page_type, title,
                                meta_description, body_html, last_crawled_at,
-                               render_status)
-            VALUES (%s, %s, %s, %s, %s, %s, now(), %s)
+                               render_status, has_structured_data, template)
+            VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s, %s)
             ON CONFLICT (site_id, url_hash) DO UPDATE SET
                 title = EXCLUDED.title,
                 meta_description = EXCLUDED.meta_description,
                 body_html = EXCLUDED.body_html,
                 last_crawled_at = now(),
-                render_status = EXCLUDED.render_status
+                render_status = EXCLUDED.render_status,
+                has_structured_data = COALESCE(
+                    EXCLUDED.has_structured_data, pages.has_structured_data),
+                template = COALESCE(pages.template, EXCLUDED.template)
             RETURNING page_id
             """,
             (site_id, url,
              snapshot.get("page_type") or "unknown",
              snapshot.get("title"), snapshot.get("meta_description"),
              snapshot.get("body_html"),
-             snapshot.get("render_status") or "not_rendered"),
+             snapshot.get("render_status") or "not_rendered",
+             html_has_structured_data(snapshot.get("body_html")),
+             template_from_url(url)),
         )
         page_id = str(cur.fetchone()[0])
     conn.commit()

@@ -383,8 +383,8 @@ def _cluster_control_metrics(conn, site_id, cluster_id, start_date, end_date):
     with conn.cursor() as cur:
         cur.execute(
             "SELECT recommended_page_type, primary_keyword FROM keyword_clusters "
-            "WHERE cluster_id = %s",
-            (cluster_id,),
+            "WHERE cluster_id = %s AND site_id = %s",
+            (cluster_id, site_id),
         )
         row = cur.fetchone()
     if not row or not row[0]:

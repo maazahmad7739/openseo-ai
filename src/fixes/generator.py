@@ -75,14 +75,43 @@ class LlmDraftError(Exception):
     """Typed LLM drafting failure (config, network, schema) — caller falls
     back to the deterministic drafter."""
 
-
 def _llm_client():
     """Resolve the configured provider; raises LlmDraftError (soft) on any
-    construction problem (missing credentials, import failure)."""
+    construction problem (missing credentials, mock mode, import failure).
+
+    Returns the provider-agnostic facade (`agents.llm_client.FallbackClient`):
+    Ollama Cloud primary, Gemini fallback. A primary outage or a lapsed
+    subscription therefore degrades to the fallback instead of failing the
+    whole drafting run, and a fix is never lost to provider availability.
+
+    MOCK MODE IS FAIL-CLOSED, and this is load-bearing rather than tidy.
+    With credentials present in the environment, an offline suite that
+    reached here built a real client and dialled the provider: the drafting
+    tests hung for the full client timeout on a live `ollama.com` round trip
+    while printing "no real network calls will be made". Every connector in
+    this codebase already refuses to touch the network offline (Shopify and
+    Framer mock gates, SHOPIFY_MOCK_MODE, *_LIVE_WRITES); drafting was the
+    one path that did not, purely because its constructor is lazy and a
+    missing key had been masking the call. Raising LlmDraftError is the
+    documented soft-fail signal, so the caller falls back to deterministic
+    drafting and the pipeline still produces a fix row.
+    """
     try:
-        from agents.ollama_client import OllamaClient
-        return OllamaClient()
-    except Exception as exc:  # OllamaConfigError + anything unexpected
+        from connectors.mode import resolve_mode
+        if resolve_mode(None, ()) in ("mock", "import"):
+            raise LlmDraftError(
+                "llm drafting disabled: adapter is in mock/import mode")
+    except LlmDraftError:
+        raise
+    except Exception:
+        # Mode resolution is advisory here: if it cannot be resolved, fall
+        # through and let normal credential handling decide. Never let the
+        # guard itself mask a real configuration error.
+        pass
+    try:
+        from agents.llm_client import FallbackClient
+        return FallbackClient()
+    except Exception as exc:  # ConfigError + anything unexpected
         raise LlmDraftError(f"llm client unavailable: {exc}") from None
 
 
@@ -596,6 +625,40 @@ def content_outline_gaps(rec, body_text=None):
 # Decision logic inputs
 # ------------------------------------------------------------
 
+def _site_platform(conn, site_id):
+    """site_config.platform for the site (plan/26 Phase 2).
+
+    Legacy deployments whose site_config predates plan/26 (no platform
+    column) resolve as 'shopify' — the pre-Framer default."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(platform, 'shopify') "
+                "FROM site_config WHERE site_id = %s",
+                (site_id,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        conn.rollback()
+        return "shopify"
+    return (row[0] if row else "shopify") or "shopify"
+
+
+def _require_shopify_platform(conn, rec, surface):
+    """FixNotSupported for non-shopify platforms on a Shopify-only surface.
+
+    plan/26 Phase 2: collection_create / publish-state / status_failure
+    redirect write targets are Shopify-shaped (GIDs, CollectionInput,
+    urlRedirectCreate). Content platforms (framer) get an honest typed
+    plan_only refusal, never a mis-targeted row."""
+    platform = _site_platform(conn, rec["site_id"])
+    rec["platform"] = platform
+    if platform != "shopify":
+        raise FixNotSupported(
+            f"{surface} is a Shopify v1 write surface — plan_only for "
+            f"platform {platform!r} (plan/26 Phase 2)")
+
+
 def _outline_gaps(rec, body_text=None):
     """Heading-grounded outline gaps with graceful degradation (Task 4).
 
@@ -638,6 +701,14 @@ def load_decision_inputs(conn, recommendation_id):
         raise FixNotSupported(
             f"fix generation covers improve_page/consolidate/technical_fix/"
             f"create_page (got {rec['action_type']!r})")
+    # plan/31 fail-closed: internal-link suggestions are SUGGESTION-ONLY.
+    # No write adapter exists for link placement — approving one must
+    # never mint a generated_fixes row, no matter the action_type.
+    if rec["generator"] == "internal_link":
+        raise FixNotSupported(
+            "internal_link recommendations are suggestion-only (plan/31): "
+            "link placement needs a human/editorial decision — no auto-fix "
+            "surface exists; implement manually and mark implemented")
     if rec["status"] not in ("approved", "in_progress"):
         raise FixGenerationError(
             f"fix generation requires an approved recommendation "
@@ -647,11 +718,15 @@ def load_decision_inputs(conn, recommendation_id):
     # a missing collection has no target_url, only proposed_url. The
     # proposed_url becomes target_url for the rest of the pipeline
     # (conflict guard + uq_fixes_active_per_target stay uniform).
+    # plan/26 Phase 2: collection_create is a Shopify surface (member
+    # GIDs, CollectionInput) — non-shopify platforms refuse BEFORE the
+    # catalogue_coverage join (plan_only, honest gate).
     if rec["action_type"] == "create_page":
         if not rec.get("proposed_url"):
             raise FixNotSupported(
                 "create_page row has no proposed_url — a missing-page "
                 "fix cannot target a guessed URL")
+        _require_shopify_platform(conn, rec, "collection_create")
         rec["target_url"] = rec["proposed_url"]
         with conn.cursor() as cur:
             cur.execute(
@@ -708,6 +783,14 @@ def load_decision_inputs(conn, recommendation_id):
         rec["primary_keyword"] = None
         rec["intent"] = None
         rec["competitor_context"] = {}
+        # plan/26 Phase 2: publish-state + status_failure redirect write
+        # targets are Shopify-only; non-shopify platforms refuse (rec
+        # still loads — the page row join below is platform-agnostic).
+        # plan/27: netlify platforms load too — their technical fixes
+        # route to the PR path (generate_netlify_technical_fix).
+        if _site_platform(conn, rec["site_id"]) != "netlify":
+            _require_shopify_platform(conn, rec,
+                                      "publish_state_technical_fix")
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT r.evidence_json, "
@@ -770,6 +853,9 @@ def load_decision_inputs(conn, recommendation_id):
         rec["domain"] = (drow[0] if drow else None)
         rec["primary_keyword"] = rec["intent"] = None
         rec["competitor_context"] = {}
+        # plan/26 Phase 2: the redirect write path (urlRedirectCreate) is
+        # Shopify-only; framer platforms refuse (typed plan_only).
+        _require_shopify_platform(conn, rec, "redirect_consolidate")
         return rec
 
     with conn.cursor() as cur:
@@ -789,11 +875,14 @@ def load_decision_inputs(conn, recommendation_id):
         rec["page_type"] = page[4]
         rec["body_html"] = page[5]
         rec["body_text"] = _body_to_text(page[5])
+        # plan/26 Phase 2: platform rides on the rec for write-target
+        # routing (shopify = GID targets; framer = URL targets).
+        rec["platform"] = _site_platform(conn, rec["site_id"])
         if rec["cluster_id"]:
             cur.execute(
                 "SELECT primary_keyword, intent FROM keyword_clusters "
-                "WHERE cluster_id = %s",
-                (rec["cluster_id"],),
+                "WHERE cluster_id = %s AND site_id = %s",
+                (rec["cluster_id"], rec["site_id"]),
             )
             krow = cur.fetchone()
             rec["primary_keyword"] = krow[0] if krow else None
@@ -808,6 +897,20 @@ def load_decision_inputs(conn, recommendation_id):
     # to the prior keyword-only behavior.
     rec["competitor_context"] = load_competitor_context(
         conn, rec["site_id"], rec["cluster_id"], rec["target_url"])
+    # plan/27 multi-signal recs: when the rec carries a cluster-independent
+    # target keyword in its evidence (e.g. the CTR-gap rec's
+    # 'target_keyword'), promote it to primary_keyword so the deterministic
+    # drafting pipeline can front the term (a NULL keyword otherwise yields
+    # a no-op title draft that equals the live value).
+    evidence = rec.get("evidence")
+    if not isinstance(evidence, dict):
+        try:
+            evidence = json.loads(evidence) if isinstance(evidence, str) \
+                else {}
+        except (TypeError, ValueError):
+            evidence = {}
+    if not rec.get("primary_keyword") and evidence.get("target_keyword"):
+        rec["primary_keyword"] = evidence["target_keyword"]
     return rec
 
 
@@ -1065,6 +1168,23 @@ def _token_overlap(a, b):
     return len(shared) / min(len(ta), len(tb))
 
 
+def _tokens_contained(haystack, needle):
+    """True when `needle`'s content tokens appear, in order and unbroken,
+    inside `haystack`'s ('api widget pro' contains 'api widget').
+
+    Stricter than `_token_overlap`: overlap is a bag-of-tokens ratio and
+    fires on any shared words, whereas this asks the specific question the
+    spam-stacking guard needs — would spelling `needle` out again just
+    repeat text the other string already carries?
+    """
+    n = _content_tokens(needle)
+    h = _content_tokens(haystack)
+    if not n or not h or len(n) > len(h):
+        return False
+    span = len(n)
+    return any(h[i:i + span] == n for i in range(len(h) - span + 1))
+
+
 def _dedupe_repeated_tail(text, source_text):
     """Drop trailing words of `text` that literally repeat the opening words
     of `source_text` ('Buy Complete Snowboard: The Complete Snowboard' is
@@ -1118,27 +1238,103 @@ def _front_keyword(text, keyword):
     rest_tokens = _content_tokens(rest)
     if rest_tokens[:len(kw_first)] == kw_first:
         return text
+    # The page title's words can also sit INSIDE the keyword rather than
+    # match it exactly ('Api Widget' vs keyword 'api widget pro'). Fronting
+    # then prints the phrase twice ('Api Widget Pro: Api Widget') and the
+    # validator rejects the draft, so no product-name-bearing keyword can
+    # ever produce a title fix. The keyword already carries the product
+    # name, so lead alone is both correct and complete — this is the case
+    # _merge_keyword_product_title's docstring describes.
+    if rest_tokens and len(rest_tokens) <= len(kw_first):
+        span = len(rest_tokens)
+        for i in range(len(kw_first) - span + 1):
+            if kw_first[i:i + span] == rest_tokens:
+                return lead
     return f"{lead}: {rest}" if rest else lead
 
 
-def _collection_title(keyword, rec):
-    """Collection-framed title for the create path (plan/25): keyword +
-    intent-framing suffix, title-cased, floor/ceiling respected. Facts stay
-    cluster-owned (the suffix is page-type phrasing, not a claim)."""
+# Framing suffixes are PAGE-TYPE phrasing, never a product claim, so they
+# stay outside the cluster/fact-checking path. Keyed on page_type first
+# because "Shop the Full Range" is wrong copy for a single product: it
+# promises a catalogue the page may not have. intent only breaks ties
+# within a page type.
+_FRAMING_SUFFIXES = {
+    "product": {
+        "commercial": "Shop Direct",
+        "informational": "Product Guide",
+        "_default": "Product Details",
+    },
+    "collection": {
+        "commercial": "Shop the Full Range",
+        "informational": "The Complete Guide",
+        "_default": "The Full Range",
+    },
+}
+
+
+def _framing_suffix(rec):
+    """Page-type-appropriate framing phrase for a below-floor title.
+
+    Falls back to the collection set when page_type is unknown, which is
+    the behaviour that predates product support and the safer default:
+    a collection phrase on an unrecognised page type is vaguer than a
+    product phrase on a collection.
+    """
+    table = _FRAMING_SUFFIXES.get((rec.get("page_type") or "").lower())
+    if table is None:
+        table = _FRAMING_SUFFIXES["collection"]
+    intent = (rec.get("intent") or "").lower()
+    return table.get(intent, table["_default"])
+
+
+def _framed_title(keyword, rec):
+    """Keyword + page-type framing, title-cased, floor/ceiling respected.
+
+    plan/25 §2 step 2 wants the collection create path framed this way; the
+    same construction rescues a below-floor merged title on an existing
+    page, where concatenating instead would repeat the product name.
+    """
     kw = (keyword or "").strip()
     if not kw:
         return None
-    intent = (rec.get("intent") or "").lower()
-    if intent == "commercial":
-        suffix = "Shop the Full Range"
-    elif intent == "informational":
-        suffix = "The Complete Guide"
-    else:
-        suffix = "The Full Range"
-    candidate = f"{kw.title()} — {suffix}"
+    candidate = f"{kw.title()} — {_framing_suffix(rec)}"
     if len(candidate) > TITLE_MAX_CHARS:
         candidate = candidate[:TITLE_MAX_CHARS - 1].rstrip() + "…"
     return candidate if len(candidate) >= TITLE_MIN_CHARS else None
+
+
+def _nav_clean_body_text(body_text):
+    """Strip nav boilerplate that pollutes scraped body text (plan/27 live
+    finding: currency switcher 'INR USD EUR GBP AED' leaked into the meta
+    draft -> 5 ALL-CAPS words -> validator rejection). Removes the currency
+    switcher + adjacent nav labels from the head of scraped text. Never
+    raises."""
+    import re
+    text = body_text or ""
+    currency_codes = ("INR", "USD", "EUR", "GBP", "AED")
+    # find the currency-switcher cluster near the head of the text
+    for marker in currency_codes:
+        idx = text.find(marker)
+        if idx != -1 and idx <= 400:
+            # drop through the whole currency cluster (all five codes)
+            end = idx
+            for code in currency_codes:
+                j = text.find(code, idx)
+                if j != -1:
+                    end = max(end, j + len(code))
+            text = text[end:].lstrip(" -–—|()$(₹€£د.إ)0123456789 ")
+            break
+    # drop remaining leading pure-nav label sequence (bounded pass)
+    nav_labels = ("Home", "Services", "Results", "Why Us", "Testimonials",
+                  "Pricing", "Contact")
+    changed = True
+    while changed:
+        changed = False
+        for label in nav_labels:
+            if text.startswith(label):
+                text = text[len(label):].lstrip(" -–—|")
+                changed = True
+    return text
 
 
 def draft_title(rec):
@@ -1177,8 +1373,16 @@ def draft_title(rec):
             # keyword, a missing page's identity) merges below the char
             # floor. Fall through to a collection-framed title instead of
             # concatenating 'Kw: kw' (the validator rejects the repeat).
-            if page_title.lower() == keyword.lower():
-                candidate = _collection_title(keyword, rec)
+            #
+            # Same trap, wider trigger: the keyword CONTAINS the product
+            # name ('api widget pro' for the page 'Api Widget'). The merged
+            # candidate is correct but can still land under the floor, and
+            # dropping through would concatenate 'Api Widget Pro: Api
+            # Widget' — the repeated-product-name rejection this path
+            # exists to avoid. Frame it instead of stacking the phrase.
+            if (page_title.lower() == keyword.lower()
+                    or _tokens_contained(keyword, page_title)):
+                candidate = _framed_title(keyword, rec)
                 if candidate:
                     return candidate
 
@@ -1284,7 +1488,7 @@ def draft_meta_description(rec):
     page_title = (rec.get("page_title") or "").strip()
     keyword = (rec.get("primary_keyword") or "").strip()
     page_type = (rec.get("page_type") or "").strip()
-    body_text = (rec.get("body_text") or "").strip()
+    body_text = _nav_clean_body_text((rec.get("body_text") or "").strip())
     if not page_title:
         return None
 
@@ -1509,14 +1713,23 @@ def generate_meta_fix_for_recommendation(conn, recommendation_id,
             "duplicate meta description: another page on this site already "
             "uses the proposed description — draft rejected (plan/21 §2.2)")
 
-    gid = rec.get("shopify_gid")
-    if not gid:
+    # plan/26 Phase 2: platform-routed write target. Shopify keeps the GID
+    # requirement verbatim; framer targets the canonical URL (no GID).
+    # plan/27: netlify routes to netlify.title_meta_rewrite (repo path).
+    sub_type, target_entity_ref, framer_payload = _write_target(
+        conn, rec, "description")
+    if sub_type is None and framer_payload is None and rec.get(
+            "platform") == "netlify":
+        raise FixNotSupported(
+            "site_config.github_repo not set — netlify meta fix cannot "
+            "target a repo (plan/27)")
+    if sub_type == "seo.description" and not target_entity_ref:
         raise FixNotSupported(
             "target page has no shopify_gid — meta fix cannot target "
             "Shopify GraphQL")
 
     conflict = check_conflict(conn, rec["site_id"], rec["target_url"],
-                              "seo.description")
+                              sub_type)
     if conflict:
         with conn.cursor() as cur:
             cur.execute(
@@ -1529,9 +1742,17 @@ def generate_meta_fix_for_recommendation(conn, recommendation_id,
                     "diff": diff}
         raise PolicyBlocked("active_fix_conflict", {"conflicting_fix_id": conflict})
 
-    payload = build_meta_payload(gid, new_meta)
-    diff = [{"field": "seo.description", "old_value": gate_meta,
-             "new_value": new_meta}]
+    if framer_payload is not None:
+        payload = dict(framer_payload)
+        payload["variables"]["description"] = new_meta
+        # plan/27: a netlify payload also carries the live title (the HTML
+        # <title>+<meta> pair is ONE edit unit — the sibling title comes
+        # from the fresh executor snapshot at pickup, never a stale value
+        # minted here; None is a legal placeholder the adapter replaces).
+        if payload.get("surface") == "netlify":
+            payload["variables"]["title"] = None
+    else:
+        payload = build_meta_payload(target_entity_ref, new_meta)
     # SERP grounding evidence rides on the payload for console/audit:
     # framing pattern used + content outline gaps (§2.2 content row) +
     # drafting source (llm vs deterministic) for the audit trail.
@@ -1550,6 +1771,12 @@ def generate_meta_fix_for_recommendation(conn, recommendation_id,
     payload["grounding"] = grounding
     # 'agent' = LLM-drafted value; 'deterministic' = baseline drafter.
     generation_source = "agent" if meta_source == "llm" else generation_source
+    # plan/27: netlify diff entries key on the snapshot key the executor
+    # reads (meta.description), not the sub_type.
+    netlify_platform = rec.get("platform") == "netlify"
+    diff_field = "meta.description" if netlify_platform else sub_type
+    diff = [{"field": diff_field, "old_value": gate_meta,
+             "new_value": new_meta}]
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1558,14 +1785,15 @@ def generate_meta_fix_for_recommendation(conn, recommendation_id,
                     (recommendation_id, site_id, action_type, sub_type, target_url,
                      target_entity_ref, payload_json, diff_json, generation_source,
                      status, risk_tier)
-                VALUES (%s, %s, %s, 'seo.description', %s, %s, %s::jsonb, %s::jsonb,
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
                         %s, 'generated', 'medium')
                 ON CONFLICT (site_id, target_url, COALESCE(sub_type, ''))
                     WHERE status IN ('generated','approved','queued') DO NOTHING
                 RETURNING fix_id, status
                 """,
                 (rec["recommendation_id"], rec["site_id"], rec["action_type"],
-                 rec["target_url"], gid, json.dumps(payload), json.dumps(diff),
+                 sub_type, rec["target_url"], target_entity_ref,
+                 json.dumps(payload), json.dumps(diff),
                  generation_source),
             )
             row = cur.fetchone()
@@ -1579,10 +1807,10 @@ def generate_meta_fix_for_recommendation(conn, recommendation_id,
     with conn.cursor() as cur:
         cur.execute(
             "SELECT fix_id, status FROM generated_fixes "
-            "WHERE recommendation_id = %s AND sub_type = 'seo.description' "
+            "WHERE recommendation_id = %s AND sub_type = %s "
             "AND status IN ('generated','approved','queued') "
             "ORDER BY created_at DESC LIMIT 1",
-            (rec["recommendation_id"],),
+            (rec["recommendation_id"], sub_type),
         )
         existing = cur.fetchone()
     if not existing:
@@ -1626,6 +1854,83 @@ def build_meta_payload(gid, new_meta):
 
 def build_diff(old_value, new_value):
     return [{"field": "seo.title", "old_value": old_value, "new_value": new_value}]
+
+
+# ------------------------------------------------------------
+# Platform-routed write targets (plan/26 Phase 2 + plan/27)
+# ------------------------------------------------------------
+
+FRAMER_UPDATE_DOC_URL = "framer://updatePageMeta"
+
+NETLIFY_MUTATION = "netlify.gitPr"
+
+
+def _netlify_write_target(conn, rec, field):
+    """plan/27: netlify.title_meta_rewrite target + payload.
+
+    target_entity_ref = the repo-relative file path resolved from the
+    canonical URL via site_config.github_root_dir; the payload carries
+    the PR action + the page URL. Returns the sub_type/target/payload
+    triple, or (None, None, None) when the site row lacks the GitHub
+    repo binding (typed refusal at the generation site)."""
+    from connectors.github_static import file_path_for_url
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT github_repo, github_branch, github_root_dir "
+            "FROM site_config WHERE site_id = %s",
+            (rec["site_id"],),
+        )
+        row = cur.fetchone()
+    if not row or not row[0]:
+        return None, None, None
+    root_dir = row[2] or ""
+    file_path = file_path_for_url(rec["target_url"], root_dir=root_dir)
+    if not file_path:
+        return None, None, None
+    sub_type = "netlify.title_meta_rewrite"
+    payload = {
+        "mutation": NETLIFY_MUTATION,
+        "variables": {"page_url": rec["target_url"],
+                      "file_path": file_path,
+                      "action": "title_meta_rewrite"},
+        "surface": "netlify",
+    }
+    # the new value rides at insert time (the drafting step fills it)
+    payload["variables"]["title"] = None
+    payload["variables"]["description"] = None
+    return sub_type, file_path, payload
+
+
+def _write_target(conn, rec, field):  # noqa: F811 (signature extended in plan/27)
+    """Platform-routed (sub_type, target_entity_ref, payload) triple.
+
+    shopify: sub_type 'seo.title'/'seo.description', target = the GID,
+    payload = the registry-verified productUpdate shape (unchanged).
+    framer:  sub_type 'framer.title'/'framer.description', target = the
+    canonical URL (no id minting, no id drift); the adapter resolves the
+    live page by URL at snapshot time. The payload carries the Framer
+    surface tag; Phase 3's adapters validate it.
+    netlify (plan/27): sub_type 'netlify.title_meta_rewrite', target =
+    the repo-relative file path; the payload carries the PR surface tag
+    + the title_meta_rewrite action. Both meta fields are written in ONE
+    PR (the HTML <title>+<meta> pair is a single edit unit — no
+    whole-object hazard like the API surfaces).
+    """
+    if rec.get("platform", "shopify") == "netlify":
+        return _netlify_write_target(conn, rec, field)
+    if rec.get("platform", "shopify") == "framer":
+        sub_type = "framer.title" if field == "title" else "framer.description"
+        payload = {
+            "mutation": "framer.updatePageMeta",
+            "variables": {"page_ref": rec["target_url"],
+                          "field": "title" if field == "title"
+                          else "description"},
+            "surface": "framer",
+        }
+        return sub_type, rec["target_url"], payload
+    if field == "title":
+        return "seo.title", rec.get("shopify_gid"), None
+    return "seo.description", rec.get("shopify_gid"), None
 
 
 # ------------------------------------------------------------
@@ -1862,6 +2167,44 @@ def verify_survivor_strength(conn, rec):
     return grounding
 
 
+def _existing_redirect_map(conn, site_id):
+    """Existing 301 rules for one site: {path: target} from generated_fixes.
+
+    Included: rows whose rule is LIVE or pending (status applied/queued/
+    approved/generated). Excluded: failed (never went live), expired
+    (stale-diff expiry means it never wrote), reverted (undone), and
+    rollback_of rows (revert audit rows copy status='applied' but represent
+    a DELETION — including them would resurrect deleted rules).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload_json FROM generated_fixes
+            WHERE site_id = %s AND sub_type = 'redirect'
+              AND status IN ('generated', 'approved', 'queued', 'applied')
+              AND rollback_of IS NULL
+            """,
+            (site_id,),
+        )
+        rows = cur.fetchall()
+    redirect_map = {}
+    for (payload_json,) in rows:
+        if isinstance(payload_json, str):
+            try:
+                payload_json = json.loads(payload_json)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(payload_json, dict):
+            continue
+        redirect = ((payload_json.get("variables") or {}).get("urlRedirect")
+                    or {})
+        path = (redirect.get("path") or "").strip()
+        target = (redirect.get("target") or "").strip()
+        if path and target:
+            redirect_map[path] = target
+    return redirect_map
+
+
 def generate_redirect_fix_for_recommendation(conn, rec, generation_source="deterministic"):
     """Approved consolidate recommendation -> sub_type='redirect' fix row.
 
@@ -1897,6 +2240,31 @@ def generate_redirect_fix_for_recommendation(conn, rec, generation_source="deter
             f"(source={source_path!r}, survivor={survivor_path!r}) — no fix row")
     if source_path == survivor_path:
         raise FixNotSupported("redirect source == survivor (no-op loop)")
+
+    # Chain/loop guard (plan/21 §2.5 closure): resolve the new rule against
+    # the site's existing 301 mappings BEFORE minting the payload. A target
+    # that already redirects onward flattens to the final destination
+    # (A -> B -> C  =>  A -> C); a chain that loops back to the source (or
+    # whose destination is itself broken) aborts generation, typed.
+    from fixes.redirect_graph import (RedirectCycleError,
+                                      resolve_redirect_chain)
+    existing_map = _existing_redirect_map(conn, rec["site_id"])
+    try:
+        resolved = resolve_redirect_chain(source_path, survivor_path,
+                                          existing_map)
+    except RedirectCycleError as cycle_exc:
+        raise FixNotSupported(
+            f"redirect chain guard: {cycle_exc.reason} — refusing to mint "
+            f"a 301 that would create a multi-hop chain or loop "
+            f"({cycle_exc.detail.get('chain', '')}); flagged for manual "
+            f"review (manual_review=True)") from cycle_exc
+    if resolved["hops"]:
+        # flattening happened: the minted rule targets the chain's final
+        # destination directly; the resolution trail rides in grounding.
+        original_target_path = survivor_path
+        survivor_path = resolved["target"]
+    else:
+        original_target_path = None
 
     sharpened_grounding = {}
     if rec.get("route") != "status_failure":
@@ -1952,6 +2320,12 @@ def generate_redirect_fix_for_recommendation(conn, rec, generation_source="deter
            if rec.get("route") == "status_failure" else {}),
         **({"sharpened_direction": sharpened_grounding}
            if sharpened_grounding else {}),
+        **({"redirect_chain": {"flattened": True,
+                               "hops": resolved["hops"],
+                               "original_target_path": original_target_path,
+                               "resolved_target_path": resolved["target"],
+                               "chain": resolved["chain"]}}
+           if resolved["hops"] else {}),
     }
     diff = [{"field": "redirect", "old_value": None,
              "new_value": f"{source_path} -> {survivor_path}"}]
@@ -2000,6 +2374,579 @@ def generate_redirect_fix_for_recommendation(conn, rec, generation_source="deter
 # The hook: recommendation -> generated_fixes row (status='generated')
 # ------------------------------------------------------------
 
+def _insert_netlify_technical_fix(conn, rec, sub_type, variables,
+                                  diff_entries, generation_source):
+    """Shared INSERT for netlify.* technical fixes (plan/27).
+
+    Idempotent regeneration via uq_fixes_active_per_target; 409 on a
+    conflicting active fix owned by a DIFFERENT recommendation (same
+    contract as the title/meta paths)."""
+    payload = {
+        "mutation": NETLIFY_MUTATION,
+        "variables": dict(variables),
+        "surface": "netlify",
+    }
+    conflict = check_conflict(conn, rec["site_id"], rec["target_url"],
+                              sub_type)
+    if conflict:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT recommendation_id FROM generated_fixes "
+                "WHERE fix_id = %s", (conflict,))
+            row = cur.fetchone()
+        if row and str(row[0]) == str(rec["recommendation_id"]):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT fix_id, status, diff_json FROM generated_fixes "
+                    "WHERE fix_id = %s", (conflict,))
+                existing = cur.fetchone()
+            diff = existing[2] if not isinstance(existing[2], str) \
+                else json.loads(existing[2])
+            return {"fix_id": str(existing[0]), "status": existing[1],
+                    "created": False, "diff": diff}
+        raise PolicyBlocked("active_fix_conflict",
+                            {"conflicting_fix_id": conflict})
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO generated_fixes
+                    (recommendation_id, site_id, action_type, sub_type,
+                     target_url, target_entity_ref, payload_json, diff_json,
+                     generation_source, status, risk_tier)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
+                        %s, 'generated', %s)
+                ON CONFLICT (site_id, target_url, COALESCE(sub_type, ''))
+                    WHERE status IN ('generated','approved','queued')
+                    DO NOTHING
+                RETURNING fix_id, status
+                """,
+                (rec["recommendation_id"], rec["site_id"],
+                 rec["action_type"], sub_type, rec["target_url"],
+                 variables["file_path"], json.dumps(payload),
+                 json.dumps(diff_entries), generation_source,
+                 "medium" if sub_type != ADAPTER_NETLIFY_NOINDEX_SUB
+                 else "high"),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if row:
+        return {"fix_id": str(row[0]), "status": row[1], "created": True,
+                "diff": diff_entries, "payload": payload}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT fix_id, status FROM generated_fixes "
+            "WHERE recommendation_id = %s AND sub_type = %s "
+            "AND status IN ('generated','approved','queued') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (rec["recommendation_id"], sub_type),
+        )
+        existing = cur.fetchone()
+    if not existing:
+        raise FixGenerationError(
+            "insert conflicted but no active netlify fix found")
+    return {"fix_id": str(existing[0]), "status": existing[1],
+            "created": False, "diff": diff_entries, "payload": payload}
+
+
+ADAPTER_NETLIFY_NOINDEX_SUB = "netlify.noindex"
+ADAPTER_NETLIFY_STRUCTURED_SUB = "netlify.structured_data"
+
+
+def _netlify_date_today():
+    import datetime
+    return datetime.date.today().isoformat()
+
+
+# Page-archetype → JSON-LD @type routing (deterministic from the URL path).
+# Each block is Rich-Results-safe: only properties Google actually consumes.
+NETLIFY_SCHEMA_TYPES = (
+    # (url substring, schema factory name)
+    ("/services", "service"),
+    ("/pricing", "offer"),
+    ("/contact", "contact"),
+    ("/results", "itemlist"),
+    ("/testimonials", "webpage"),
+    ("/why-us", "aboutpage"),
+    ("/blog/", "blogposting"),
+    ("/", "webpage"),   # fallback LAST
+)
+
+
+def _site_base_url(target_url, site_domain):
+    """Resolve the client's base URL for schema output — never hardcoded.
+
+    Precedence (plan/27: structured data must ground on the CLIENT's site):
+      1. scheme + host parsed from the target_url (audit payload /
+         execution context) — the page being written IS on the client's
+         site, so its origin is authoritative;
+      2. site_config.domain (site context), https-prefixed;
+      3. neither available -> FixNotSupported (typed validation error).
+    """
+    from urllib.parse import urlparse
+    if target_url:
+        parts = urlparse(target_url)
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+    if site_domain:
+        domain = str(site_domain).strip()
+        if domain:
+            if "://" not in domain:
+                domain = "https://" + domain
+            parts = urlparse(domain)
+            # urlparse is lenient (spaces in netloc parse "fine"); demand a
+            # hostname shape before trusting it — anything else refuses.
+            hostname = (parts.hostname or "")
+            if parts.scheme and parts.netloc and re.fullmatch(
+                    r"[A-Za-z0-9._~-]+(:\d+)?|\[[0-9A-Fa-f:]+\](:\d+)?",
+                    parts.netloc) and hostname and "." in hostname \
+                    and " " not in parts.netloc:
+                return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+            raise FixNotSupported(
+                f"site_config.domain is not a usable URL origin: "
+                f"{site_domain!r}")
+    raise FixNotSupported(
+        "cannot resolve a base URL for JSON-LD: target_url carries no "
+        "scheme/host and site_config.domain is empty")
+
+
+def _breadcrumb_jsonld(target_url, site_name, site_domain=None):
+    """BreadcrumbList from the URL path (deterministic; every content page)."""
+    from urllib.parse import urlparse
+    base_url = _site_base_url(target_url, site_domain)
+    path = urlparse(target_url).path or "/"
+    segments = [s for s in path.split("/") if s and "." not in s]
+    items = [{"@type": "ListItem", "position": 1, "name": "Home",
+              "item": base_url}]
+    for i, seg in enumerate(segments, start=2):
+        label = seg.replace("-", " ").replace(".html", "").title()
+        items.append({"@type": "ListItem", "position": i, "name": label,
+                      "item": target_url})
+    return {"@type": "BreadcrumbList", "itemListElement": items}
+
+
+def _page_specific_jsonld(target_url, file_path, site_name, page_title, h1,
+                          site_domain=None, business_profile=None):
+    """Deterministic, page-archetype-routed JSON-LD (plan/27 §5).
+
+    Routing table (URL path substring → primary schema type):
+      homepage        → Organization + WebSite (knowledge-graph anchors)
+      /services.html  → Service (professional service) + BreadcrumbList
+      /contact.html   → ContactPage + Organization + BreadcrumbList
+      /pricing.html   → WebPage + Offer + BreadcrumbList
+      /results.html   → ItemList (case studies) + BreadcrumbList
+      /why-us.html    → AboutPage + BreadcrumbList
+      default         → WebPage + BreadcrumbList
+
+    The name/url/publisher fields ground on REAL page data (page_title,
+    h1) — never guessed. The @graph form keeps multi-type blocks valid
+    per schema.org (one @context, one node with @graph). URLs ground on
+    the client's own origin (target_url host, else site_config.domain);
+    a missing site_name is a typed refusal — the Organization block is
+    never fabricated with a placeholder name.
+
+    plan/30 — /services + /pricing ground on the client's BUSINESS
+    PROFILE (business_profile dict: business_service_types,
+    business_areas_served, business_offer_name):
+      * /services: serviceType omitted when business_service_types is
+        empty (a Service block with agency serviceType copy is never
+        emitted); areaServed omitted when business_areas_served is empty —
+        both are optional on schema.org Service, so absence omits the
+        field rather than inventing an agency region;
+      * /pricing: the Offer block is emitted ONLY when the client
+        profile names an offering (business_offer_name or first service
+        type) — a page title is not a truthful Offer name, and there is
+        no agency-default Offer.
+    """
+    from urllib.parse import urlparse
+    base_url = _site_base_url(target_url, site_domain)
+    path = urlparse(target_url).path.lower()
+    if not (site_name or "").strip():
+        raise FixNotSupported(
+            "site_config.site_name missing — refusing to inject a "
+            "placeholder Organization name into JSON-LD")
+    org_name = site_name
+    today = _netlify_date_today()
+    business_profile = business_profile or {}
+    business_service_types = [
+        s for s in (business_profile.get("business_service_types") or [])
+        if (s or "").strip()]
+    business_areas_served = [
+        s for s in (business_profile.get("business_areas_served") or [])
+        if (s or "").strip()]
+    business_offer_name = (
+        business_profile.get("business_offer_name") or "").strip() or None
+
+    # shared building blocks
+    org_block = {"@type": "Organization", "name": org_name,
+                 "url": base_url}
+    breadcrumb = _breadcrumb_jsonld(target_url, org_name,
+                                    site_domain=site_domain)
+
+    if path == "/" or path == "":
+        # homepage: Organization + WebSite (the knowledge-graph anchor)
+        graph = [
+            {"@type": "Organization", "name": org_name,
+             "url": base_url,
+             "sameAs": []},
+            {"@type": "WebSite", "name": org_name,
+             "url": base_url},
+        ]
+        schema_type = "Organization"
+    elif "/contact" in path:
+        graph = [
+            {"@type": "ContactPage", "name": page_title or "Contact",
+             "url": target_url,
+             "about": org_block},
+            breadcrumb,
+        ]
+        schema_type = "ContactPage"
+    elif "/pricing" in path:
+        # plan/30: the Offer block grounds on the client's business profile
+        # (business_offer_name > first service type); a page title is not a
+        # truthful Offer name. Without a profile there is NO agency-default
+        # Offer — the block is omitted (WebPage + breadcrumb still emit).
+        graph = [
+            {"@type": "WebPage", "name": page_title or "Pricing",
+             "url": target_url,
+             "about": org_block},
+            breadcrumb,
+        ]
+        offer_name = business_offer_name or (
+            business_service_types[0] if business_service_types else None)
+        if offer_name:
+            graph.insert(1, {"@type": "Offer", "itemOffered": {
+                "@type": "Service", "name": offer_name}})
+        schema_type = "WebPage"
+    elif "/services" in path:
+        # plan/30: Service grounds on the client's business profile.
+        # serviceType emitted only when business_service_types is
+        # populated; areaServed only when business_areas_served is
+        # populated (both optional on schema.org Service). Neither field
+        # ever falls back to agency copy.
+        service_block = {"@type": "Service", "name": page_title or "Services",
+                         "url": target_url,
+                         "provider": org_block}
+        if business_service_types:
+            service_block["serviceType"] = list(business_service_types)
+        if business_areas_served:
+            service_block["areaServed"] = list(business_areas_served)
+        graph = [
+            service_block,
+            breadcrumb,
+        ]
+        schema_type = "Service"
+    elif "/results" in path or "/testimonials" in path:
+        graph = [
+            {"@type": "WebPage", "name": page_title or "Results",
+             "url": target_url, "about": org_block},
+            breadcrumb,
+        ]
+        schema_type = "WebPage"
+    elif "/why-us" in path:
+        graph = [
+            {"@type": "AboutPage", "name": page_title or "About",
+             "url": target_url, "about": org_block},
+            breadcrumb,
+        ]
+        schema_type = "AboutPage"
+    else:
+        graph = [
+            {"@type": "WebPage", "name": page_title or target_url,
+             "url": target_url, "about": org_block},
+            breadcrumb,
+        ]
+        schema_type = "WebPage"
+
+    jsonld = json.dumps({"@context": "https://schema.org",
+                         "@graph": graph}, ensure_ascii=False)
+    # stash the breadcrumb for callers that want it separately
+    _page_specific_jsonld.last_breadcrumb = breadcrumb
+    return jsonld
+
+
+# plan/32: the generator's crawl-evidence floor, re-asserted at fix time.
+# Kept byte-identical to plan/03's `crawl_document_floor` on purpose: a page
+# that the generator would not flag must not be auto-fixed either.
+_MIN_CRAWL_BODY_BYTES = 500
+
+
+def _netlify_site_context(conn, site_id):
+    """Repo/org grounding for netlify technical fixes, or a typed refusal."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT github_repo, github_root_dir, site_name, domain, "
+            "business_service_types, business_areas_served, "
+            "business_offer_name "
+            "FROM site_config WHERE site_id = %s",
+            (site_id,),
+        )
+        row = cur.fetchone()
+    if not row or not row[0]:
+        raise FixNotSupported(
+            "site_config.github_repo not set — netlify technical fix "
+            "cannot target a repo (plan/27)")
+    return {
+        "repo_root": row[1] or "",
+        "site_name": row[2],
+        "site_domain": row[3],
+        "business_profile": {
+            "business_service_types": row[4] or [],
+            "business_areas_served": row[5] or [],
+            "business_offer_name": row[6],
+        },
+    }
+
+
+def _structured_data_fix_for_page(conn, rec, ctx, generation_source):
+    """One netlify.structured_data fix for a single page. plan/32.
+
+    Split out of generate_netlify_technical_fix so the grouped path can mint
+    one fix per affected page with identical per-page content, rather than a
+    second, subtly different copy of the JSON-LD construction.
+    """
+    from connectors.github_static import file_path_for_url
+
+    file_path = file_path_for_url(rec["target_url"], root_dir=ctx["repo_root"])
+    if not file_path:
+        raise FixNotSupported(
+            "cannot resolve a repo file path for the target URL")
+    jsonld = _page_specific_jsonld(
+        target_url=rec["target_url"],
+        file_path=file_path,
+        site_name=ctx["site_name"],
+        page_title=rec.get("page_title"),
+        h1=rec.get("h1"),
+        site_domain=ctx["site_domain"],
+        business_profile=ctx["business_profile"],
+    )
+    # plan/28 diff label: the @graph form carries the types INSIDE the
+    # graph (top-level @type is None) — name every schema type injected
+    parsed = json.loads(jsonld)
+    graph = parsed.get("@graph") or ([parsed] if parsed.get("@type") else [])
+    schema_types = [g.get("@type") for g in graph if g.get("@type")]
+    schema_label = " + ".join(schema_types) if schema_types else "WebPage"
+    variables = {"page_url": rec["target_url"], "file_path": file_path,
+                 "action": "structured_data_inject", "jsonld": jsonld}
+    diff_entries = [{"field": "meta.jsonld", "old_value": None,
+                     "new_value": f"{schema_label} JSON-LD block"}]
+    result = _insert_netlify_technical_fix(
+        conn, rec, ADAPTER_NETLIFY_STRUCTURED_SUB, variables,
+        diff_entries, generation_source)
+    result["target_url"] = rec["target_url"]
+    return result
+
+
+def _grouped_structured_data_members(conn, rec, template):
+    """Every page still verifiably missing schema on `template`, at fix time.
+
+    Deliberately re-queries instead of trusting the recommendation's stored
+    `sample_urls`, and re-applies every generator guard:
+
+      * sample_urls is capped at 5 for display, so a 40-page template would
+        otherwise be "fixed" on 5 pages and silently left broken on 35;
+      * a page can be re-crawled between generation and approval, and one
+        that has since GAINED schema must not be rewritten;
+      * `pages.template` is now also written by locally-fetched pages, so a
+        stale or hand-edited recommendation cannot widen the blast radius
+        beyond the commercial page types this rule ever covered.
+
+    Ordered by URL so a regenerated batch is deterministic.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT url, title, h1
+            FROM pages
+            WHERE site_id = %s
+              AND template = %s
+              AND has_structured_data = false
+              AND page_type IN ('product', 'collection')
+              AND status_code = 200
+              AND indexable = true
+              AND last_crawled_at IS NOT NULL
+              AND body_html IS NOT NULL
+              AND length(body_html) >= %s
+            ORDER BY url ASC
+            """,
+            (rec["site_id"], template, _MIN_CRAWL_BODY_BYTES),
+        )
+        return [{"url": r[0], "page_title": r[1], "h1": r[2]}
+                for r in cur.fetchall()]
+
+
+def _generate_grouped_structured_data_fixes(conn, rec, ctx, generation_source):
+    """plan/32: expand ONE grouped recommendation into a fix per affected page.
+
+    The whole point of grouping: one template-wide JSON-LD defect is one
+    operator decision but N file edits. Generating a single fix would leave
+    every sibling page broken while telling the operator the issue was
+    handled, which is worse than the 18 duplicate recommendations it replaced.
+
+    Per-page failures are isolated rather than fatal — one URL that cannot
+    resolve to a repo path, or that collides with an unrelated active fix,
+    must not discard the fixes for the rest of the template. Those pages are
+    returned in `skipped` so the shortfall is visible instead of silent.
+    """
+    template = rec["evidence"].get("template")
+    members = _grouped_structured_data_members(conn, rec, template)
+    if not members:
+        raise FixNotSupported(
+            f"no pages on template {template!r} still verifiably lack "
+            f"structured data — the group is already resolved (re-crawled, "
+            f"or de-listed since the recommendation was generated)")
+
+    fixes, skipped = [], []
+    for member in members:
+        member_rec = dict(rec)
+        member_rec["target_url"] = member["url"]
+        member_rec["page_title"] = member["page_title"]
+        member_rec["h1"] = member["h1"]
+        try:
+            fixes.append(_structured_data_fix_for_page(
+                conn, member_rec, ctx, generation_source))
+        except (PolicyBlocked, FixNotSupported) as exc:
+            conn.rollback()
+            reason = getattr(exc, "reason", None) or str(exc)
+            skipped.append({"url": member["url"], "reason": reason})
+        except Exception:
+            conn.rollback()
+            raise
+
+    if not fixes:
+        # Nothing landed. Surface the reason rather than reporting success.
+        raise FixGenerationError(
+            f"grouped structured-data fix produced 0 fixes for template "
+            f"{template!r}: {json.dumps(skipped)[:500]}")
+
+    head = fixes[0]
+    head["fix_ids"] = [f["fix_id"] for f in fixes]
+    head["group"] = {
+        "template": template,
+        "template_inferred": bool(rec["evidence"].get("template_inferred")),
+        "page_count": len(members),
+        "fix_count": len(fixes),
+        "skipped": skipped,
+        "target_urls": [f["target_url"] for f in fixes],
+    }
+    return head
+
+
+def generate_netlify_technical_fix(conn, rec, generation_source
+                                   ="deterministic"):
+    """plan/27: technical_fix -> netlify.structured_data / netlify.noindex.
+
+    Routing (deterministic, evidence-gated):
+      * issue_type structured_data_failure + has_structured_data=false
+        -> netlify.structured_data with a deterministic Organization/
+        WebPage JSON-LD (schema.org minimum-viable, grounded on the
+        site_name + page). plan/32: when the recommendation is grouped by
+        template (evidence.scope='template'), ONE fix is minted per
+        affected page instead of one for the representative URL;
+      * issue_type not_indexable where the page carries GSC clicks but is
+        robots-blocked by a meta directive -> netlify.noindex is NOT a fix
+        (removal, not insertion) — refused; noindex_tag fixes are minted
+        ONLY from the agent's explicit recommendation for zero-value
+        duplicates: evidence must carry the 'noindex_intentional' flag;
+      * everything else -> FixNotSupported (typed plan_only).
+
+    target = the repo-relative file path (github_root_dir honored);
+    missing github_repo binding refuses (typed)."""
+    from connectors.github_static import file_path_for_url
+
+    evidence = rec.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        try:
+            evidence = json.loads(evidence) if isinstance(evidence, str) \
+                else {}
+        except (TypeError, ValueError):
+            evidence = {}
+    issue_type = evidence.get("issue_type") or rec.get("primary_keyword")
+
+    ctx = _netlify_site_context(conn, rec["site_id"])
+
+    if issue_type == "structured_data_failure":
+        # plan/32: template-grouped recommendations expand to one fix per
+        # affected page; per-URL recommendations keep the single-fix path.
+        if evidence.get("scope") == "template" and evidence.get("template"):
+            return _generate_grouped_structured_data_fixes(
+                conn, rec, ctx, generation_source)
+        return _structured_data_fix_for_page(conn, rec, ctx, generation_source)
+
+    file_path = file_path_for_url(rec["target_url"], root_dir=ctx["repo_root"])
+    if not file_path:
+        raise FixNotSupported(
+            "cannot resolve a repo file path for the target URL")
+
+    if issue_type == "not_indexable" and evidence.get("noindex_intentional"):
+        variables = {"page_url": rec["target_url"], "file_path": file_path,
+                     "action": "noindex_tag", "noindex": True}
+        diff_entries = [{"field": "meta.robots", "old_value": None,
+                         "new_value": "noindex, follow"}]
+        return _insert_netlify_technical_fix(
+            conn, rec, ADAPTER_NETLIFY_NOINDEX_SUB, variables,
+            diff_entries, generation_source)
+
+    raise FixNotSupported(
+        f"netlify technical_fix applies to structured_data_failure (or an "
+        f"explicit noindex_intentional not_indexable) only — got "
+        f"{issue_type!r} (plan_only surface, plan/27)")
+
+
+def generate_netlify_canonical_fix(conn, rec, generation_source
+                                   ="deterministic"):
+    """plan/28: technical_fix -> netlify.canonical_tag (self-referencing
+    <link rel="canonical"> injection via the GitHub-PR engine).
+
+    Guards (deterministic, crawl-gated):
+      * the page's crawled canonical_url must be NULL (a page with a
+        canonical already refuses — never a duplicate-canonical PR);
+      * the href is ALWAYS the page's own absolute URL (self-referencing
+        by construction — never a guessed cross-page canonical);
+      * missing github_repo binding refuses (typed).
+    """
+    from connectors.github_static import file_path_for_url
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT github_repo, github_root_dir, canonical_url "
+            "FROM site_config s "
+            "LEFT JOIN pages p ON p.site_id = s.site_id "
+            "AND p.url = %s "
+            "WHERE s.site_id = %s",
+            (rec["target_url"], rec["site_id"]),
+        )
+        row = cur.fetchone()
+    if not row or not row[0]:
+        raise FixNotSupported(
+            "site_config.github_repo not set — netlify canonical fix "
+            "cannot target a repo (plan/28)")
+    repo_root = row[1] or ""
+    crawled_canonical = row[2]
+    if crawled_canonical:
+        raise FixNotSupported(
+            f"page already carries a canonical ({crawled_canonical}) — "
+            "no duplicate-canonical fix (plan/28 no-op guard)")
+    from connectors.github_static import file_path_for_url
+    file_path = file_path_for_url(rec["target_url"], root_dir=repo_root)
+    if not file_path:
+        raise FixNotSupported(
+            "cannot resolve a repo file path for the target URL")
+    # self-referencing by construction: the canonical href IS the page URL
+    variables = {"page_url": rec["target_url"], "file_path": file_path,
+                 "action": "canonical_tag",
+                 "canonical_url": rec["target_url"]}
+    diff_entries = [{"field": "meta.canonical", "old_value": None,
+                     "new_value": f'<link rel="canonical" '
+                                  f'href="{rec["target_url"]}">'}]
+    return _insert_netlify_technical_fix(
+        conn, rec, "netlify.canonical_tag", variables,
+        diff_entries, generation_source)
+
+
 def generate_fix_for_recommendation(conn, recommendation_id,
                                     generation_source="deterministic",
                                     live_seo_title=None):
@@ -2027,6 +2974,13 @@ def generate_fix_for_recommendation(conn, recommendation_id,
         return generate_redirect_fix_for_recommendation(conn, rec,
                                                         generation_source=generation_source)
     if rec.get("action_type") == "technical_fix":
+        # plan/27: netlify platforms route technical fixes to the PR path
+        # (structured data / noindex); publish-state + redirect writes are
+        # Shopify-shaped and refuse there.
+        if rec.get("platform", _site_platform(conn, rec["site_id"])) \
+                == "netlify":
+            return generate_netlify_technical_fix(
+                conn, rec, generation_source=generation_source)
         evidence = rec.get("evidence") or {}
         issue_type = evidence.get("issue_type")
         if issue_type == "status_failure":
@@ -2095,7 +3049,10 @@ def generate_fix_for_recommendation(conn, recommendation_id,
         raise FixNotSupported("draft failed validation constraints — no fix row")
     problems = validate_title_draft(new_title, rec["primary_keyword"],
                                     product_title=rec["page_title"],
-                                    intent=intent, site_name=site_name)
+                                    intent=intent, site_name=site_name,
+                                    inherit_null_rule=(
+                                        rec.get("platform", "shopify")
+                                        == "shopify"))
     if problems:
         raise FixNotSupported(f"draft rejected by validator: {problems}")
 
@@ -2107,14 +3064,22 @@ def generate_fix_for_recommendation(conn, recommendation_id,
             "duplicate title: another page on this site already uses the "
             "proposed title — draft rejected (plan/21 §2.1 check 4)")
 
-    # Executor requires a GID; collections GIDs land with the §1.4 patch.
-    gid = rec.get("shopify_gid")
-    if not gid:
+    # plan/26 Phase 2: platform-routed write target. Shopify keeps the GID
+    # requirement verbatim; framer targets the canonical URL (no GID).
+    # plan/27: netlify routes to netlify.title_meta_rewrite (repo path).
+    sub_type, target_entity_ref, framer_payload = _write_target(
+        conn, rec, "title")
+    if sub_type is None and framer_payload is None and rec.get(
+            "platform") == "netlify":
+        raise FixNotSupported(
+            "site_config.github_repo not set — netlify title fix cannot "
+            "target a repo (plan/27)")
+    if sub_type == "seo.title" and not target_entity_ref:
         raise FixNotSupported(
             "target page has no shopify_gid (collection GID ingestion is a "
             "§1.4 prerequisite) — fix cannot target Shopify GraphQL")
 
-    conflict = check_conflict(conn, rec["site_id"], rec["target_url"], "seo.title")
+    conflict = check_conflict(conn, rec["site_id"], rec["target_url"], sub_type)
     if conflict:
         # Same-recommendation conflict = idempotent regeneration (return the
         # existing active row); a DIFFERENT recommendation's active fix is a
@@ -2133,7 +3098,16 @@ def generate_fix_for_recommendation(conn, recommendation_id,
                     "diff": diff}
         raise PolicyBlocked("active_fix_conflict", {"conflicting_fix_id": conflict})
 
-    payload = build_payload(gid, new_title)
+    if framer_payload is not None:
+        payload = dict(framer_payload)
+        payload["variables"]["title"] = new_title
+        # plan/27: a netlify payload needs BOTH fields (the HTML title+meta
+        # pair is one edit unit); the description is replaced from the
+        # fresh executor snapshot at pickup (None here is a placeholder).
+        if payload.get("surface") == "netlify":
+            payload["variables"]["description"] = None
+    else:
+        payload = build_payload(target_entity_ref, new_title)
     # SERP grounding evidence rides on the payload (console/audit): the
     # framing pattern applied + competitor sample size. Content outline
     # gaps feed §2.2's content row from the title path too. The drafting
@@ -2155,7 +3129,13 @@ def generate_fix_for_recommendation(conn, recommendation_id,
     # old_value = the value the gate judged (live seo.title when a fresh
     # read supplied it) — the executor's stale-diff guard compares the live
     # snapshot against exactly this value.
-    diff = build_diff(gate_title, new_title)
+    # plan/26 Phase 2: the diff field MUST name the SNAPSHOT key the
+    # executor's stale-diff guard looks up (framer: 'meta.title';
+    # plan/27 netlify: 'meta.title' — the snapshot key the guard reads).
+    netlify_platform = rec.get("platform") == "netlify"
+    diff_field = "meta.title" if netlify_platform else sub_type
+    diff = [{"field": diff_field, "old_value": gate_title,
+             "new_value": new_title}]
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -2164,14 +3144,15 @@ def generate_fix_for_recommendation(conn, recommendation_id,
                     (recommendation_id, site_id, action_type, sub_type, target_url,
                      target_entity_ref, payload_json, diff_json, generation_source,
                      status, risk_tier)
-                VALUES (%s, %s, %s, 'seo.title', %s, %s, %s::jsonb, %s::jsonb,
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
                         %s, 'generated', 'low')
                 ON CONFLICT (site_id, target_url, COALESCE(sub_type, ''))
                     WHERE status IN ('generated','approved','queued') DO NOTHING
                 RETURNING fix_id, status
                 """,
                 (rec["recommendation_id"], rec["site_id"], rec["action_type"],
-                 rec["target_url"], gid, json.dumps(payload), json.dumps(diff),
+                 sub_type, rec["target_url"], target_entity_ref,
+                 json.dumps(payload), json.dumps(diff),
                  generation_source),
             )
             row = cur.fetchone()
@@ -2186,16 +3167,18 @@ def generate_fix_for_recommendation(conn, recommendation_id,
     with conn.cursor() as cur:
         cur.execute(
             "SELECT fix_id, status FROM generated_fixes "
-            "WHERE recommendation_id = %s AND sub_type = 'seo.title' "
+            "WHERE recommendation_id = %s AND sub_type = %s "
             "AND status IN ('generated','approved','queued') "
             "ORDER BY created_at DESC LIMIT 1",
-            (rec["recommendation_id"],),
+            (rec["recommendation_id"], sub_type),
         )
         existing = cur.fetchone()
     if not existing:
         raise FixGenerationError("insert conflicted but no active row found")
     return {"fix_id": str(existing[0]), "status": existing[1], "created": False,
             "diff": diff, "payload": payload}
+
+
 # ------------------------------------------------------------
 # Publish-state fix generation (Phase 3, plan/21 §2.3 #1/#3):
 # sitemap_index_mismatch / not_indexable where the blocking mechanism is
@@ -2290,10 +3273,16 @@ def generate_publish_fix_for_recommendation(conn, rec,
         shop_domain = rec.get("shop_domain")
         token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
         publication_id = None
-        if shop_domain and token:
-            client = ShopifyGraphQLClient(shop_domain=shop_domain,
-                                          access_token=token)
-            publication_id = resolve_publication_id(conn, client)
+        # Always consult the system_config cache first; it needs no
+        # credentials. Gating the whole call on `shop_domain and token` made
+        # a correctly cached publication id unreachable offline, so the
+        # publish path refused with an error claiming the cache was empty
+        # when it had simply never been read. resolve_publication_id short
+        # circuits on the cache and returns None before any query when
+        # credentials are absent, so this cannot reach the network itself.
+        client = ShopifyGraphQLClient(shop_domain=shop_domain,
+                                      access_token=token)
+        publication_id = resolve_publication_id(conn, client)
         if not publication_id:
             raise FixNotSupported(
                 "no publication id resolved (system_config cache empty and "
@@ -2598,6 +3587,7 @@ def _grounding_corpus_text(conn, rec):
                   SELECT 'gid://shopify/Product/'
                          || unnest(cc.matching_product_ids))
             WHERE cc.site_id = %s AND cc.cluster_id = %s
+            ORDER BY p.url
             LIMIT 20
             """,
             (rec["site_id"], rec["cluster_id"]),

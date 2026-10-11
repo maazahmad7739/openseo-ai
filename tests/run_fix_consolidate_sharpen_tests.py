@@ -433,9 +433,20 @@ def test_wrong_direction_regression(conn):
             generate_fix_for_recommendation(conn, reversed_rec)
             allok &= check("reversed direction rejected", False, "no exception")
         except FixNotSupported as exc:
-            allok &= check("reversed direction rejected",
-                           "wrong-direction guard" in str(exc)
-                           and "OUT-EARNS" in str(exc), str(exc))
+            # The chain/loop guard (plan/21 §2.5 closure) runs BEFORE the
+            # relative-strength guard: when the first fix is already
+            # generated, the reversed candidate is literally a cycle
+            # (weaker -> stronger minted, candidate wants stronger -> weaker)
+            # and is refused as "redirect chain guard: redirect_loop_source".
+            # When no prior rule exists, the relative-strength guard fires
+            # ("wrong-direction guard" ... "OUT-EARNS"). Both are typed,
+            # deterministic refusals of the winner -> loser direction.
+            allok &= check(
+                "reversed direction rejected",
+                ("wrong-direction guard" in str(exc) and "OUT-EARNS" in str(exc))
+                or ("redirect chain guard" in str(exc)
+                    and "redirect_loop_source" in str(exc)),
+                str(exc))
     finally:
         cleanup(conn, ids)
     return allok

@@ -261,6 +261,11 @@ class _AuditHTMLParser(HTMLParser):
     Lenient by design: real-world HTML is malformed. Content of
     script/style/noscript/svg/template is dropped; heading text is
     whitespace-collapsed; document order preserved; H1–H3 only.
+
+    plan/31 link-graph ingestion: <a href> tags inside <body> are captured
+    as raw {href, text, rel} records in document order (text = the anchor's
+    data content, href/rel unvalidated — resolution happens downstream in
+    audit.link_ingest). Dedup happens at ingestion, not here.
     """
 
     def __init__(self):
@@ -269,6 +274,7 @@ class _AuditHTMLParser(HTMLParser):
         self.meta_description = None
         self.headings = []            # [(level, text)] document order
         self.body_html_parts = []
+        self.links = []               # [{href, text, rel}] document order
         # state
         self._in_title = False
         self._title_buf = []
@@ -277,6 +283,7 @@ class _AuditHTMLParser(HTMLParser):
         self._heading = None
         self._heading_buf = []
         self._skip_depth = 0
+        self._in_anchor = None        # {"href":..., "rel":..., "parts":[]}
 
     # -- meta capture (shared by starttag + startendtag) -----------------
     def _capture_meta(self, attrs):
@@ -308,6 +315,15 @@ class _AuditHTMLParser(HTMLParser):
         if tag == "meta":
             self._capture_meta(attrs)
             return
+        if tag == "a" and self._in_anchor is None:
+            lowered = {k.lower(): (v or "") for k, v in attrs or []}
+            href = (lowered.get("href") or "").strip()
+            if href:
+                self._in_anchor = {"href": href,
+                                   "rel": (lowered.get("rel") or "").strip()
+                                   or None,
+                                   "parts": []}
+            return
         if tag in ("h1", "h2", "h3") and self._heading is None:
             self._heading = tag
             self._heading_buf = []
@@ -318,6 +334,14 @@ class _AuditHTMLParser(HTMLParser):
             return
         if tag == "meta":
             self._capture_meta(attrs)
+            return
+        if tag == "a" and self._in_anchor is None:
+            lowered = {k.lower(): (v or "") for k, v in attrs or []}
+            href = (lowered.get("href") or "").strip()
+            if href:
+                self.links.append({"href": href, "text": None,
+                                   "rel": (lowered.get("rel") or "").strip()
+                                   or None})
             return
         if self._in_body and tag != "body":
             self.body_html_parts.append(
@@ -339,6 +363,13 @@ class _AuditHTMLParser(HTMLParser):
                 self.title = joined or None
             self._title_done = True
             return
+        if tag == "a" and self._in_anchor is not None:
+            text = " ".join("".join(self._in_anchor["parts"]).split())
+            self.links.append({"href": self._in_anchor["href"],
+                               "text": text or None,
+                               "rel": self._in_anchor["rel"]})
+            self._in_anchor = None
+            return
         if tag in ("h1", "h2", "h3") and self._heading == tag:
             text = " ".join("".join(self._heading_buf).split())
             if text:
@@ -356,6 +387,8 @@ class _AuditHTMLParser(HTMLParser):
             self._title_buf.append(data)
         if self._heading:
             self._heading_buf.append(data)
+        if self._in_anchor is not None:
+            self._in_anchor["parts"].append(data)
         if self._in_body:
             self.body_html_parts.append(data)
 
@@ -412,11 +445,15 @@ def parse_page_html(html):
     """HTML → audit-page-snapshot fields.
 
     Returns {title, meta_description, h1, heading_outline, body_html,
-             body_text, render_status}. render_status is ALWAYS
+             body_text, render_status, links}. render_status is ALWAYS
     'not_rendered' in v1 (plain GET; no headless browser — plan/23 §1.4).
+    links: [{href, text, rel}] raw <a> records in document order
+    (plan/31 link-graph ingestion; href unvalidated — downstream
+    resolution in audit.link_ingest).
     """
     html = html or ""
     title, meta, headings, body_html = None, None, [], ""
+    links = []
     parser = _AuditHTMLParser()
     try:
         parser.feed(html)
@@ -425,6 +462,7 @@ def parse_page_html(html):
         meta = parser.meta_description
         headings = parser.headings
         body_html = "".join(parser.body_html_parts).strip()
+        links = parser.links
     except Exception:
         title, meta, headings, body_html = _fallback_extract(html)
 
@@ -440,6 +478,7 @@ def parse_page_html(html):
         "body_html": body_html or None,
         "body_text": body_text or None,
         "render_status": "not_rendered",
+        "links": links,
     }
 
 

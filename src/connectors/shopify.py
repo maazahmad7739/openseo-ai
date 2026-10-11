@@ -284,7 +284,10 @@ def _is_mock_mode(cfg):
     explicit = cfg.get("shopify.mock_mode")
     if explicit is not None:
         return bool(explicit)
-    return resolve_mode(cfg.get("shopify.mode"), (MOCK_MODE_ENV,)) == "mock"
+    mode = resolve_mode(cfg.get("shopify.mode"), (MOCK_MODE_ENV,))
+    # plan/31: 'import' = offline (no fixtures served; sync skips fetches).
+    # 'sandbox'/'live' = real API calls (sandbox = test credentials).
+    return mode in ("mock", "import")
 
 
 # ============================================================
@@ -516,7 +519,7 @@ class ShopifyGraphQLClient:
     """
 
     def __init__(self, shop_domain=None, access_token=None, api_version=None,
-                 timeout=HTTP_TIMEOUT_SECONDS):
+                 timeout=HTTP_TIMEOUT_SECONDS, mock_mode=None):
         resolved_version = api_version or os.environ.get("SHOPIFY_API_VERSION") \
             or PINNED_API_VERSION_DEFAULT
         self.shop_domain = shop_domain
@@ -525,6 +528,12 @@ class ShopifyGraphQLClient:
         self.url = ("https://" + (shop_domain or "mock-store") +
                     GRAPHQL_PATH.format(version=resolved_version))
         self.throttle = _ThrottleTracker()
+        # Same resolution as ShopifyRestAdapter, so a MOCK-mode site cannot
+        # reach the network through this class either. probe_scopes() is the
+        # only method that consults it; _post() is a write and is expected to
+        # be gated by the write policy above it.
+        self.mock_mode = bool(mock_mode) if mock_mode is not None else (
+            resolve_mode(None, (MOCK_MODE_ENV,)) in ("mock", "import"))
 
     def _post(self, query, variables=None):
         if not self.shop_domain or not self.access_token:
@@ -595,10 +604,25 @@ class ShopifyGraphQLClient:
 
         Returns {ok, scopes: [...], shop_domain} or {ok: False, error} —
         Phase 0 §7.1 probe; never contains the token itself.
+
+        Mock mode short-circuits this. Every other call in this adapter
+        goes through _call(), which returns a fixture when self.mock_mode is
+        set; this method reached urlopen() directly and so was the one live
+        request a MOCK-mode client could still make. That is not merely a
+        wasted round-trip: the probe sits on the fix-executor's write path,
+        so a seeded-credential test suite blocked on a real Shopify host for
+        the full 60s timeout while printing "no real network calls will be
+        made". Framer and GitHub already fail closed on their equivalent
+        probes (FRAMER_LIVE_WRITES / NETLIFY_LIVE_WRITES); this matches them.
         """
         if not self.shop_domain or not self.access_token:
             return {"ok": False, "error": "no_credentials",
                     "detail": "probe needs SHOPIFY_DOMAIN + SHOPIFY_ACCESS_TOKEN"}
+        # Credential guard first: it is local, and "no credentials" is the
+        # more actionable diagnosis than "mock mode" when both apply.
+        if self.mock_mode:
+            return {"ok": False, "error": "mock_mode",
+                    "detail": "scope probe skipped: adapter is in mock mode"}
         url = f"https://{self.shop_domain}{ACCESS_SCOPES_PATH}"
         req = urllib.request.Request(url, method="GET")
         req.add_header("X-Shopify-Access-Token", self.access_token)
@@ -712,6 +736,12 @@ def required_scopes_for_sub_types(sub_types):
         "collection_create": ["collectionCreate", "publishablePublish"],  # plan/25: create + publish (union)
         "product_create": ["productCreate"],
         "page_create": ["pageCreate"],
+        # plan/26 Phase 3: framer.* sub_types have NO Shopify scope material.
+        # Explicit [] entries keep the registry-drift guard intact for
+        # Shopify sub_types while the executor's probe dispatches framer.*
+        # to the Framer auth probe (never into this mapping).
+        "framer.title": [],
+        "framer.description": [],
     }
     scopes = set()
     for st in sub_types or []:
