@@ -418,6 +418,133 @@ def run_offpage_draft_trigger(site_id, rec_id: str = None,
             "outcomes": outcomes}
 
 
+@router.get("/run-corpus")
+def run_offpage_corpus(site_id, conn=Depends(get_conn)):
+    """Real corpus step (run_live_offpage stage 1, as an operator action).
+
+    a) Refreshes the tenant's product/collection pages with REAL crawled
+       copy (robots-respecting; site_fetch normalisation).
+    b) Wires the tenant's own pages into each off-page leg's cluster with
+       the stand-in relevance scorer (keyword overlap between the cluster's
+       query text and the page's URL/title) — the same non-semantic
+       scoring stand-in the pipeline runs while the embedding contract is
+       undecided. The grounding loader ranks on these rows.
+    """
+    import re as _re
+
+    import site_fetch as fetcher
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT cluster_id, primary_keyword, keywords "
+            "FROM keyword_clusters WHERE site_id = %s "
+            "AND cluster_id IN (SELECT cluster_id FROM recommendations "
+            "WHERE site_id = %s AND generator = 'offpage_community' "
+            "AND status = 'raw' AND cluster_id IS NOT NULL)",
+            (site_id, site_id))
+        clusters = cur.fetchall()
+        cur.execute(
+            "SELECT page_id, url, title FROM pages "
+            "WHERE site_id = %s AND page_type IN ('product', 'collection') "
+            "ORDER BY url", (site_id,))
+        typed = cur.fetchall()
+    # a) real copy refresh (small, known set; robots respected).
+    refreshed = []
+    robots = None
+    origin = None
+    for _pid, url, _title in typed:
+        parsed = urlparse(url)
+        if parsed.netloc and origin is None:
+            origin = f"https://{parsed.netloc}/"
+    if origin:
+        try:
+            robots = fetcher.fetch_robots_txt(origin)
+        except Exception:
+            robots = None
+    for page_id, url, _title in typed:
+        if not fetcher._robots_ok_for_url(robots, url):
+            refreshed.append({"url": url, "status": "robots_disallow"})
+            continue
+        resp = fetcher._get(url)
+        if not resp.get("ok"):
+            refreshed.append({"url": url, "status": resp.get("reason")})
+            continue
+        try:
+            body_html, text, h1 = fetcher._page_body_from_html(
+                resp.get("body") or "")
+            if body_html and text and len(text) >= 300:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE pages SET body_html = %s WHERE "
+                        "page_id = %s AND site_id = %s",
+                        (body_html, page_id, site_id))
+                refreshed.append({"url": url,
+                                  "status": f"loaded({len(text)}c)"})
+            else:
+                refreshed.append({"url": url,
+                                  "status": f"thin({len(text or '')}c)"})
+        except Exception as exc:
+            refreshed.append({"url": url,
+                              "status": f"error:{type(exc).__name__}"})
+        conn.commit()
+
+    # b) stand-in relevance wiring per leg cluster.
+    wired = 0
+
+    def _tokens(text):
+        return set(_re.findall(r"[a-z0-9]+", (text or "").lower())) - {
+            "the", "a", "an", "of", "for", "and", "to", "in", "on", "is",
+            "are", "it", "you", "your", "we", "our", "with", "that", "this",
+            "at", "by", "from", "or", "as", "be", "their", "them", "they"}
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM page_query_match_scores "
+                    "WHERE site_id = %s", (site_id,))
+        _before = cur.fetchone()[0]
+        for cluster_id, primary, keywords_list in clusters:
+            demand = _tokens(primary or "") | (
+                _tokens(" ".join(keywords_list))
+                if isinstance(keywords_list, (list, tuple)) else set())
+            for page_id, url, title in typed:
+                page_tokens = _tokens(url) | _tokens(title or "")
+                overlap = len(demand & page_tokens) / max(len(demand), 1)
+                if overlap < 0.2:
+                    continue
+                intent = min(0.95, 0.55 + overlap * 0.4)
+                cat = min(0.95, 0.50 + overlap * 0.45)
+                gsc = min(0.80, 0.30 + overlap * 0.5)
+                sem = min(0.90, 0.35 + overlap * 0.55)
+                cur.execute(
+                    "SELECT 1 FROM page_query_match_scores "
+                    "WHERE site_id = %s AND page_id = %s AND cluster_id = %s",
+                    (site_id, page_id, cluster_id))
+                if cur.fetchone():
+                    cur.execute(
+                        "UPDATE page_query_match_scores SET "
+                        "intent_page_type_score = %s, "
+                        "catalogue_match_score = %s, gsc_evidence_score = %s, "
+                        "semantic_content_score = %s "
+                        "WHERE site_id = %s AND page_id = %s "
+                        "AND cluster_id = %s",
+                        (intent, cat, gsc, sem, site_id, page_id, cluster_id))
+                else:
+                    cur.execute(
+                        "INSERT INTO page_query_match_scores (site_id, "
+                        "page_id, cluster_id, intent_page_type_score, "
+                        "catalogue_match_score, gsc_evidence_score, "
+                        "semantic_content_score) VALUES (%s, %s, %s, "
+                        "%s, %s, %s, %s)",
+                        (site_id, page_id, cluster_id, intent, cat, gsc, sem))
+                wired += 1
+        conn.commit()
+        cur.execute("SELECT count(*) FROM page_query_match_scores "
+                    "WHERE site_id = %s", (site_id,))
+        _after = cur.fetchone()[0]
+    return {"ok": True, "site_id": site_id, "corpus_refresh": refreshed,
+            "wiring": {"rows_before": _before, "rows_after": _after,
+                       "writes": wired}}
+
+
 @router.get("/queue", response_model=OffpageQueueOut)
 def get_offpage_queue(site_id, conn=Depends(get_conn)):
     """Active off-page task window (capped 5, oldest pending first).
