@@ -143,15 +143,17 @@ def _dataforseo_seam(site, platform, query, limit):
                 "data_source": "live", "results": [],
                 "http_status": None, "latency_ms": None,
                 "error": f"adapter_config: {type(exc).__name__}: {exc}"}
-    # check_budget(conn, service) takes the caller's connection; the job's
-    # per-leg conn is not threaded through the seam contract, so the gate
-    # reads the budget cap on its own (read-only) connection.
+    # check_budget(conn, service) takes the caller's connection (never
+    # raised here): the leg's conn is not threaded through the seam
+    # contract, so the gate reads the weekly cap on its own (read-only)
+    # connection. Budget rows carry (spend, cap, is_over, is_warn, warn)
+    # or None when no cap is configured.
     import db as _dbmod
     try:
         budget_conn = _dbmod.get_connection()
         try:
-            allowed, reason = costlog.check_budget(
-                budget_conn, service="openseo_serp")
+            budget = costlog.check_budget(budget_conn,
+                                          service="openseo_serp")
         finally:
             budget_conn.close()
     except Exception as exc:
@@ -159,6 +161,12 @@ def _dataforseo_seam(site, platform, query, limit):
                 "data_source": "live", "results": [],
                 "http_status": None, "latency_ms": None,
                 "error": f"budget_gate_db: {type(exc).__name__}: {exc}"}
+    if budget is not None and budget[2]:
+        return {"ok": False, "provider": SEAM_PROVIDERS["dataforseo"],
+                "data_source": "live", "results": [],
+                "http_status": None, "latency_ms": None,
+                "error": (f"budget_gate: weekly spend ${budget[0]:.2f} "
+                          f">= cap ${budget[1]:.2f} for openseo_serp")}
     if not allowed:
         return {"ok": False, "provider": SEAM_PROVIDERS["dataforseo"],
                 "data_source": "live", "results": [],
