@@ -714,46 +714,61 @@ def adopt_discovered_community(site_id, platform,
                     "ON CONFLICT (account_id, community_id) DO UPDATE SET "
                     "standing = 'participating', assessed_at = now()",
                     (site_id, account_id, item["community_id"]))
-        # 4. Purge placeholder legs (drafts -> recs -> threads) when asked.
-        if purge_like:
-            for pattern in [p.strip() for p in purge_like.split(",") if p.strip()]:
-                # platform lives on offpage_communities (threads carry no
-                # platform column): resolve matching threads via the join.
-                cur.execute(
-                    "DELETE FROM offpage_drafts d USING recommendations r "
-                    "WHERE d.recommendation_id = r.recommendation_id "
-                    "AND d.site_id = r.site_id "
-                    "AND r.offpage_thread_id IN ("
-                    "  SELECT t.thread_id FROM offpage_threads t"
-                    "  JOIN offpage_communities c"
-                    "    ON c.community_id = t.community_id"
-                    "   AND c.site_id = t.site_id"
-                    "  WHERE t.site_id = %s AND c.platform = %s"
-                    "    AND t.thread_url LIKE %s)",
-                    (site_id, platform, f"%{pattern}%"))
-                cur.execute(
-                    "DELETE FROM offpage_account_communities ac "
-                    "USING offpage_threads t "
-                    "WHERE ac.community_id = t.community_id "
-                    "AND t.site_id = ac.site_id "
-                    "AND t.site_id = %s AND t.thread_url LIKE %s",
-                    (site_id, f"%{pattern}%"))
-                cur.execute(
-                    "DELETE FROM recommendations r USING offpage_threads t "
-                    "WHERE r.offpage_thread_id = t.thread_id "
-                    "AND r.site_id = t.site_id "
-                    "AND t.site_id = %s AND t.thread_url LIKE %s",
-                    (site_id, f"%{pattern}%"))
-                cur.execute(
-                    "DELETE FROM offpage_threads WHERE site_id = %s "
-                    "AND thread_url LIKE %s RETURNING thread_url",
-                    (site_id, f"%{pattern}%"))
-                purged.extend([{"thread_url": r[0]} for r in cur.fetchall()])
+        # 4. Purge placeholder legs (drafts -> ac-links -> recs -> threads)
+        #    when asked; any failure is surfaced in the response, never a
+        #    blind 500.
+        purge_error = None
+        try:
+            if purge_like:
+                for pattern in [p.strip() for p in purge_like.split(",")
+                                if p.strip()]:
+                    # platform lives on offpage_communities (threads carry
+                    # no platform column): resolve matches via the join.
+                    cur.execute(
+                        "DELETE FROM offpage_drafts d "
+                        "USING recommendations r "
+                        "WHERE d.recommendation_id = r.recommendation_id "
+                        "AND d.site_id = r.site_id "
+                        "AND r.offpage_thread_id IN ("
+                        "  SELECT t.thread_id FROM offpage_threads t"
+                        "  JOIN offpage_communities c"
+                        "    ON c.community_id = t.community_id"
+                        "   AND c.site_id = t.site_id"
+                        "  WHERE t.site_id = %s AND c.platform = %s"
+                        "    AND t.thread_url LIKE %s)",
+                        (site_id, platform, f"%{pattern}%"))
+                    cur.execute(
+                        "DELETE FROM offpage_account_communities ac "
+                        "USING offpage_threads t "
+                        "WHERE ac.community_id = t.community_id "
+                        "AND t.site_id = ac.site_id "
+                        "AND t.site_id = %s AND t.thread_url LIKE %s",
+                        (site_id, f"%{pattern}%"))
+                    cur.execute(
+                        "DELETE FROM recommendations r "
+                        "USING offpage_threads t "
+                        "WHERE r.offpage_thread_id = t.thread_id "
+                        "AND r.site_id = t.site_id "
+                        "AND t.site_id = %s AND t.thread_url LIKE %s",
+                        (site_id, f"%{pattern}%"))
+                    cur.execute(
+                        "DELETE FROM offpage_threads "
+                        "WHERE site_id = %s AND thread_url LIKE %s "
+                        "RETURNING thread_url",
+                        (site_id, f"%{pattern}%"))
+                    purged.extend([{"thread_url": r[0]}
+                                   for r in cur.fetchall()])
+        except Exception as exc:
+            conn.rollback()
+            purge_error = f"{type(exc).__name__}: {exc}"[:400]
     conn.commit()
-    return {"ok": True, "site_id": site_id, "platform": platform,
-            "adopted_communities": adopted,
-            "threads_promoted": promoted_threads,
-            "purged": purged}
+    out = {"ok": True, "site_id": site_id, "platform": platform,
+           "adopted_communities": adopted,
+           "threads_promoted": promoted_threads,
+           "purged": purged}
+    if purge_error:
+        out["purge_error"] = purge_error
+    return out
 
 
 @router.get("/queue", response_model=OffpageQueueOut)
