@@ -739,23 +739,33 @@ def adopt_discovered_community(site_id, platform,
                         (site_id, platform, f"%{pattern}%"))
                     cur.execute(
                         "DELETE FROM offpage_account_communities ac "
-                        "USING offpage_threads t "
+                        "USING offpage_threads t, offpage_communities c "
                         "WHERE ac.community_id = t.community_id "
+                        "AND t.community_id = c.community_id "
                         "AND t.site_id = ac.site_id "
-                        "AND t.site_id = %s AND t.thread_url LIKE %s",
-                        (site_id, f"%{pattern}%"))
+                        "AND c.site_id = ac.site_id "
+                        "AND t.site_id = %s AND c.platform = %s "
+                        "AND t.thread_url LIKE %s",
+                        (site_id, platform, f"%{pattern}%"))
                     cur.execute(
                         "DELETE FROM recommendations r "
-                        "USING offpage_threads t "
+                        "USING offpage_threads t, offpage_communities c "
                         "WHERE r.offpage_thread_id = t.thread_id "
                         "AND r.site_id = t.site_id "
-                        "AND t.site_id = %s AND t.thread_url LIKE %s",
-                        (site_id, f"%{pattern}%"))
+                        "AND t.community_id = c.community_id "
+                        "AND t.site_id = c.site_id "
+                        "AND t.site_id = %s AND c.platform = %s "
+                        "AND t.thread_url LIKE %s",
+                        (site_id, platform, f"%{pattern}%"))
                     cur.execute(
-                        "DELETE FROM offpage_threads "
-                        "WHERE site_id = %s AND thread_url LIKE %s "
-                        "RETURNING thread_url",
-                        (site_id, f"%{pattern}%"))
+                        "DELETE FROM offpage_threads t "
+                        "USING offpage_communities c "
+                        "WHERE t.community_id = c.community_id "
+                        "AND t.site_id = c.site_id "
+                        "AND c.site_id = %s AND c.platform = %s "
+                        "AND t.thread_url LIKE %s "
+                        "RETURNING t.thread_url",
+                        (site_id, platform, f"%{pattern}%"))
                     purged.extend([{"thread_url": r[0]}
                                    for r in cur.fetchall()])
         except Exception as exc:
