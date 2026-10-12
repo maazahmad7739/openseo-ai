@@ -593,6 +593,16 @@ def run(now=None, conn=None, seams=None, site_filter=None):
                         _log_search(conn, site_id, platform, seam, query,
                                     envelope, result_count, now)
                         summary["queries_run"] += 1
+                        if not envelope.get("ok"):
+                            # A provider-side failure is a REAL diagnostic:
+                            # log it (with the adapter's detail) instead of
+                            # letting a zero-result envelope masquerade as
+                            # "no conversations found".
+                            summary["errors"].append(
+                                f"serp {seam} failed for {platform} "
+                                f"'{query}': "
+                                f"{str(envelope.get('error'))[:160]} "
+                                f"{str(envelope.get('detail'))[:160]}")
                         self_host = HOST_RULES[platform]
                         data_source = envelope.get("data_source", "live")
                         for res in envelope.get("results") or []:
