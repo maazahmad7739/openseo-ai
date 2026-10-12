@@ -604,6 +604,30 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
                        "writes": wired}}
 
 
+@router.get("/search-log")
+def get_offpage_search_log(site_id, limit: int = 15, conn=Depends(get_conn)):
+    """The discovery search ledger (offpage_search_log) for a tenant: what
+    was queried, on which seam, what came back (count/latency/error)."""
+    limit = max(1, min(int(limit), 50))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, created_at, platform, seam, query, result_count,
+                   provider, http_status, latency_ms
+            FROM offpage_search_log WHERE site_id = %s
+            ORDER BY created_at DESC, id DESC LIMIT %s
+            """,
+            (site_id, limit))
+        rows = [dict(zip(
+            ("id", "created_at", "platform", "seam", "query",
+             "result_count", "provider", "http_status", "latency_ms"),
+            r)) for r in cur.fetchall()]
+        for r in rows:
+            r["id"] = str(r["id"])
+            r["created_at"] = str(r["created_at"])
+    return {"ok": True, "site_id": site_id, "items": rows}
+
+
 @router.get("/adopt-community")
 def adopt_discovered_community(site_id, platform,
                                purge_like: str = None,
