@@ -443,28 +443,51 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
             "AND status = 'raw' AND cluster_id IS NOT NULL)",
             (site_id, site_id))
         clusters = cur.fetchall()
-        cur.execute(
-            "SELECT page_id, url, title FROM pages "
-            "WHERE site_id = %s AND (page_type IN ('product', 'collection') "
-            "OR length(btrim(COALESCE(body_html, ''))) >= 400) "
-            "ORDER BY url", (site_id,))
-        typed = cur.fetchall()
-    # a) real copy refresh (small, known set; robots respected).
-    refreshed = []
-    robots = None
-    origin = None
-    for _pid, url, _title in typed:
-        parsed = urlparse(url)
-        if parsed.netloc and origin is None:
-            origin = f"https://{parsed.netloc}/"
-    if origin:
+        # stage 1: the tenant's REAL live pages. The sitemap is the source
+        # of truth for which URLs exist (import tenants' rows are often
+        # body-less URL stubs); the crawl fills actual fact text.
+        sitemap_urls = []
+        cur.execute("SELECT domain FROM site_config WHERE site_id = %s",
+                    (site_id,))
+        domain = cur.fetchone()[0]
+    host_lives = []
+    for host in (f"www.{domain}", domain):
         try:
-            robots = fetcher.fetch_robots_txt(origin)
+            origin = f"https://{host}/"
+            resp = fetcher._get(origin + "sitemap.xml")
+            if resp.get("ok"):
+                body = resp.get("body") or ""
+                urls = fetcher.parse_sitemap_xml(body)
+                if urls:
+                    host_lives = [u if u.startswith("http") else
+                                  f"https://{host}{u}" for u in urls]
+                    break
         except Exception:
-            robots = None
-    for page_id, url, _title in typed:
+            continue
+    if not host_lives:
+        # sitemap unavailable: fall back to the DB's own URL inventory for
+        # the tenant's apex hosts (still the tenant's real pages).
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT url FROM pages WHERE site_id = %s "
+                "AND (url LIKE %s OR url LIKE %s) ORDER BY url LIMIT 40",
+                (site_id, f"https://www.{domain}/%", f"https://{domain}/%"))
+            host_lives = [r[0] for r in cur.fetchall()]
+    # a) REAL copy crawl (bounded; robots respected).
+    refreshed = []
+    try:
+        robots = fetcher.fetch_robots_txt(host_lives[0].rsplit("/", 3)[0]
+                                          and f"https://{urlparse(
+                                              host_lives[0]).netloc}/")
+    except Exception:
+        robots = None
+    crawled = 0
+    for url in host_lives[:25]:
         if not fetcher._robots_ok_for_url(robots, url):
             refreshed.append({"url": url, "status": "robots_disallow"})
+            continue
+        if crawled >= 18:
+            refreshed.append({"url": url, "status": "budget_deferred"})
             continue
         resp = fetcher._get(url)
         if not resp.get("ok"):
@@ -473,24 +496,39 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
         try:
             body_html, text, h1 = fetcher._page_body_from_html(
                 resp.get("body") or "")
-            if body_html and text and len(text) >= 300:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE pages SET body_html = %s WHERE "
-                        "page_id = %s AND site_id = %s",
-                        (body_html, page_id, site_id))
-                refreshed.append({"url": url,
-                                  "status": f"loaded({len(text)}c)"})
-            else:
-                refreshed.append({"url": url,
-                                  "status": f"thin({len(text or '')}c)"})
-        except Exception as exc:
+            meta_title = fetcher._page_title_from_html(resp.get("body") or "")
+        except Exception:
+            body_html, text, h1, meta_title = None, None, None, None
+        if not body_html or not text or len(text) < 300:
             refreshed.append({"url": url,
-                              "status": f"error:{type(exc).__name__}"})
-        conn.commit()
+                              "status": f"thin({len(text or '')}c)"})
+            continue
+        page_type = ("blog" if "/blogs/" in url or "/blog/" in url
+                     else "collection" if "/collections/" in url
+                     else "product" if "/products/" in url
+                     else "landing")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pages (site_id, url, page_type, title, h1,
+                                   body_html, indexable, status_code)
+                VALUES (%s, %s, %s, %s, %s, %s, true, 200)
+                ON CONFLICT (site_id, url_hash) DO UPDATE SET
+                    page_type = EXCLUDED.page_type,
+                    title = EXCLUDED.title,
+                    h1 = EXCLUDED.h1,
+                    body_html = EXCLUDED.body_html
+                RETURNING page_id
+                """,
+                (site_id, url, page_type, meta_title, h1, body_html))
+            page_id = str(cur.fetchone()[0])
+        crawled += 1
+        refreshed.append({"url": url, "page_id": page_id, "title": meta_title,
+                          "status": f"loaded({len(text)}c)", "type": page_type})
+    conn.commit()
 
-    # b) stand-in relevance wiring per leg cluster (typed catalogue pages
-    #    plus substantial content pages — the import tenants' real corpus).
+    # b) stand-in relevance wiring per leg cluster over the REAL crawled
+    #    pages (this run's loaded set carries body + title).
     wired = 0
 
     def _tokens(text):
@@ -498,6 +536,9 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
             "the", "a", "an", "of", "for", "and", "to", "in", "on", "is",
             "are", "it", "you", "your", "we", "our", "with", "that", "this",
             "at", "by", "from", "or", "as", "be", "their", "them", "they"}
+
+    crawled_pages = [(e["page_id"], e["url"], e.get("title", ""))
+                     for e in refreshed if e.get("page_id")]
 
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM page_query_match_scores "
@@ -507,7 +548,7 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
             demand = _tokens(primary or "") | (
                 _tokens(" ".join(keywords_list))
                 if isinstance(keywords_list, (list, tuple)) else set())
-            for page_id, url, title in typed:
+            for page_id, url, title in crawled_pages:
                 page_tokens = _tokens(url) | _tokens(title or "")
                 overlap = len(demand & page_tokens) / max(len(demand), 1)
                 if overlap < 0.2:
