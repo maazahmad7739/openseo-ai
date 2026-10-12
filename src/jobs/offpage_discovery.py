@@ -118,9 +118,20 @@ def _community_key(url):
         return "unknown"
 
 
-def _build_query(keyword, platform):
+def _recency_operator():
+    """Google-style after: operator bounding discovery to the CURRENT year.
+
+    Stale (2022/2023-era) threads are operator-irrelevant; SERP queries are
+    scoped to this year's start. Overridable per channel via the settings
+    panel's Targeting JSON ('after': 'YYYY-MM-DD').
+    """
+    return f"after:{datetime.now(timezone.utc).year}-01-01"
+
+
+def _build_query(keyword, platform, after_date=None):
     host = HOST_RULES[platform][0]
-    return f"site:{host} {keyword}"
+    after = after_date or _recency_operator()
+    return f"site:{host} {keyword} {after}".strip()
 
 
 def _context_source_for(seam):
@@ -579,7 +590,9 @@ def run(now=None, conn=None, seams=None, site_filter=None):
                         if not _claim_quota_call(
                                 conn, site_id, platform, now, hourly_cap):
                             break
-                        query = _build_query(keyword, platform)
+                        query = _build_query(
+                            keyword, platform,
+                            (targeting or {}).get("after"))
                         try:
                             envelope = provider(site_id, platform, query,
                                                 DEFAULT_LIMIT)

@@ -181,7 +181,7 @@ def run(conn):
             """, (t_x["site_id"], x_url))
         row = cur.fetchone()
     check("A3 provenance: discovery_query + serp context_source",
-          row and row[0] == "site:x.com leather bag care"
+          row and row[0] == f"site:x.com leather bag care {od._recency_operator()}"
           and row[1] == "serp" and row[2] == "reply", str(row))
     check("A3b community is fail-closed: disabled + rules unread",
           row and row[3] is False and row[4] == "unknown", str(row))
@@ -273,7 +273,7 @@ def run(conn):
         logs = cur.fetchall()
     check("C9 ledger records each call with query/provider/latency",
           len(logs) == 2 and all(
-              l[0] == "dataforseo" and l[1] == "site:x.com leather bag care"
+              l[0] == "dataforseo" and l[1] == f"site:x.com leather bag care {od._recency_operator()}"
               and l[3] == "fake_provider" and l[4] == 12 for l in logs),
           str(logs))
 

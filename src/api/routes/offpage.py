@@ -628,6 +628,40 @@ def get_offpage_search_log(site_id, limit: int = 15, conn=Depends(get_conn)):
     return {"ok": True, "site_id": site_id, "items": rows}
 
 
+@router.get("/purge-discovered")
+def purge_discovered(site_id, platform: str = None, conn=Depends(get_conn)):
+    """Clear all DISCOVERED (data_source='live') off-page rows for a
+    tenant — used to clear a stale queue before a re-run. Kept rows:
+    operator-imported worlds (data_source='import')."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM offpage_drafts d USING recommendations r, "
+            "offpage_threads t WHERE d.recommendation_id = r.recommendation_id "
+            "AND d.site_id = r.site_id "
+            "AND r.offpage_thread_id = t.thread_id "
+            "AND t.data_source = 'live' AND t.site_id = %s", (site_id,))
+        cur.execute(
+            "DELETE FROM recommendations r USING offpage_threads t "
+            "WHERE r.offpage_thread_id = t.thread_id "
+            "AND r.site_id = t.site_id "
+            "AND t.data_source = 'live' AND t.site_id = %s", (site_id,))
+        cur.execute(
+            "DELETE FROM offpage_account_communities ac USING "
+            "offpage_communities c WHERE ac.community_id = c.community_id "
+            "AND ac.site_id = c.site_id AND c.data_source = 'live' "
+            "AND c.site_id = %s", (site_id,))
+        cur.execute(
+            "DELETE FROM offpage_threads WHERE site_id = %s "
+            "AND data_source = 'live'", (site_id,))
+        cur.execute(
+            "DELETE FROM offpage_communities WHERE site_id = %s "
+            "AND data_source = 'live'", (site_id,))
+    conn.commit()
+    return {"ok": True, "site_id": site_id,
+            "cleared": ["drafts", "recommendations", "threads",
+                        "communities"], "platform": platform or "all"}
+
+
 @router.get("/adopt-community")
 def adopt_discovered_community(site_id, platform,
                                purge_like: str = None,
