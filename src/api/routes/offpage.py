@@ -612,10 +612,10 @@ def get_offpage_search_log(site_id, limit: int = 15, conn=Depends(get_conn)):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, created_at, platform, seam, query, result_count,
-                   provider, http_status, latency_ms
+            SELECT search_id, created_at, platform, seam, query,
+                   result_count, provider, http_status, latency_ms
             FROM offpage_search_log WHERE site_id = %s
-            ORDER BY created_at DESC, id DESC LIMIT %s
+            ORDER BY created_at DESC, search_id DESC LIMIT %s
             """,
             (site_id, limit))
         rows = [dict(zip(
