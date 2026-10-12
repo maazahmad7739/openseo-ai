@@ -255,7 +255,7 @@ def _install_world(conn, site):
               "retention side cost once cohorts were instrumented "
               "properly?",
               )[0],
-             "reply", "helium_ops", f"{base}/features")
+             "reply", "helium_ops", f"{base}/helium-case-studies")
         _leg("medium", "gethelium-ad-stack-insights",
              ("https://medium.com/@gethelium/"
               "how-small-saas-teams-choose-a-growth-platform-h3lium"),
