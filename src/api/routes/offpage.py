@@ -542,7 +542,23 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
         cur.execute("SELECT count(*) FROM page_query_match_scores "
                     "WHERE site_id = %s", (site_id,))
         _after = cur.fetchone()[0]
+        cur.execute(
+            "SELECT page_type, count(*), "
+            "count(*) FILTER (WHERE length(btrim(COALESCE(body_html, ''))) "
+            ">= 400) FROM pages WHERE site_id = %s "
+            "GROUP BY page_type ORDER BY 2 DESC", (site_id,))
+        breakdown = [{"page_type": r[0], "pages": r[1], "with_body": r[2]}
+                     for r in cur.fetchall()]
+        cur.execute(
+            "SELECT url, page_type, "
+            "COALESCE(length(btrim(COALESCE(body_html, ''))), 0) "
+            "FROM pages WHERE site_id = %s AND (page_type IN "
+            "('product', 'collection') OR length(btrim(COALESCE("
+            "body_html, ''))) >= 400) ORDER BY 3 DESC", (site_id,))
+        candidates = [{"url": r[0], "page_type": r[1], "body": r[2]}
+                      for r in cur.fetchall()]
     return {"ok": True, "site_id": site_id, "corpus_refresh": refreshed,
+            "candidate_pages": candidates, "page_type_breakdown": breakdown,
             "wiring": {"rows_before": _before, "rows_after": _after,
                        "writes": wired}}
 
