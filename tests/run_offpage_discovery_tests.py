@@ -277,9 +277,12 @@ def run(conn):
               and l[3] == "fake_provider" and l[4] == 12 for l in logs),
           str(logs))
 
-    # A tenant with NO cluster keeps an inert rec (NULL cluster -> the
-    # drafter's grounding gate refuses it, so the opportunity is visible but
-    # never drafted).
+    # A tenant with NO cluster: discovery now MINTS the demand cluster for
+    # the discovered keyword (with its own keyword row), so the
+    # recommendation is draftable — grounding ranks from the minted
+    # cluster's wiring instead of being permanently inert. The old contract
+    # (NULL cluster -> drafter refuses forever) made discovered threads
+    # undraftable even after the operator configured them.
     t_nc = seed_site(conn, f"disc-nc-{RUN_TOKEN}.example.com", "NoCluster", "paper stock")
     enable_leg(conn, t_nc["site_id"], "x", ["dataforseo"])
     with conn.cursor() as cur:
@@ -292,12 +295,17 @@ def run(conn):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT cluster_id, target_url FROM recommendations
-            WHERE site_id = %s AND generator = 'offpage_community'
+            SELECT r.cluster_id, r.target_url,
+                   (SELECT count(*) FROM keyword_clusters kc
+                    WHERE kc.cluster_id = r.cluster_id
+                      AND kc.site_id = r.site_id) AS cluster_exists
+            FROM recommendations r
+            WHERE r.site_id = %s AND r.generator = 'offpage_community'
             """, (t_nc["site_id"],))
         nc = cur.fetchone()
-    check("C10 no-cluster rec is created inert (cluster NULL)",
-          nc and nc[0] is None and nc[1] == nc_url, str(nc))
+    check("C10 no-cluster rec gets discovery-minted demand cluster",
+          nc and nc[0] is not None and nc[1] == nc_url and nc[2] == 1,
+          str(nc))
 
     # ---- D. scheduling registration ----
     check("D11 scheduled daily@07:00 UTC",

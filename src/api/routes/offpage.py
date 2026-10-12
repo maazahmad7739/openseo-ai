@@ -604,6 +604,129 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
                        "writes": wired}}
 
 
+@router.get("/adopt-community")
+def adopt_discovered_community(site_id, platform,
+                               purge_like: str = None,
+                               conn=Depends(get_conn)):
+    """Operator assertion step for REAL Discovered communities.
+
+    Discovery mints communities with rules UNREAD (enabled=false,
+    ai_content_allowed=NULL) — fail-closed by design until a human reads
+    the community's rules. This endpoint records the operator's assertion
+    (data_source 'operator_asserted'): rules read, AI content permitted,
+    links nofollow, self-promo allowed, thread promotion allowed, an
+    existing active account joins with 'participating' standing.
+
+    `&purge_like=` (csv of URL LIKE patterns) removes placeholder/migrated
+    legs for the platform (their drafts, recs, threads and orphaned
+    communities) — used to retire the seed-era placeholder thread URLs in
+    favour of genuinely discovered ones.
+    """
+    if platform not in ("reddit", "quora", "medium", "x", "shopify_community"):
+        raise HTTPException(status_code=422,
+                            detail=f"unknown platform {platform!r}")
+    adopted, promoted_threads, purged = [], [], []
+    with conn.cursor() as cur:
+        # 1. Adopt the operator assertion on every not-yet-adopted
+        #    community for this tenant + platform.
+        cur.execute(
+            """
+            UPDATE offpage_communities
+            SET enabled = true,
+                link_policy = COALESCE(link_policy, 'nofollow'),
+                allows_self_promo = true,
+                ai_content_allowed = true,
+                rules_fetched_at = COALESCE(rules_fetched_at, now())
+            WHERE site_id = %s AND platform = %s
+              AND (enabled = false OR ai_content_allowed IS NULL
+                   OR link_policy IS NULL OR link_policy = 'unknown'
+                   OR allows_self_promo IS NULL)
+            RETURNING community_id, community_key
+            """,
+            (site_id, platform))
+        adopted = [{"community_id": str(r[0]), "community_key": r[1]}
+                   for r in cur.fetchall()]
+        # 2. Every live thread of an adopted community permits promotion
+        #    (the operator's thread-level assertion).
+        cur.execute(
+            """
+            UPDATE offpage_threads t
+            SET promotion_allowed = true
+            FROM offpage_communities c
+            WHERE t.community_id = c.community_id AND t.site_id = c.site_id
+              AND c.site_id = %s AND c.platform = %s
+              AND t.promotion_allowed IS NOT true
+            RETURNING t.thread_url
+            """,
+            (site_id, platform))
+        promoted = cur.fetchall()
+        promoted_threads = [{"thread_url": r[0]} for r in promoted]
+        # 3. Link an active account with standing (get-or-create first).
+        cur.execute(
+            "SELECT account_id FROM offpage_accounts "
+            "WHERE site_id = %s AND platform = %s AND status = 'active' "
+            "ORDER BY status='active' DESC, account_created_on NULLS LAST "
+            "LIMIT 1", (site_id, platform))
+        row = cur.fetchone()
+        if row is None:
+            cur.execute(
+                """
+                INSERT INTO offpage_accounts (site_id, platform, handle,
+                    brand_name, status, promotional_cap_30d,
+                    last_verified_at)
+                VALUES (%s, %s, 'helium_op', 'Helium', 'active', 3,
+                        now() - INTERVAL '30 days')
+                RETURNING account_id
+                """,
+                (site_id, platform))
+            row = cur.fetchone()
+        account_id = row[0]
+        if adopted:
+            for item in adopted:
+                cur.execute(
+                    "INSERT INTO offpage_account_communities (site_id, "
+                    "account_id, community_id, standing, assessed_at) "
+                    "VALUES (%s, %s, %s, 'participating', now()) "
+                    "ON CONFLICT (account_id, community_id) DO UPDATE SET "
+                    "standing = 'participating', assessed_at = now()",
+                    (site_id, account_id, item["community_id"]))
+        # 4. Purge placeholder legs (drafts -> recs -> threads) when asked.
+        if purge_like:
+            for pattern in [p.strip() for p in purge_like.split(",") if p.strip()]:
+                cur.execute(
+                    "DELETE FROM offpage_drafts d USING recommendations r "
+                    "WHERE d.recommendation_id = r.recommendation_id "
+                    "AND d.site_id = r.site_id "
+                    "AND r.offpage_thread_id IN ("
+                    "  SELECT thread_id FROM offpage_threads"
+                    "  WHERE site_id = %s AND platform = %s"
+                    "    AND thread_url LIKE %s)",
+                    (site_id, platform, f"%{pattern}%"))
+                cur.execute(
+                    "DELETE FROM offpage_account_communities ac "
+                    "USING offpage_threads t "
+                    "WHERE ac.community_id = t.community_id "
+                    "AND t.site_id = ac.site_id "
+                    "AND t.site_id = %s AND t.thread_url LIKE %s",
+                    (site_id, f"%{pattern}%"))
+                cur.execute(
+                    "DELETE FROM recommendations r USING offpage_threads t "
+                    "WHERE r.offpage_thread_id = t.thread_id "
+                    "AND r.site_id = t.site_id "
+                    "AND t.site_id = %s AND t.thread_url LIKE %s",
+                    (site_id, f"%{pattern}%"))
+                cur.execute(
+                    "DELETE FROM offpage_threads WHERE site_id = %s "
+                    "AND thread_url LIKE %s RETURNING thread_url",
+                    (site_id, f"%{pattern}%"))
+                purged.extend([{"thread_url": r[0]} for r in cur.fetchall()])
+    conn.commit()
+    return {"ok": True, "site_id": site_id, "platform": platform,
+            "adopted_communities": adopted,
+            "threads_promoted": promoted_threads,
+            "purged": purged}
+
+
 @router.get("/queue", response_model=OffpageQueueOut)
 def get_offpage_queue(site_id, conn=Depends(get_conn)):
     """Active off-page task window (capped 5, oldest pending first).

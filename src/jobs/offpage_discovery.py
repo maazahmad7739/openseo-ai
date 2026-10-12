@@ -46,6 +46,7 @@ it never raises (run() catches per-leg and per-seam failures into the
 summary).
 """
 
+import json
 import os
 import sys
 import time
@@ -413,6 +414,36 @@ def _cluster_for_keyword(conn, site_id, keyword):
         return row[0] if row else None
 
 
+def _ensure_cluster(conn, site_id, platform, keyword):
+    """Get-or-create the demand cluster for a discovered keyword.
+
+    A discovered thread's recommendation needs a cluster: the grounding
+    loader refuses to rank a cluster-less rec, so discovery mints the
+    keyword's cluster (and its own keyword row) when the tenant's config
+    does not already carry one.
+    """
+    existing = _cluster_for_keyword(conn, site_id, keyword)
+    if existing:
+        return existing
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO keyword_clusters (site_id, primary_keyword, keywords,
+                                          intent, commercial_intent,
+                                          recommended_page_type)
+            VALUES (%s, %s, ARRAY[%s], 'commercial', true, 'landing')
+            RETURNING cluster_id
+            """,
+            (site_id, keyword, keyword))
+        cluster_id = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO cluster_queries (cluster_id, query) "
+            "SELECT %s, %s WHERE NOT EXISTS ("
+            "SELECT 1 FROM cluster_queries WHERE cluster_id = %s AND query = %s)",
+            (cluster_id, keyword, cluster_id, keyword))
+    return cluster_id
+
+
 _ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 
 
@@ -492,7 +523,7 @@ def run(now=None, conn=None, seams=None, site_filter=None):
                 cur.execute(
                     """
                     SELECT ps.site_id, ps.platform, ps.discovery_seams,
-                           ps.discovery_calls_per_day,
+                           ps.discovery_calls_per_day, ps.targeting,
                            sc.target_keywords
                     FROM offpage_platform_settings ps
                     JOIN site_config sc ON sc.site_id = ps.site_id
@@ -505,7 +536,18 @@ def run(now=None, conn=None, seams=None, site_filter=None):
                     (site_filter, site_filter),
                 )
                 legs = cur.fetchall()
-            for site_id, platform, seams_col, daily_cap, keywords in legs:
+            for leg in legs:
+                site_id, platform, seams_col, daily_cap, targeting, \
+                    sc_keywords = leg
+                # Operator scoping: the settings panel's Targeting JSON
+                # carries per-platform discovery keywords; the tenant-level
+                # target_keywords remain the fallback (site-wide list).
+                if isinstance(targeting, str):
+                    try:
+                        targeting = json.loads(targeting)
+                    except (TypeError, ValueError):
+                        targeting = None
+                keywords = (targeting or {}).get("keywords") or sc_keywords
                 leg_calls = 0
                 for seam in seams_col:
                     provider = providers.get(seam)
@@ -569,8 +611,8 @@ def run(now=None, conn=None, seams=None, site_filter=None):
                             if thread_id is None:
                                 continue
                             summary["threads_created"] += 1
-                            cluster_id = _cluster_for_keyword(
-                                conn, site_id, keyword)
+                            cluster_id = _ensure_cluster(
+                                conn, site_id, platform, keyword)
                             rec_id = _insert_recommendation(
                                 conn, site_id, thread_id, res["url"],
                                 cluster_id, keyword, platform)
