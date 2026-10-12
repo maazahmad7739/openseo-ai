@@ -156,13 +156,27 @@ def _install_world(conn, site):
         # /features demand cluster.
         feat_cluster = clusters.get(f"{base}/features")
 
-        def _corpus_widen(cluster_id, urls):
+        # The long-form contract needs a REAL corpus (650-1500 grounded
+        # words against ~6 pages). The tenant's own imported pages are the
+        # facts — wire the fattest collection/product pages into EACH leg's
+        # cluster so the model grounds on actual Helium copy.
+        cur.execute(
+            """
+            SELECT p.page_id
+            FROM pages p
+            WHERE p.site_id = %s
+              AND p.page_type IN ('product', 'collection')
+              AND p.body_html IS NOT NULL AND btrim(p.body_html) <> ''
+            ORDER BY length(p.body_html) DESC, p.url
+            LIMIT 10
+            """,
+            (site["site_id"],))
+        corpus_page_ids = [str(r[0]) for r in cur.fetchall()]
+
+        def _corpus_wide_auto(cluster_id):
             if not cluster_id:
                 return
-            for url in urls:
-                page_id = pages.get(url)
-                if not page_id:
-                    continue
+            for page_id in corpus_page_ids:
                 cur.execute(
                     "SELECT 1 FROM page_query_match_scores "
                     "WHERE site_id = %s AND page_id = %s AND cluster_id = %s",
@@ -177,13 +191,8 @@ def _install_world(conn, site):
                     "0.9, 0.9, 0.6, 0.6)", (site["site_id"], page_id,
                                             cluster_id))
 
-        _corpus_widen(feat_cluster,
-                      ["https://gethelium.co/features",
-                       "https://gethelium.co/pricing"])
-        _corpus_widen(clusters.get(f"{base}/pricing"),
-                      ["https://gethelium.co/pricing",
-                       "https://gethelium.co/features",
-                       "https://gethelium.co/"])
+        _corpus_wide_auto(feat_cluster)
+        _corpus_wide_auto(clusters.get(f"{base}/pricing"))
 
         def _leg(platform, community_key, thread_url, title, snippet,
                  post_kind, handle, target_url):
@@ -339,29 +348,52 @@ def _run_discovery(conn):
     return summary
 
 
-def _run_drafts(conn, site_id, max_drafts):
+def _run_drafts(conn, site_id, max_drafts, rec_id=None):
     from agents.llm_client import FallbackClient
     from fixes.offpage_drafter import draft_offpage_reply, OffpageDraftBlocked
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT r.recommendation_id, r.target_url, r.offpage_thread_id,
-                   t.post_kind, c.platform, c.community_key
-            FROM recommendations r
-            LEFT JOIN offpage_threads t
-                ON t.site_id = r.site_id AND t.thread_id = r.offpage_thread_id
-            LEFT JOIN offpage_communities c
-                ON c.site_id = t.site_id AND c.community_id = t.community_id
-            WHERE r.site_id = %s AND r.generator = 'offpage_community'
-              AND r.status = 'raw'
-              AND r.offpage_thread_id IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM offpage_drafts d
-                  WHERE d.recommendation_id = r.recommendation_id
-                    AND d.status IN ('drafted', 'approved'))
-            ORDER BY r.created_at ASC
-            """
-            , (site_id,))
+        if rec_id:
+            # Force re-draft: an existing live draft is superseded by the
+            # drafter's versioned supersede (uq_offpage_draft_live).
+            cur.execute(
+                """
+                SELECT r.recommendation_id, r.target_url, r.offpage_thread_id,
+                       t.post_kind, c.platform, c.community_key
+                FROM recommendations r
+                LEFT JOIN offpage_threads t
+                    ON t.site_id = r.site_id
+                   AND t.thread_id = r.offpage_thread_id
+                LEFT JOIN offpage_communities c
+                    ON c.site_id = t.site_id
+                   AND c.community_id = t.community_id
+                WHERE r.recommendation_id = %s
+                  AND r.site_id = %s
+                  AND r.generator = 'offpage_community'
+                  AND r.offpage_thread_id IS NOT NULL
+                """
+                , (rec_id, site_id))
+        else:
+            cur.execute(
+                """
+                SELECT r.recommendation_id, r.target_url, r.offpage_thread_id,
+                       t.post_kind, c.platform, c.community_key
+                FROM recommendations r
+                LEFT JOIN offpage_threads t
+                    ON t.site_id = r.site_id
+                   AND t.thread_id = r.offpage_thread_id
+                LEFT JOIN offpage_communities c
+                    ON c.site_id = t.site_id
+                   AND c.community_id = t.community_id
+                WHERE r.site_id = %s AND r.generator = 'offpage_community'
+                  AND r.status = 'raw'
+                  AND r.offpage_thread_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM offpage_drafts d
+                      WHERE d.recommendation_id = r.recommendation_id
+                        AND d.status IN ('drafted', 'approved'))
+                ORDER BY r.created_at ASC
+                """
+                , (site_id,))
         pending = [dict(zip(
             ("recommendation_id", "target_url", "thread_id", "post_kind",
              "platform", "community_key"), row))
@@ -425,7 +457,8 @@ def _status(conn, site_id):
 
 
 @router.get("/offpage-demo")
-def offpage_ops(site_id, op: str = "status", max_drafts: int = 2):
+def offpage_ops(site_id, op: str = "status", max_drafts: int = 2,
+                rec_id: str = None):
     conn = database.get_connection()
     try:
         site = _site_row(conn, site_id)
@@ -443,7 +476,7 @@ def offpage_ops(site_id, op: str = "status", max_drafts: int = 2):
             return {"ok": True, "op": "discover", "site": site["site_id"],
                     "summary": summary, **_status(conn, site["site_id"])}
         if op == "draft":
-            out = _run_drafts(conn, site["site_id"], max_drafts)
+            out = _run_drafts(conn, site["site_id"], max_drafts, rec_id)
             return {"ok": True, "op": "draft", "site": site["site_id"],
                     **out, **_status(conn, site["site_id"])}
         raise HTTPException(
