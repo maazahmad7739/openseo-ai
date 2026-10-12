@@ -445,7 +445,8 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
         clusters = cur.fetchall()
         cur.execute(
             "SELECT page_id, url, title FROM pages "
-            "WHERE site_id = %s AND page_type IN ('product', 'collection') "
+            "WHERE site_id = %s AND (page_type IN ('product', 'collection') "
+            "OR length(btrim(COALESCE(body_html, ''))) >= 400) "
             "ORDER BY url", (site_id,))
         typed = cur.fetchall()
     # a) real copy refresh (small, known set; robots respected).
@@ -488,7 +489,8 @@ def run_offpage_corpus(site_id, conn=Depends(get_conn)):
                               "status": f"error:{type(exc).__name__}"})
         conn.commit()
 
-    # b) stand-in relevance wiring per leg cluster.
+    # b) stand-in relevance wiring per leg cluster (typed catalogue pages
+    #    plus substantial content pages — the import tenants' real corpus).
     wired = 0
 
     def _tokens(text):

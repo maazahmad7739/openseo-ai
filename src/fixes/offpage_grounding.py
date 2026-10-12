@@ -125,6 +125,10 @@ def load_brand_corpus(conn, rec, limit=CORPUS_MAX_PAGES):
     sources = []
     page_ids = []
     with conn.cursor() as cur:
+        # The type filter is the Shopify catalogue's; import tenants
+        # (Framer etc.) carry their corpus on content pages typed
+        # 'landing'/'blog'. CORPUS_MIN_BODY_CHARS already enforces the
+        # substance floor, so accept any type with a substantial body.
         cur.execute(
             """
             SELECT p.page_id, p.url, p.title, p.body_html
@@ -134,9 +138,10 @@ def load_brand_corpus(conn, rec, limit=CORPUS_MAX_PAGES):
              AND p.site_id = s.site_id
             WHERE s.site_id = %(site_id)s
               AND s.cluster_id = %(cluster_id)s
-              AND p.page_type IN ('product', 'collection')
               AND p.body_html IS NOT NULL
               AND btrim(p.body_html) <> ''
+              AND (p.page_type IN ('product', 'collection')
+                   OR length(btrim(p.body_html)) >= 400)
             ORDER BY s.aggregate_score DESC NULLS LAST, p.url
             LIMIT %(limit)s
             """,
