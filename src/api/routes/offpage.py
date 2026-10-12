@@ -717,14 +717,19 @@ def adopt_discovered_community(site_id, platform,
         # 4. Purge placeholder legs (drafts -> recs -> threads) when asked.
         if purge_like:
             for pattern in [p.strip() for p in purge_like.split(",") if p.strip()]:
+                # platform lives on offpage_communities (threads carry no
+                # platform column): resolve matching threads via the join.
                 cur.execute(
                     "DELETE FROM offpage_drafts d USING recommendations r "
                     "WHERE d.recommendation_id = r.recommendation_id "
                     "AND d.site_id = r.site_id "
                     "AND r.offpage_thread_id IN ("
-                    "  SELECT thread_id FROM offpage_threads"
-                    "  WHERE site_id = %s AND platform = %s"
-                    "    AND thread_url LIKE %s)",
+                    "  SELECT t.thread_id FROM offpage_threads t"
+                    "  JOIN offpage_communities c"
+                    "    ON c.community_id = t.community_id"
+                    "   AND c.site_id = t.site_id"
+                    "  WHERE t.site_id = %s AND c.platform = %s"
+                    "    AND t.thread_url LIKE %s)",
                     (site_id, platform, f"%{pattern}%"))
                 cur.execute(
                     "DELETE FROM offpage_account_communities ac "
