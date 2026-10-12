@@ -147,11 +147,43 @@ def _install_world(conn, site):
     clusters = hs.ensure_clusters(conn, site["site_id"], pages)
     offpage = hs.ensure_offpage_world(conn, site["site_id"], pages, clusters)
 
-    # Reddit leg exists via the fixture; add the shopify_community + medium
-    # legs with the same operator-import posture.
     legs = []
     with conn.cursor() as cur:
         base = f"https://{site['domain']}"
+        # The grounding loader only ranks pages typed product/collection
+        # (fixture: only /features and /pricing qualify), so legs whose
+        # cluster would otherwise have an empty corpus point at the
+        # /features demand cluster.
+        feat_cluster = clusters.get(f"{base}/features")
+
+        def _corpus_widen(cluster_id, urls):
+            if not cluster_id:
+                return
+            for url in urls:
+                page_id = pages.get(url)
+                if not page_id:
+                    continue
+                cur.execute(
+                    "SELECT 1 FROM page_query_match_scores "
+                    "WHERE site_id = %s AND page_id = %s AND cluster_id = %s",
+                    (site["site_id"], page_id, cluster_id))
+                if cur.fetchone():
+                    continue
+                cur.execute(
+                    "INSERT INTO page_query_match_scores (site_id, page_id, "
+                    "cluster_id, intent_page_type_score, "
+                    "catalogue_match_score, gsc_evidence_score, "
+                    "semantic_content_score) VALUES (%s, %s, %s, "
+                    "0.9, 0.9, 0.6, 0.6)", (site["site_id"], page_id,
+                                            cluster_id))
+
+        _corpus_widen(feat_cluster,
+                      ["https://gethelium.co/features",
+                       "https://gethelium.co/pricing"])
+        _corpus_widen(clusters.get(f"{base}/pricing"),
+                      ["https://gethelium.co/pricing",
+                       "https://gethelium.co/features",
+                       "https://gethelium.co/"])
 
         def _leg(platform, community_key, thread_url, title, snippet,
                  post_kind, handle, target_url):
@@ -213,8 +245,9 @@ def _install_world(conn, site):
                 "standing = 'established', assessed_at = now()",
                 (site["site_id"], account_id, community_id))
             # Natural-key guard (uq_recommendations_candidate): reuse the
-            # row when (generator, action_type, cluster, target_url,
-            # proposed_url) already exists, whatever thread it points at.
+            # row when the same (generator, action_type, cluster, target_url,
+            # proposed_url) key already exists, whatever thread it points at.
+            rec_cluster = clusters.get(target_url)
             cur.execute(
                 "INSERT INTO recommendations (site_id, generator, "
                 "action_type, status, diagnosis, target_url, cluster_id, "
@@ -224,8 +257,7 @@ def _install_world(conn, site):
                 "RETURNING recommendation_id",
                 (site["site_id"],
                  f"Helium opportunity surfaced for {platform} "
-                 f"('{post_kind}')", target_url,
-                 clusters.get(target_url), thread_id))
+                 f"('{post_kind}')", target_url, rec_cluster, thread_id))
             row = cur.fetchone()
             if row:
                 rec_id = str(row[0])
@@ -237,6 +269,14 @@ def _install_world(conn, site):
                     "AND COALESCE(proposed_url, '') = '' LIMIT 1",
                     (site["site_id"], target_url))
                 rec_id = str(cur.fetchone()[0])
+            # A rec created earlier against a thin-corpus cluster is repointed
+            # at the widened demand cluster so drafter grounding works.
+            if rec_cluster and rec_cluster != feat_cluster and \
+                    platform == "shopify_community":
+                cur.execute(
+                    "UPDATE recommendations SET cluster_id = %s "
+                    "WHERE recommendation_id = %s AND site_id = %s",
+                    (feat_cluster, rec_id, site["site_id"]))
             legs.append({"platform": platform, "thread_id": thread_id,
                          "recommendation_id": rec_id})
 
@@ -246,27 +286,25 @@ def _install_world(conn, site):
               "is-a-bundled-growth-platform-worth-it-for-a-small-team/t-p/"
               "helium"),
              "Is a bundled growth platform worth it for a small team?",
-             ("We run a small SaaS team and paid acquisition alone stopped "
-              "paying back at our scale. We are weighing a platform that "
-              "bundles acquisition with retention playbooks against buying "
-              "media directly and wiring lifecycle messaging ourselves. "
-              "Payback window matters to us more than raw volume - what "
-              "did teams our size actually settle on, and what did the "
-              "retention side cost once cohorts were instrumented "
-              "properly?",
-              )[0],
+             "We run a small SaaS team and paid acquisition alone stopped "
+             "paying back at our scale. We are weighing a platform that "
+             "bundles acquisition with retention playbooks against buying "
+             "media directly and wiring lifecycle messaging ourselves. "
+             "Payback window matters to us more than raw volume - what "
+             "did teams our size actually settle on, and what did the "
+             "retention side cost once cohorts were instrumented "
+             "properly?",
              "reply", "helium_ops", f"{base}/helium-case-studies")
         _leg("medium", "gethelium-ad-stack-insights",
              ("https://medium.com/@gethelium/"
               "how-small-saas-teams-choose-a-growth-platform-h3lium"),
              "How small SaaS teams choose a growth platform (operator topic)",
-             ("Editorial topic row for the operator's Medium publication: "
-              "the guide walks through payback windows, retention "
-              "instrumentation and when bundled acquisition platforms beat "
-              "direct media buying for small SaaS teams. The long-form "
-              "contract (650-1500 content words, grounded on the tenant "
-              "corpus) applies.",
-              )[0],
+             "Editorial topic row for the operator's Medium publication: "
+             "the guide walks through payback windows, retention "
+             "instrumentation and when bundled acquisition platforms beat "
+             "direct media buying for small SaaS teams. The long-form "
+             "contract (650-1500 content words, grounded on the tenant "
+             "corpus) applies.",
              "article", "helium_ops", f"{base}/pricing")
 
         # Platform channels: explicit operator opt-in for the three legs.
