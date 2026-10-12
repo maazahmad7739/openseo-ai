@@ -455,11 +455,13 @@ def _insert_recommendation(conn, site_id, thread_id, thread_url, cluster_id,
 # Orchestration
 # ------------------------------------------------------------
 
-def run(now=None, conn=None, seams=None):
+def run(now=None, conn=None, seams=None, site_filter=None):
     """Discover conversations/topics for every enabled platform leg.
 
     Returns a summary dict; never raises. `seams` injects providers for
     tests (default: DataForSEO + the fail-closed web-search seam).
+    `site_filter` scopes the run to ONE tenant's legs (operator-triggered
+    runs pass it; the scheduler omits it for the full sweep).
     """
     own_conn = conn is None
     if own_conn:
@@ -497,8 +499,10 @@ def run(now=None, conn=None, seams=None):
                     WHERE ps.enabled
                       AND ps.discovery_seams IS NOT NULL
                       AND cardinality(ps.discovery_seams) > 0
+                      AND (%s::uuid IS NULL OR ps.site_id = %s::uuid)
                     ORDER BY ps.site_id, ps.platform
-                    """
+                    """,
+                    (site_filter, site_filter),
                 )
                 legs = cur.fetchall()
             for site_id, platform, seams_col, daily_cap, keywords in legs:

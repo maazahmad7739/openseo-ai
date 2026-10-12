@@ -311,6 +311,113 @@ def _queue_drafts(conn, site_id, limit, status_filter):
     return rows
 
 
+# ---------------------------------------------------------------
+# Operator-triggered pipeline runs (plan/35). The scheduler's daily
+# 07:00 offpage_discovery slot runs wherever the operator loop is
+# deployed; the serverless runtime has no scheduler, so discovery and
+# drafting are explicit operator actions here. Both call the committed
+# job paths; every external call stays under the job's own quota and
+# budget gates.
+# ---------------------------------------------------------------
+
+@router.get("/run-discovery")
+def run_offpage_discovery_trigger(site_id, conn=Depends(get_conn)):
+    """Run the REAL discovery job for this tenant's enabled legs
+    (real DataForSEO SERP; quota + budget gated inside the job)."""
+    from jobs.offpage_discovery import run as discovery_run
+    summary = discovery_run(conn=conn, site_filter=site_id)
+    conn.commit()
+    return {"ok": True, "site_id": site_id, "summary": summary}
+
+
+@router.get("/run-draft")
+def run_offpage_draft_trigger(site_id, rec_id: str = None,
+                              max_drafts: int = 2, conn=Depends(get_conn)):
+    """Draft through the REAL drafter + LLM fallback client for the
+    tenant's raw off-page recommendations that have no live draft yet.
+    `&rec_id=` forces re-drafting one recommendation (its live draft is
+    superseded by the drafter's versioned write)."""
+    from agents.llm_client import FallbackClient
+    from fixes.offpage_drafter import draft_offpage_reply, OffpageDraftBlocked
+    with conn.cursor() as cur:
+        if rec_id:
+            cur.execute(
+                """
+                SELECT r.recommendation_id, r.target_url, r.offpage_thread_id,
+                       t.post_kind, c.platform, c.community_key
+                FROM recommendations r
+                LEFT JOIN offpage_threads t
+                    ON t.site_id = r.site_id
+                   AND t.thread_id = r.offpage_thread_id
+                LEFT JOIN offpage_communities c
+                    ON c.site_id = t.site_id
+                   AND c.community_id = t.community_id
+                WHERE r.recommendation_id = %s
+                  AND r.site_id = %s
+                  AND r.generator = 'offpage_community'
+                  AND r.offpage_thread_id IS NOT NULL
+                """,
+                (rec_id, site_id))
+        else:
+            cur.execute(
+                """
+                SELECT r.recommendation_id, r.target_url, r.offpage_thread_id,
+                       t.post_kind, c.platform, c.community_key
+                FROM recommendations r
+                LEFT JOIN offpage_threads t
+                    ON t.site_id = r.site_id
+                   AND t.thread_id = r.offpage_thread_id
+                LEFT JOIN offpage_communities c
+                    ON c.site_id = t.site_id
+                   AND c.community_id = t.community_id
+                WHERE r.site_id = %s
+                  AND r.generator = 'offpage_community'
+                  AND r.status = 'raw'
+                  AND r.offpage_thread_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM offpage_drafts d
+                      WHERE d.recommendation_id = r.recommendation_id
+                        AND d.status IN ('drafted', 'approved'))
+                ORDER BY r.created_at ASC
+                """,
+                (site_id,))
+        pending = [dict(zip(
+            ("recommendation_id", "target_url", "thread_id", "post_kind",
+             "platform", "community_key"), row)) for row in cur.fetchall()]
+    outcomes, minted = [], []
+    client = FallbackClient()
+    for row in pending[:max(1, min(int(max_drafts), 4))]:
+        item = str(row["recommendation_id"])
+        try:
+            out = draft_offpage_reply(conn, item, client=client)
+            conn.commit()
+            outcomes.append({
+                "recommendation_id": item,
+                "platform": row["platform"] or "reddit",
+                "post_kind": row["post_kind"] or "reply",
+                "draft_id": str(out["draft_id"]) if out else None,
+                "status": "drafted"})
+            minted.append(item)
+        except OffpageDraftBlocked as exc:
+            conn.rollback()
+            outcomes.append({
+                "recommendation_id": item,
+                "platform": row["platform"] or "reddit",
+                "post_kind": row["post_kind"] or "reply",
+                "status": "refused",
+                "reason": str(exc)[:300]})
+        except Exception as exc:
+            conn.rollback()
+            outcomes.append({
+                "recommendation_id": item,
+                "platform": row["platform"] or "reddit",
+                "post_kind": row["post_kind"] or "reply",
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}"[:300]})
+    return {"ok": True, "site_id": site_id, "pending": len(pending),
+            "outcomes": outcomes}
+
+
 @router.get("/queue", response_model=OffpageQueueOut)
 def get_offpage_queue(site_id, conn=Depends(get_conn)):
     """Active off-page task window (capped 5, oldest pending first).
