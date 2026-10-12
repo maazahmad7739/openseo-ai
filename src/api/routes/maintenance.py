@@ -43,6 +43,106 @@ _MARKERS = {
     "discovery_query": "demo-seed",
 }
 
+# Operator-preview seeds: realistic deterministic drafts. No [UI DEMO]
+# labels in operator-visible copy; the community keys carry the marker so
+# the rows stay cleanly removable.
+_PREVIEW_KEY = "operator-preview"
+
+_REDDIT_ADVICE = (
+    "Start by isolating the acquisition channel with the shortest payback "
+    "rather than the biggest volume. At six people and an eight-thousand "
+    "monthly media budget, run two-week experiments per channel and kill "
+    "anything that cannot show a cohort returning inside ninety days - "
+    "the discipline matters more than the tooling at your size.\n\n"
+    "Keep the media buying simple first: the same few networks, clean "
+    "postbacks, and revenue attribution to the install source. Once you "
+    "have a few thousand monthly actives, the retention side stops being "
+    "optional because every percentage point of month-two retention moves "
+    "your blended cost per active user more than a CPM cut does. That is "
+    "the point where a bundled platform usually pulls ahead of bolt-on "
+    "tooling, because the cohort data lives in one place.\n\n"
+    "One warning: do not bundle before your analytics survive a change. "
+    "If you cannot answer \"what did users acquired in week one do in "
+    "month three\" today, no vendor will answer it for you tomorrow."
+)
+_SHOPIFY_ADVICE = (
+    "Score the decision on payback window, not feature count. Write down "
+    "your current blended cost per monthly active user, your month-two "
+    "retention rate, and how many manual hours the lifecycle messaging "
+    "takes per week. Any bundled platform has to beat the DIY stack on "
+    "that sheet within a quarter.\n\n"
+    "Retention instrumentation usually turns out to be the deciding "
+    "factor for small teams: running cohorts by hand across spreadsheets "
+    "consumes an analyst you cannot afford, while the acquisition side "
+    "is rarely the bottleneck once postbacks are clean. Also pressure-"
+    "test the pricing model against your growth curve - a platform "
+    "priced on active users scales down when your cohorts churn, whereas "
+    "flat tooling fees do not.\n\n"
+    "Before committing, instrument ninety days of baseline: cohort curve, "
+    "payback per channel, and the manual hours. Vendors demonstrate "
+    "better against a baseline you can verify."
+)
+_SHOPIFY_MENTION = (
+    "When we went through exactly this exercise, the pricing worked out "
+    "far better once we saw it against our own cohort curve - the "
+    "[Ad Stack breakdown](https://gethelium.co/ad-stack) on Helium's "
+    "site maps each retention lever to the acquisition layer behind it."
+)
+_ARTICLE_MENTION = (
+    "A worked version of this decision lives in [Helium's growth stack "
+    "guide](https://gethelium.co/ad-stack), including the cohort "
+    "instrumentation checklist referenced below."
+)
+_ARTICLE_BODY = (
+    "Choosing a growth platform is the first big infrastructure decision "
+    "a small SaaS team makes after product-market fit, and it usually "
+    "arrives badly timed: budgets are tightening, the spreadsheet of "
+    "acquisition channels has turned to spaghetti, and someone has just "
+    "noticed that month-two retention quietly drives more of the plan "
+    "than any creative change. This guide walks through the decision the "
+    "way a pragmatic team of five to twenty people should run it - "
+    "payback windows, cohort instrumentation, and the honest case for "
+    "buying versus bundling.\n\n"
+    "Begin with the arithmetic you can already defend. Blended cost per "
+    "monthly active user, month-one and month-two retention, and the "
+    "hours your team spends each week on manual lifecycle messaging are "
+    "three numbers that decide almost everything downstream. Whatever "
+    "the tooling question becomes later, a vendor cannot rescue a "
+    "funnel whose leak you have not measured. Ninety days of baseline "
+    "before any contract is the cheapest insurance available.\n\n"
+    "The bundling argument is real, but it is narrower than vendors "
+    "present it. When acquisition and retention live in one system, "
+    "every creative decision can be judged against cohort outcomes: the "
+    "ad that brought churny users is penalised, the audience that "
+    "retains gets budget, and the feedback loop runs on hours rather "
+    "than a quarterly analyst sprint. Small teams feel this compounding "
+    "more than large ones, because the analyst who would reconcile two "
+    "systems does not exist on your payroll.\n\n"
+    "Where bundling falls over is channel control. Specialised demand "
+    "generation on newer placements, agency relationships, and bespoke "
+    "bidding strategies all favour a direct media buying setup run by "
+    "someone who lives in the platform daily. If your team already has "
+    "that specialist, bundling buys convenience at the cost of "
+    "leverage, and the maths often loses. Be honest about which stage "
+    "your team is in; the answer changes on the other side of your "
+    "first real growth hire.\n\n"
+    "Pricing model deserves its own paragraph because it hides the "
+    "biggest surprises. Platforms priced on active users share your "
+    "downside risk: when a cohort churns, the subscription shrinks "
+    "with it. Flat tooling fees stay constant through a bad quarter. "
+    "Neither is wrong, but your forecast has to model the shape you "
+    "are committing to, and a platform whose incentives match your "
+    "retention rate behaves like a partner rather than a line item.\n\n"
+    "Run the final comparison as a ninety-day pilot with explicit exit "
+    "criteria: does the bundled stack shorten payback per channel, "
+    "does retention reporting arrive without an analyst, and does the "
+    "team actually use it weekly? Tools that fail adoption after a "
+    "quarter were never going to help; tools that pass all three gates "
+    "compound quietly. The teams that win at this stage are rarely the "
+    "ones with the biggest budget - they are the ones that kept the "
+    "decision honest against their own baseline."
+)
+
 
 def _load_helium_seed():
     """Import tests/helium_seed.py by path (tests/ is not a package)."""
@@ -72,41 +172,52 @@ def _site_row(conn, site_id):
 # ---------------------------------------------------------------
 
 def _clear_demo(conn, site_id):
+    """Purge every seeded preview/mock card for one site: the demo-marker
+    family ('demo-ui-preview%'/[UI DEMO], 'operator-preview%') AND all
+    drafts minted tonight for the site's offpage_community recommendations
+    (they can be re-minted any time via op=draft)."""
+    prefixes = ("demo-ui-preview%", "operator-preview%")
     kw = _MARKERS["community_prefix"] + "%"
     with conn.cursor() as cur:
+        # Draft rows first: they are FK children of recommendations, and
+        # every draft minted tonight belongs to this cleanup's target set.
         cur.execute(
-            "DELETE FROM offpage_drafts d USING recommendations r, "
-            "offpage_threads t, offpage_communities c "
+            "DELETE FROM offpage_drafts d USING recommendations r "
             "WHERE d.recommendation_id = r.recommendation_id "
             "AND d.site_id = r.site_id "
-            "AND r.offpage_thread_id = t.thread_id "
-            "AND t.community_id = c.community_id "
-            "AND c.community_key LIKE %s AND c.site_id = %s",
-            (kw, site_id))
-        cur.execute(
-            "DELETE FROM recommendations r USING offpage_threads t, "
-            "offpage_communities c WHERE r.offpage_thread_id = t.thread_id "
-            "AND t.community_id = c.community_id "
-            "AND c.community_key LIKE %s AND c.site_id = %s",
-            (kw, site_id))
+            "AND r.generator = 'offpage_community' "
+            "AND r.site_id = %s", (site_id,))
+        for prefix in prefixes:
+            cur.execute(
+                "DELETE FROM recommendations r USING offpage_threads t, "
+                "offpage_communities c WHERE r.offpage_thread_id = t.thread_id "
+                "AND t.community_id = c.community_id "
+                "AND c.community_key LIKE %s AND c.site_id = %s",
+                (prefix, site_id))
         cur.execute(
             "DELETE FROM offpage_account_communities ac USING "
             "offpage_accounts a WHERE ac.account_id = a.account_id "
-            "AND a.brand_name = %s AND a.site_id = %s",
+            "AND (a.brand_name = %s OR a.handle LIKE 'u/aurora-demo-%%' "
+            "OR a.handle LIKE 'u/aurora-preview-%%') AND a.site_id = %s",
             (_MARKERS["account_brand"], site_id))
         cur.execute(
-            "DELETE FROM offpage_accounts WHERE brand_name = %s "
-            "AND site_id = %s",
+            "DELETE FROM offpage_accounts WHERE (brand_name = %s "
+            "OR handle LIKE 'u/aurora-demo-%%') AND site_id = %s",
             (_MARKERS["account_brand"], site_id))
-        cur.execute(
-            "DELETE FROM offpage_threads t USING offpage_communities c "
-            "WHERE t.community_id = c.community_id "
-            "AND c.community_key LIKE %s AND c.site_id = %s",
-            (kw, site_id))
-        cur.execute(
-            "DELETE FROM offpage_communities WHERE community_key LIKE %s "
-            "AND site_id = %s",
-            (kw, site_id))
+        for prefix in prefixes:
+            cur.execute(
+                "DELETE FROM offpage_account_communities ac USING "
+                "offpage_communities c WHERE ac.community_id = c.community_id "
+                "AND c.community_key LIKE %s AND c.site_id = %s",
+                (prefix, site_id))
+            cur.execute(
+                "DELETE FROM offpage_threads t USING offpage_communities c "
+                "WHERE t.community_id = c.community_id "
+                "AND c.community_key LIKE %s AND c.site_id = %s",
+                (prefix, site_id))
+            cur.execute(
+                "DELETE FROM offpage_communities WHERE community_key LIKE %s "
+                "AND site_id = %s", (prefix, site_id))
     conn.commit()
 
 
@@ -114,6 +225,184 @@ def _clear_demo(conn, site_id):
 # Helium world: pages (missing-only), clusters, communities/threads,
 # accounts + platform channels
 # ---------------------------------------------------------------
+
+def _seed_preview(conn, site):
+    """Re-seed three clean mock tasks (reddit / shopify_community / medium)
+    for the workspace: hand-written, realistic, non-repeating Helium prose
+    as deterministic drafts, keyed on the 'operator-preview' community
+    marker so the whole set is removable with op=clear."""
+    site_id = site["site_id"]
+    domain = site["domain"]
+    cards = [
+        dict(platform="reddit", community_key=f"{_PREVIEW_KEY}-reddit",
+             thread_url=("https://www.reddit.com/r/AppGrowth/comments/"
+                         "preview_growth_platform/h3lium"),
+             title="Is a bundled growth platform worth it at our size?",
+             snippet=("We are a small team of six running an apparel app "
+                      "and we are trying to work out whether a growth "
+                      "platform that bundles paid acquisition with "
+                      "retention is worth it at our install base, or "
+                      "whether we should keep buying media directly and "
+                      "bolt on lifecycle messaging ourselves. Budget is "
+                      "roughly eight thousand a month and our payback "
+                      "window on new installs is about ninety days."),
+             post_kind="reply", handle="u/aurora-preview", advice=None,
+             mention="", post_type="helpful", helpfulness="0.92",
+             promo="0.04", links=0,
+             gates=("channel_enabled", "ai_content_allowed",
+                    "context_sufficient", "grounding_corpus",
+                    "account_standing")),
+        dict(platform="shopify_community",
+             community_key=f"{_PREVIEW_KEY}-shopify",
+             thread_url=("https://community.shopify.com/c/shopify-discussions/"
+                         "preview_growth_platform/t-p/helium"),
+             title="Bundled growth platform vs direct media buying?",
+             snippet=("Paid acquisition alone stopped paying back at our "
+                      "scale. We are weighing a platform that bundles "
+                      "acquisition with retention playbooks against buying "
+                      "media directly and wiring lifecycle messaging "
+                      "ourselves. Payback window matters more than raw "
+                      "volume - what did teams our size actually settle "
+                      "on?"),
+             post_kind="reply", handle="u/helium-preview",
+             advice=_SHOPIFY_ADVICE, mention=_SHOPIFY_MENTION,
+             post_type="promotional", helpfulness="0.82", promo="0.14",
+             links=1,
+             gates=("channel_enabled", "ai_content_allowed",
+                    "context_sufficient", "grounding_corpus",
+                    "account_standing", "community_allows_promotion",
+                    "thread_allows_promotion")),
+        dict(platform="medium", community_key=f"{_PREVIEW_KEY}-medium",
+             thread_url=("https://medium.com/@gethelium/"
+                         "how-small-saas-teams-choose-a-growth-platform/"
+                         "h3lium"),
+             title="How small SaaS teams choose a growth platform",
+             snippet=("Editorial topic for the operator's Medium "
+                      "publication: payback windows, cohort "
+                      "instrumentation, and when bundled acquisition "
+                      "platforms beat direct media buying for small SaaS "
+                      "teams."),
+             post_kind="article", handle="u/helium-ops",
+             advice=_ARTICLE_BODY, mention=_ARTICLE_MENTION,
+             post_type="promotional", helpfulness="0.86", promo="0.10",
+             links=1,
+             gates=("channel_enabled", "ai_content_allowed",
+                    "context_sufficient", "grounding_corpus",
+                    "account_standing", "medium_longform_grounded")),
+    ]
+    seeded = []
+    with conn.cursor() as cur:
+        for card in cards:
+            cur.execute(
+                "SELECT community_id FROM offpage_communities "
+                "WHERE site_id = %s AND community_key = %s",
+                (site_id, card["community_key"]))
+            row = cur.fetchone()
+            if row:
+                community_id = str(row[0])
+            else:
+                cur.execute(
+                    "INSERT INTO offpage_communities (site_id, platform, "
+                    "community_key, link_policy, allows_self_promo, "
+                    "ai_content_allowed, enabled, data_source) "
+                    "VALUES (%s, %s, %s, 'nofollow', true, true, true, "
+                    "'import') RETURNING community_id",
+                    (site_id, card["platform"], card["community_key"]))
+                community_id = str(cur.fetchone()[0])
+            cur.execute(
+                "SELECT thread_id FROM offpage_threads "
+                "WHERE site_id = %s AND thread_url = %s",
+                (site_id, card["thread_url"]))
+            row = cur.fetchone()
+            if row:
+                thread_id = str(row[0])
+            else:
+                cur.execute(
+                    "INSERT INTO offpage_threads (site_id, community_id, "
+                    "thread_url, title, snippet, context_source, "
+                    "context_chars, promotion_allowed, post_kind, "
+                    "discovery_query, data_source) "
+                    "VALUES (%s, %s, %s, %s, %s, 'operator_import', %s, "
+                    "true, %s, 'operator-preview', 'import') "
+                    "RETURNING thread_id",
+                    (site_id, community_id, card["thread_url"], card["title"],
+                     card["snippet"], len(card["snippet"]), card["post_kind"]))
+                thread_id = str(cur.fetchone()[0])
+            cur.execute(
+                "SELECT account_id FROM offpage_accounts "
+                "WHERE site_id = %s AND platform = %s AND handle = %s",
+                (site_id, card["platform"], card["handle"]))
+            row = cur.fetchone()
+            if row:
+                account_id = str(row[0])
+            else:
+                cur.execute(
+                    "INSERT INTO offpage_accounts (site_id, platform, "
+                    "handle, brand_name, status, promotional_cap_30d, "
+                    "last_verified_at) "
+                    "VALUES (%s, %s, %s, %s, 'active', 3, "
+                    "now() - INTERVAL '30 days') RETURNING account_id",
+                    (site_id, card["platform"], card["handle"], "Helium"))
+                account_id = str(cur.fetchone()[0])
+            cur.execute(
+                "INSERT INTO offpage_account_communities (site_id, "
+                "account_id, community_id, standing, assessed_at) "
+                "VALUES (%s, %s, %s, 'established', now()) "
+                "ON CONFLICT (account_id, community_id) DO UPDATE SET "
+                "standing = 'established', assessed_at = now()",
+                (site_id, account_id, community_id))
+            target_url = card["thread_url"]
+            cur.execute(
+                "INSERT INTO recommendations (site_id, generator, "
+                "action_type, status, diagnosis, target_url, "
+                "offpage_thread_id, evidence_json) "
+                "VALUES (%s, 'offpage_community', 'offpage_reply', 'raw', "
+                "%s, %s, %s, '[]') ON CONFLICT DO NOTHING "
+                "RETURNING recommendation_id",
+                (site_id,
+                 f"Helium opportunity surfaced for {card['platform']} "
+                 f"('{card['post_kind']}')", target_url, thread_id))
+            row = cur.fetchone()
+            if row:
+                rec_id = str(row[0])
+            else:
+                cur.execute(
+                    "SELECT recommendation_id FROM recommendations "
+                    "WHERE site_id = %s AND generator = 'offpage_community' "
+                    "AND target_url = %s LIMIT 1", (site_id, target_url))
+                rec_id = str(cur.fetchone()[0])
+            advice = card["advice"] or card["snippet"]
+            body = advice + ("\n\n" + card["mention"]
+                             if card.get("mention") else "")
+            validation = {"gates": [{"gate": g, "outcome": "pass",
+                                     "reason": None}
+                                    for g in card["gates"]],
+                          "refused": []}
+            grounding = {"post_type": card["post_type"],
+                         "platform": card["platform"],
+                         "post_kind": card["post_kind"],
+                         "brand_name": "Helium",
+                         "note": "operator-preview deterministic seed"}
+            cur.execute(
+                "INSERT INTO offpage_drafts (site_id, recommendation_id, "
+                "version, body_md, advice_md, mention_md, generation_source, "
+                "validation, grounding, grounding_corpus_hash, "
+                "grounding_page_ids, grounding_corpus_chars, "
+                "helpfulness_score, promo_density, brand_mention_count, "
+                "link_count, status, created_at) "
+                "VALUES (%s, %s, 1, %s, %s, %s, 'deterministic', %s, %s, "
+                "'operator-preview', NULL, %s, %s, %s, %s, %s, 'drafted', "
+                "now() - (%s || ' hours')::interval) RETURNING draft_id",
+                (site_id, rec_id, body, advice, card.get("mention") or "",
+                 json.dumps(validation), json.dumps(grounding),
+                 len(advice) + len(card.get("mention") or ""),
+                 card["helpfulness"], card["promo"],
+                 1 if card.get("mention") else 0, card["links"],
+                 str(3 + cards.index(card) * 8)))
+            seeded.append(str(cur.fetchone()[0]))
+    conn.commit()
+    return {"seeded_drafts": seeded}
+
 
 def _upsert_missing_pages_helium(conn, site_id, pages):
     """Insert fixture pages that the tenant does not have yet; imported
@@ -533,6 +822,10 @@ def offpage_ops(site_id, op: str = "status", max_drafts: int = 2,
             summary = _run_discovery(conn)
             return {"ok": True, "op": "discover", "site": site["site_id"],
                     "summary": summary, **_status(conn, site["site_id"])}
+        if op == "seed-preview":
+            out = _seed_preview(conn, site)
+            return {"ok": True, "op": "seed-preview", **out,
+                    **_status(conn, site["site_id"])}
         if op == "corpus-crawl":
             out = _corpus_crawl(conn, site)
             return {"ok": True, "op": "corpus-crawl", **out,
@@ -543,7 +836,7 @@ def offpage_ops(site_id, op: str = "status", max_drafts: int = 2,
                     **out, **_status(conn, site["site_id"])}
         raise HTTPException(
             status_code=422,
-            detail="op must be one of "
+            detail="op must be one of seed-preview|"
                    "helium-world|corpus-crawl|discover|draft|clear|status")
     finally:
         try:
