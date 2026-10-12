@@ -167,11 +167,6 @@ def _dataforseo_seam(site, platform, query, limit):
                 "http_status": None, "latency_ms": None,
                 "error": (f"budget_gate: weekly spend ${budget[0]:.2f} "
                           f">= cap ${budget[1]:.2f} for openseo_serp")}
-    if not allowed:
-        return {"ok": False, "provider": SEAM_PROVIDERS["dataforseo"],
-                "data_source": "live", "results": [],
-                "http_status": None, "latency_ms": None,
-                "error": f"budget_gate: {reason}"}
     started = time.monotonic()
     try:
         result = openseo.fetch("serp", {"query": query, "limit": limit})
