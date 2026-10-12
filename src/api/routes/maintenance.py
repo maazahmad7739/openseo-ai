@@ -427,6 +427,64 @@ def _run_drafts(conn, site_id, max_drafts, rec_id=None):
     return {"pending_after_queue": len(pending), "outcomes": outcomes}
 
 
+def _corpus_crawl(conn, site):
+    """Stage 1 of the live pipeline: crawl the tenant's REAL pages and load
+    the bodies into `pages` so the grounding corpus holds actual facts.
+
+    Mirrors scripts/run_live_offpage.py's corpus step: robots.txt is
+    checked, <body> inner HTML is extracted per site_fetch's normalisation,
+    and only the KNOWN Helium pages are refreshed (never other tenants).
+    """
+    from urllib.parse import urlparse
+    import site_fetch as sf
+    domain = site["domain"]
+    fetcher = sf
+    fetched = []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT url FROM pages WHERE site_id = %s "
+            "AND page_type IN ('collection', 'product') "
+            "ORDER BY url LIMIT 8", (site["site_id"],))
+        urls = [r[0] for r in cur.fetchall()]
+    robots = None
+    try:
+        robots = fetcher.fetch_robots_txt(f"https://{domain}/")
+    except Exception:
+        robots = None
+    for url in urls:
+        if not fetcher._robots_ok_for_url(robots, url):
+            fetched.append({"url": url, "status": "robots_disallow"})
+            continue
+        try:
+            resp = fetcher._get(url)
+            if not resp.get("ok"):
+                fetched.append({"url": url,
+                                "status": f"fetch_failed({resp.get('reason')})"})
+                continue
+            status, html = resp.get("status"), resp.get("body") or ""
+        except Exception as exc:
+            fetched.append({"url": url, "status": f"error: "
+                            f"{type(exc).__name__}"})
+            continue
+        body_html, text, h1 = fetcher._page_body_from_html(html)
+        title = fetcher._page_title_from_html(html)
+        meta = fetcher._page_meta_from_html(html)
+        if not body_html or not text or len(text) < 300:
+            fetched.append({"url": url, "status": f"thin_body({status}, "
+                            f"{len(text or '')} chars)"})
+            continue
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pages SET body_html = %s, title = COALESCE(%s, title), "
+                "meta_description = COALESCE(%s, meta_description), "
+                "h1 = COALESCE(%s, h1) WHERE site_id = %s AND url = %s",
+                (body_html, title, meta, h1, site["site_id"], url))
+        fetched.append({"url": url, "status": f"loaded({status}, "
+                        f"{len(text)} chars)"})
+    conn.commit()
+    return {"fetched": fetched}
+
+
 def _status(conn, site_id):
     counts = {}
     with conn.cursor() as cur:
@@ -475,13 +533,18 @@ def offpage_ops(site_id, op: str = "status", max_drafts: int = 2,
             summary = _run_discovery(conn)
             return {"ok": True, "op": "discover", "site": site["site_id"],
                     "summary": summary, **_status(conn, site["site_id"])}
+        if op == "corpus-crawl":
+            out = _corpus_crawl(conn, site)
+            return {"ok": True, "op": "corpus-crawl", **out,
+                    **_status(conn, site["site_id"])}
         if op == "draft":
             out = _run_drafts(conn, site["site_id"], max_drafts, rec_id)
             return {"ok": True, "op": "draft", "site": site["site_id"],
                     **out, **_status(conn, site["site_id"])}
         raise HTTPException(
             status_code=422,
-            detail="op must be one of helium-world|discover|draft|clear|status")
+            detail="op must be one of "
+                   "helium-world|corpus-crawl|discover|draft|clear|status")
     finally:
         try:
             conn.rollback()
