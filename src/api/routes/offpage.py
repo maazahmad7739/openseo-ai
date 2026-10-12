@@ -378,7 +378,7 @@ def run_offpage_draft_trigger(site_id, rec_id: str = None,
                       SELECT 1 FROM offpage_drafts d
                       WHERE d.recommendation_id = r.recommendation_id
                         AND d.status IN ('drafted', 'approved'))
-                ORDER BY r.created_at ASC
+                ORDER BY COALESCE(t.context_chars, 0) DESC, r.created_at ASC
                 """,
                 (site_id,))
         pending = [dict(zip(
